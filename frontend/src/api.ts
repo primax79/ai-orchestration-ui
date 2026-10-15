@@ -120,6 +120,21 @@ export const api = {
     });
   },
 
+  async removeSkill(
+    skill: string,
+    assistant: string,
+    scope: 'global' | 'project' = 'global'
+  ): Promise<any> {
+    return apiFetch('/api/env/remove-skill', {
+      method: 'POST',
+      body: JSON.stringify({ skill, assistant, scope }),
+    });
+  },
+
+  async resolveConflicts(): Promise<any> {
+    return apiFetch('/api/env/resolve-conflicts', { method: 'POST' });
+  },
+
   async getConfig(): Promise<OrchestrationConfigResponse> {
     return apiFetch<OrchestrationConfigResponse>('/api/config/show');
   },

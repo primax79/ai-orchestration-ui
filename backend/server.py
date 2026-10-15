@@ -222,6 +222,29 @@ async def api_register_mcp(request: Request) -> JSONResponse:
     return JSONResponse(data, status_code=200 if code == 0 else 500)
 
 
+async def api_remove_skill(request: Request) -> JSONResponse:
+    body = await request.json()
+    skill = body.get("skill")
+    assistant = body.get("assistant")
+    scope = body.get("scope", "global")
+    if not skill or not assistant:
+        return JSONResponse({"error": "skill and assistant are required"}, status_code=400)
+
+    cmd = ["env", "remove-skill", str(skill), "--assistant", str(assistant), "--scope", scope, "--workspace", str(state.workspace), "--json"]
+    code, data = run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "skill_removed", "skill": skill, "assistant": assistant})
+    return JSONResponse(data, status_code=200 if code == 0 else 500)
+
+
+async def api_resolve_conflicts(request: Request) -> JSONResponse:
+    cmd = ["env", "resolve-conflicts", "--workspace", str(state.workspace), "--json"]
+    code, data = run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "conflicts_resolved"})
+    return JSONResponse(data, status_code=200 if code == 0 else 500)
+
+
 # ---------------------------------------------------------------------------
 # REST Endpoints: Macro 4 — Orchestrator Configuration & AGENTS.md
 # ---------------------------------------------------------------------------
@@ -304,6 +327,8 @@ routes = [
     Route("/api/env/status", api_env_status, methods=["GET"]),
     Route("/api/env/install-skills", api_install_skills, methods=["POST"]),
     Route("/api/env/register-mcp", api_register_mcp, methods=["POST"]),
+    Route("/api/env/remove-skill", api_remove_skill, methods=["POST"]),
+    Route("/api/env/resolve-conflicts", api_resolve_conflicts, methods=["POST"]),
     Route("/api/config/show", api_config_show, methods=["GET"]),
     Route("/api/config/set-profile", api_config_set_profile, methods=["POST"]),
     Route("/api/config/render-agents-md", api_render_agents_md, methods=["GET"]),

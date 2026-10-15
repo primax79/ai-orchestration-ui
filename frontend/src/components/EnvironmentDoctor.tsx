@@ -1,26 +1,87 @@
-import React from 'react';
-import { Activity, CheckCircle2, AlertTriangle, XCircle, Terminal, HardDrive } from 'lucide-react';
+import React, { useState } from 'react';
+import { Activity, CheckCircle2, AlertTriangle, XCircle, Terminal, HardDrive, Trash2, Wrench, Loader2 } from 'lucide-react';
 import { EnvStatusResponse } from '../types';
+import { api } from '../api';
 
 interface EnvironmentDoctorProps {
   status: EnvStatusResponse | null;
   onRefresh: () => void;
 }
 
-export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status }) => {
+export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, onRefresh }) => {
+  const [loadingAction, setLoadingAction] = useState<string | null>(null);
+
   if (!status) {
     return <div style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>Loading environment status...</div>;
   }
 
   const { clis, source_repos, environments } = status;
 
+  // Check if any environment has conflicts
+  const hasConflicts = Object.values(environments).some((scopes) =>
+    Object.values(scopes).some((sinfo) => sinfo.conflicts.length > 0)
+  );
+
+  const handleResolveConflicts = async () => {
+    setLoadingAction('resolve-conflicts');
+    try {
+      await api.resolveConflicts();
+      onRefresh();
+    } catch (e: any) {
+      alert(`Error resolving conflicts: ${e.message}`);
+    } finally {
+      setLoadingAction(null);
+    }
+  };
+
+  const handleRemoveSkill = async (assistant: string, scope: string, skill: string) => {
+    if (!confirm(`Remove skill '${skill}' from ${assistant} (${scope})?`)) {
+      return;
+    }
+    setLoadingAction(`remove-${assistant}-${scope}-${skill}`);
+    try {
+      await api.removeSkill(skill, assistant, scope as any);
+      onRefresh();
+    } catch (e: any) {
+      alert(`Error removing skill: ${e.message}`);
+    } finally {
+      setLoadingAction(null);
+    }
+  };
+
   return (
     <div style={{ padding: '1.5rem', maxWidth: '1200px', margin: '0 auto' }}>
-      <div style={{ marginBottom: '1.5rem' }}>
-        <h1 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#f8fafc' }}>Environment Health & Drift Doctor</h1>
-        <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem' }}>
-          Real-time diagnostic of CLI binaries, skill installations, drift detection, and registered MCP servers across Kilo, Claude, and Codex.
-        </p>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem' }}>
+        <div>
+          <h1 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#f8fafc' }}>Environment Health & Drift Doctor</h1>
+          <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem' }}>
+            Real-time diagnostic of CLI binaries, skill installations, drift detection, and registered MCP servers across Kilo, Claude, and Codex.
+          </p>
+        </div>
+
+        {hasConflicts && (
+          <button
+            onClick={handleResolveConflicts}
+            disabled={loadingAction !== null}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.4rem',
+              padding: '0.45rem 0.9rem',
+              borderRadius: '0.375rem',
+              border: 'none',
+              backgroundColor: '#ef4444',
+              color: '#fff',
+              fontSize: '0.85rem',
+              fontWeight: 600,
+              cursor: 'pointer',
+              boxShadow: '0 4px 6px -1px rgba(239, 68, 68, 0.3)',
+            }}
+          >
+            {loadingAction === 'resolve-conflicts' ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
+            <span>Auto-Resolve All Trigger Conflicts</span>
+          </button>
+        )}
       </div>
 
       {/* CLIs & Repos Bar */}
@@ -110,54 +171,96 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status }) 
                   {sinfo.conflicts.map((c, i) => (
                     <div key={i} style={{
                       display: 'flex',
+                      justifyContent: 'space-between',
                       alignItems: 'center',
                       gap: '0.5rem',
-                      padding: '0.5rem 0.75rem',
+                      padding: '0.6rem 0.8rem',
                       borderRadius: '0.375rem',
                       backgroundColor: '#451a1a',
                       border: '1px solid #ef4444',
                       color: '#fca5a5',
                       fontSize: '0.8rem',
-                      marginBottom: '0.5rem',
+                      marginBottom: '0.75rem',
                     }}>
-                      <AlertTriangle size={15} color="#ef4444" />
-                      <span>{c}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                        <AlertTriangle size={15} color="#ef4444" />
+                        <span>{c}</span>
+                      </div>
+                      <button
+                        onClick={handleResolveConflicts}
+                        disabled={loadingAction !== null}
+                        style={{
+                          padding: '0.2rem 0.6rem',
+                          borderRadius: '0.25rem',
+                          border: 'none',
+                          backgroundColor: '#ef4444',
+                          color: '#fff',
+                          fontWeight: 600,
+                          fontSize: '0.75rem',
+                          cursor: 'pointer',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        Resolve
+                      </button>
                     </div>
                   ))}
 
                   {/* Skills Grid */}
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '0.4rem' }}>
-                    {Object.entries(sinfo.skills).map(([sname, sdata]) => (
-                      <div
-                        key={sname}
-                        style={{
-                          backgroundColor: '#0f172a',
-                          border: '1px solid #334155',
-                          borderRadius: '0.25rem',
-                          padding: '0.4rem 0.6rem',
-                          display: 'flex',
-                          justifyContent: 'space-between',
-                          alignItems: 'center',
-                          fontSize: '0.75rem',
-                        }}
-                      >
-                        <span style={{ color: '#e2e8f0', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={sname}>
-                          {sname}
-                        </span>
-                        <span style={{
-                          fontSize: '0.65rem',
-                          fontWeight: 600,
-                          padding: '0.1rem 0.3rem',
-                          borderRadius: '0.2rem',
-                          backgroundColor: sdata.state === 'up-to-date' ? '#064e3b' : sdata.state.startsWith('obsolete') ? '#7f1d1d' : '#451a03',
-                          color: sdata.state === 'up-to-date' ? '#34d399' : sdata.state.startsWith('obsolete') ? '#fca5a5' : '#fbbf24',
-                          whiteSpace: 'nowrap',
-                          marginLeft: '0.4rem',
-                        }}>
-                          {sdata.state}
-                        </span>
-                      </div>
-                    ))}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '0.4rem' }}>
+                    {Object.entries(sinfo.skills).map(([sname, sdata]) => {
+                      const isRemoving = loadingAction === `remove-${assistant}-${scope}-${sname}`;
+                      return (
+                        <div
+                          key={sname}
+                          style={{
+                            backgroundColor: '#0f172a',
+                            border: '1px solid #334155',
+                            borderRadius: '0.25rem',
+                            padding: '0.4rem 0.6rem',
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            fontSize: '0.75rem',
+                          }}
+                        >
+                          <span style={{ color: '#e2e8f0', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '140px' }} title={sname}>
+                            {sname}
+                          </span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                            <span style={{
+                              fontSize: '0.65rem',
+                              fontWeight: 600,
+                              padding: '0.1rem 0.3rem',
+                              borderRadius: '0.2rem',
+                              backgroundColor: sdata.state === 'up-to-date' ? '#064e3b' : sdata.state.startsWith('obsolete') ? '#7f1d1d' : '#451a03',
+                              color: sdata.state === 'up-to-date' ? '#34d399' : sdata.state.startsWith('obsolete') ? '#fca5a5' : '#fbbf24',
+                              whiteSpace: 'nowrap',
+                            }}>
+                              {sdata.state}
+                            </span>
+                            <button
+                              onClick={() => handleRemoveSkill(assistant, scope, sname)}
+                              disabled={loadingAction !== null}
+                              title={`Remove ${sname} from ${assistant}`}
+                              style={{
+                                background: 'none',
+                                border: 'none',
+                                color: '#64748b',
+                                cursor: 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                padding: '0.1rem',
+                              }}
+                              onMouseEnter={(e) => (e.currentTarget.style.color = '#ef4444')}
+                              onMouseLeave={(e) => (e.currentTarget.style.color = '#64748b')}
+                            >
+                              {isRemoving ? <Loader2 size={13} className="spin" /> : <Trash2 size={13} />}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               ))}
