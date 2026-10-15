@@ -326,7 +326,7 @@ app = Starlette(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765)")
+    parser.add_argument("--port", type=int, default=8780, help="Port to listen on (default: 8780)")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
     parser.add_argument("--workspace", default=str(DEFAULT_WORKSPACE), help="Initial workspace path")
     args = parser.parse_args()

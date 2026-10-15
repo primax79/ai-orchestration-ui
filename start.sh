@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-PORT="${PORT:-8765}"
+PORT="${PORT:-8780}"
 HOST="${HOST:-127.0.0.1}"
 WORKSPACE="${1:-$(pwd)}"
 

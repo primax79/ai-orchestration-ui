@@ -148,7 +148,7 @@ export const api = {
 
   connectWebSocket(onMessage: (msg: any) => void): () => void {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host || 'localhost:8765';
+    const host = window.location.host || 'localhost:8780';
     const ws = new WebSocket(`${protocol}//${host}/ws`);
 
     ws.onmessage = (event) => {
