@@ -49,17 +49,39 @@ function sendVsCodeMessage<T>(type: string, payload?: any): Promise<T> {
   });
 }
 
+function getApiToken(): string | null {
+  if (typeof document === 'undefined') return null;
+  const meta = document.querySelector('meta[name="ai-orch-token"]');
+  return meta ? meta.getAttribute('content') : null;
+}
+
 // Helper for HTTP fetch in standalone browser mode
 async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const url = endpoint.startsWith('http') ? endpoint : endpoint;
+  const token = getApiToken();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options?.headers as Record<string, string> || {}),
+  };
+  if (token) {
+    headers['X-AI-Orch-Token'] = token;
+  }
+
   const res = await fetch(url, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options?.headers || {}),
-    },
+    headers,
   });
+
   if (!res.ok) {
+    if (res.status === 401) {
+      if (typeof window !== 'undefined' && typeof window.sessionStorage !== 'undefined') {
+        const reloaded = window.sessionStorage.getItem('ai_orch_reloaded_on_401');
+        if (!reloaded) {
+          window.sessionStorage.setItem('ai_orch_reloaded_on_401', '1');
+          window.location.reload();
+        }
+      }
+    }
     let err = `${res.status} ${res.statusText}`;
     try {
       const data = await res.json();
@@ -67,6 +89,11 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> 
     } catch {}
     throw new Error(err);
   }
+
+  if (typeof window !== 'undefined' && typeof window.sessionStorage !== 'undefined') {
+    window.sessionStorage.removeItem('ai_orch_reloaded_on_401');
+  }
+
   return res.json();
 }
 
@@ -82,10 +109,7 @@ export const api = {
     if (isVsCode && vscode) {
       return sendVsCodeMessage<{ ok: boolean }>('switchWorkspace', { workspacePath });
     }
-    return apiFetch<{ ok: boolean }>('/api/workspace/switch', {
-      method: 'POST',
-      body: JSON.stringify({ workspace_path: workspacePath }),
-    });
+    throw new Error('Workspace switching is not supported in standalone browser mode. Start another server with the desired workspace.');
   },
 
   async getTasks(): Promise<TaskListResponse> {
@@ -249,7 +273,11 @@ export const api = {
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host || 'localhost:8780';
-    const ws = new WebSocket(`${protocol}//${host}/ws`);
+    const token = getApiToken();
+    const wsUrl = token
+      ? `${protocol}//${host}/ws?token=${encodeURIComponent(token)}`
+      : `${protocol}//${host}/ws`;
+    const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
       try {

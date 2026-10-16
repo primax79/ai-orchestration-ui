@@ -14,25 +14,145 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import asynccontextmanager
+import hmac
 import json
 import os
 import pathlib
-import subprocess
+import re
+import secrets
 import sys
-from typing import Any
+from typing import Any, AsyncGenerator
+from urllib.parse import parse_qs
 
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 UI_ROOT = pathlib.Path(__file__).resolve().parent.parent
-AI_ORCH_BIN = UI_ROOT.parent / "ai-orchestration" / "bin" / "ai-orch"
-DEFAULT_WORKSPACE = UI_ROOT.parent
+
+
+def get_ai_orch_bin() -> pathlib.Path:
+    if "AI_ORCH_BIN" in os.environ and os.environ["AI_ORCH_BIN"].strip():
+        return pathlib.Path(os.environ["AI_ORCH_BIN"]).expanduser().resolve()
+    sibling = UI_ROOT.parent / "ai-orchestration" / "bin" / "ai-orch"
+    return sibling
+
+
+def get_config_dir() -> pathlib.Path:
+    if "AI_ORCH_CONFIG_DIR" in os.environ and os.environ["AI_ORCH_CONFIG_DIR"].strip():
+        return pathlib.Path(os.environ["AI_ORCH_CONFIG_DIR"]).expanduser().resolve()
+    return pathlib.Path.home() / ".config" / "ai-orchestration"
+
+
+def get_initial_workspace() -> pathlib.Path:
+    if "AI_ORCH_WORKSPACE" in os.environ and os.environ["AI_ORCH_WORKSPACE"].strip():
+        return pathlib.Path(os.environ["AI_ORCH_WORKSPACE"]).expanduser().resolve()
+    return pathlib.Path.cwd().resolve()
+
+
+def get_or_create_token() -> str:
+    config_dir = get_config_dir()
+    token_file = config_dir / "ui-token"
+    if token_file.is_file():
+        try:
+            token = token_file.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        except Exception:
+            pass
+
+    config_dir.mkdir(parents=True, exist_ok=True)
+    raw_token = secrets.token_urlsafe(32)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(token_file), flags, 0o600)
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(raw_token)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    try:
+        token_file.chmod(0o600)
+    except Exception:
+        pass
+    return raw_token
+
+
+def is_host_allowed(host_header: str | None, scope: Scope) -> bool:
+    if not host_header:
+        return False
+    host = host_header.strip().lower()
+
+    env_allowed = os.environ.get("AI_ORCH_ALLOWED_HOSTS")
+    if env_allowed is not None:
+        allowed = {h.strip().lower() for h in env_allowed.split(",") if h.strip()}
+        return host in allowed
+
+    server_port = None
+    server_info = scope.get("server")
+    if server_info and len(server_info) > 1 and server_info[1]:
+        server_port = str(server_info[1])
+
+    port = os.environ.get("PORT") or server_port or "8780"
+    allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    if server_port and server_port != port:
+        allowed.add(f"127.0.0.1:{server_port}")
+        allowed.add(f"localhost:{server_port}")
+
+    return host in allowed
+
+
+class AuthAndHostMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            host_header = headers.get(b"host", b"").decode("latin1")
+            if not is_host_allowed(host_header, scope):
+                response = Response("Invalid Host header", status_code=400)
+                await response(scope, receive, send)
+                return
+
+            path = scope.get("path", "")
+            if path == "/api" or path.startswith("/api/"):
+                expected_token = get_or_create_token()
+                token_hdr = headers.get(b"x-ai-orch-token", b"").decode("latin1")
+                if not token_hdr or not hmac.compare_digest(token_hdr, expected_token):
+                    response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                    await response(scope, receive, send)
+                    return
+
+            await self.app(scope, receive, send)
+
+        elif scope["type"] == "websocket":
+            headers = dict(scope.get("headers", []))
+            host_header = headers.get(b"host", b"").decode("latin1")
+            if not is_host_allowed(host_header, scope):
+                await send({"type": "websocket.close", "code": 4400, "reason": "Invalid Host header"})
+                return
+
+            qs = parse_qs(scope.get("query_string", b"").decode("latin1"))
+            token = qs.get("token", [""])[0]
+            expected_token = get_or_create_token()
+            if not token or not hmac.compare_digest(token, expected_token):
+                await send({"type": "websocket.close", "code": 4401, "reason": "unauthorized"})
+                return
+
+            await self.app(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
 
 
 class OrchestrationState:
@@ -41,12 +161,9 @@ class OrchestrationState:
         self.active_websockets: set[WebSocket] = set()
         self.watcher_task: asyncio.Task | None = None
 
-    def set_workspace(self, new_ws: pathlib.Path) -> None:
-        self.workspace = new_ws.resolve()
-
     async def broadcast(self, message: dict[str, Any]) -> None:
         stale = set()
-        for ws in self.active_websockets:
+        for ws in list(self.active_websockets):
             try:
                 await ws.send_json(message)
             except Exception:
@@ -54,22 +171,219 @@ class OrchestrationState:
         self.active_websockets.difference_update(stale)
 
 
-state = OrchestrationState(DEFAULT_WORKSPACE)
+state = OrchestrationState(get_initial_workspace())
 
 
-def run_ai_orch(args: list[str]) -> tuple[int, dict[str, Any] | str]:
-    """Execute `./bin/ai-orch <args...>` and return (exit_code, parsed_json_or_text)."""
-    if not AI_ORCH_BIN.is_file():
-        return 1, f"ai-orch CLI not found at {AI_ORCH_BIN}"
-    cmd = [sys.executable, str(AI_ORCH_BIN), *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    out = proc.stdout.strip()
-    err = proc.stderr.strip()
+async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[int, dict[str, Any] | str]:
+    """Execute `./bin/ai-orch <args...>` asynchronously and return (exit_code, parsed_json_or_text)."""
+    bin_path = get_ai_orch_bin()
+    if not bin_path.is_file():
+        return 1, f"ai-orch CLI not found at {bin_path}"
+
+    if os.access(bin_path, os.X_OK):
+        cmd = [str(bin_path), *args]
+    else:
+        cmd = [sys.executable, str(bin_path), *args]
+
+    if timeout is None:
+        if any(action in args for action in ("install-skills", "register-mcp")):
+            timeout = 600.0
+        else:
+            timeout = 60.0
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        return 1, f"Failed to execute CLI command: {exc}"
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        return 504, {"error": f"CLI command timed out after {timeout} seconds"}
+
+    out = stdout_bytes.decode("utf-8", errors="replace").strip()
+    err = stderr_bytes.decode("utf-8", errors="replace").strip()
     try:
         parsed = json.loads(out) if out else {}
         return proc.returncode, parsed
     except Exception:
         return proc.returncode, out or err
+
+
+# ---------------------------------------------------------------------------
+# Static Serving & SPA Fallback with Meta Tag Injection
+# ---------------------------------------------------------------------------
+
+dist_dir = UI_ROOT / "frontend" / "dist"
+
+
+async def serve_index(request: Request) -> Response:
+    dist_index = dist_dir / "index.html"
+    raw_index = UI_ROOT / "frontend" / "index.html"
+    index_path = dist_index if dist_index.is_file() else raw_index
+    if not index_path.is_file():
+        return Response("index.html not found", status_code=404)
+
+    content = index_path.read_text(encoding="utf-8")
+    token = get_or_create_token()
+    meta_tag = f'<meta name="ai-orch-token" content="{token}">'
+
+    content = re.sub(r'<meta\s+name=["\']ai-orch-token["\'][^>]*>', '', content)
+    if "<head>" in content:
+        content = content.replace("<head>", f"<head>\n    {meta_tag}", 1)
+    elif "<HEAD>" in content:
+        content = content.replace("<HEAD>", f"<HEAD>\n    {meta_tag}", 1)
+    else:
+        content = f"{meta_tag}\n{content}"
+
+    return HTMLResponse(content, headers={"Cache-Control": "no-store"})
+
+
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        full_path = scope.get("path", "")
+        if full_path.startswith("/api/") or full_path == "/api":
+            return JSONResponse({"error": "Not Found"}, status_code=404)
+        if path in ("", "index.html"):
+            return await serve_index(Request(scope))
+        try:
+            return await super().get_response(path, scope)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return await serve_index(Request(scope))
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Watcher Background Task
+# ---------------------------------------------------------------------------
+
+def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) -> dict[str, float]:
+    mtimes: dict[str, float] = {}
+
+    global_cfg = config_dir / "orchestration.toml"
+    try:
+        if global_cfg.is_file():
+            mtimes[f"config:{global_cfg}"] = global_cfg.stat().st_mtime
+    except OSError:
+        pass
+
+    local_cfg = workspace / ".ai-orchestration.local.toml"
+    try:
+        if local_cfg.is_file():
+            mtimes[f"config:{local_cfg}"] = local_cfg.stat().st_mtime
+    except OSError:
+        pass
+
+    tasks_dir = workspace / "tasks"
+    if tasks_dir.is_dir():
+        try:
+            mtimes[f"tasks:{tasks_dir}"] = tasks_dir.stat().st_mtime
+            for p in tasks_dir.rglob("*.md"):
+                try:
+                    if p.is_file():
+                        mtimes[f"tasks:{p}"] = p.stat().st_mtime
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    return mtimes
+
+
+async def _polling_watcher_loop() -> None:
+    poll_interval = float(os.environ.get("AI_ORCH_WATCH_INTERVAL", "1.0"))
+    last_snapshot = snapshot_watched_files(state.workspace, get_config_dir())
+
+    while True:
+        try:
+            await asyncio.sleep(poll_interval)
+            current_snapshot = snapshot_watched_files(state.workspace, get_config_dir())
+
+            changed_areas: set[str] = set()
+            all_keys = set(last_snapshot.keys()) | set(current_snapshot.keys())
+            for k in all_keys:
+                if last_snapshot.get(k) != current_snapshot.get(k):
+                    if k.startswith("config:"):
+                        changed_areas.add("config")
+                    elif k.startswith("tasks:"):
+                        changed_areas.add("tasks")
+
+            if changed_areas:
+                await asyncio.sleep(0.3)
+                debounce_snapshot = snapshot_watched_files(state.workspace, get_config_dir())
+                for k in set(debounce_snapshot.keys()) | set(current_snapshot.keys()):
+                    if debounce_snapshot.get(k) != current_snapshot.get(k):
+                        if k.startswith("config:"):
+                            changed_areas.add("config")
+                        elif k.startswith("tasks:"):
+                            changed_areas.add("tasks")
+                last_snapshot = debounce_snapshot
+                await state.broadcast({"type": "changed", "areas": sorted(list(changed_areas))})
+            else:
+                last_snapshot = current_snapshot
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(1.0)
+
+
+async def _watchfiles_watcher_loop() -> None:
+    import watchfiles
+
+    config_dir = get_config_dir()
+    watch_dirs = [state.workspace]
+    if config_dir != state.workspace and config_dir.exists():
+        watch_dirs.append(config_dir)
+
+    async for changes in watchfiles.awatch(*[str(d) for d in watch_dirs], debounce=300):
+        areas: set[str] = set()
+        for _, path_str in changes:
+            p = pathlib.Path(path_str)
+            if p.name in ("orchestration.toml", ".ai-orchestration.local.toml"):
+                areas.add("config")
+            elif p.suffix == ".md" and "tasks" in p.parts:
+                areas.add("tasks")
+        if areas:
+            await state.broadcast({"type": "changed", "areas": sorted(list(areas))})
+
+
+async def watcher_loop() -> None:
+    use_polling = os.environ.get("AI_ORCH_WATCH_POLLING") == "1"
+    if not use_polling:
+        try:
+            import watchfiles  # noqa: F401
+            await _watchfiles_watcher_loop()
+            return
+        except ImportError:
+            pass
+        except Exception:
+            pass
+    await _polling_watcher_loop()
+
+
+@asynccontextmanager
+async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+    state.watcher_task = asyncio.create_task(watcher_loop())
+    try:
+        yield
+    finally:
+        if state.watcher_task:
+            state.watcher_task.cancel()
+            try:
+                await state.watcher_task
+            except asyncio.CancelledError:
+                pass
+            state.watcher_task = None
 
 
 # ---------------------------------------------------------------------------
@@ -87,16 +401,6 @@ async def api_get_workspace(request: Request) -> JSONResponse:
     })
 
 
-async def api_switch_workspace(request: Request) -> JSONResponse:
-    body = await request.json()
-    new_path = pathlib.Path(body.get("workspace_path", "")).expanduser().resolve()
-    if not new_path.is_dir():
-        return JSONResponse({"error": f"Directory not found: {new_path}"}, status_code=400)
-    state.set_workspace(new_path)
-    await state.broadcast({"type": "workspace_switched", "workspace": str(new_path)})
-    return JSONResponse({"ok": True, "workspace_path": str(new_path)})
-
-
 # ---------------------------------------------------------------------------
 # REST Endpoints: Macro 1 — Backlog & Tasks
 # ---------------------------------------------------------------------------
@@ -105,16 +409,17 @@ async def api_list_tasks(request: Request) -> JSONResponse:
     tasks_dir = state.workspace / "tasks"
     if not tasks_dir.is_dir():
         return JSONResponse({"tasks": [], "initiatives": [], "stats": {"total": 0}, "message": "No tasks/ directory in current workspace"})
-    code, data = run_ai_orch(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"])
+    code, data = await run_ai_orch(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"])
     if code != 0:
-        return JSONResponse({"error": data}, status_code=500)
+        return JSONResponse({"error": data} if not isinstance(data, dict) else data, status_code=504 if code == 504 else 500)
     return JSONResponse(data)
 
 
 async def api_validate_tasks(request: Request) -> JSONResponse:
     tasks_dir = state.workspace / "tasks"
-    code, data = run_ai_orch(["tasks", "validate", "--tasks-dir", str(tasks_dir), "--json"])
-    return JSONResponse(data, status_code=200 if code == 0 else 400)
+    code, data = await run_ai_orch(["tasks", "validate", "--tasks-dir", str(tasks_dir), "--json"])
+    status_code = 504 if code == 504 else (200 if code == 0 else 400)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_transition_task(request: Request) -> JSONResponse:
@@ -132,27 +437,27 @@ async def api_transition_task(request: Request) -> JSONResponse:
     if body.get("reason"):
         cmd.extend(["--reason", str(body["reason"])])
 
-    code, data = run_ai_orch(cmd)
+    code, data = await run_ai_orch(cmd)
     if code == 0:
-        # Auto-sync 00-INDEX.md after successful transition
-        run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(state.workspace / "tasks"), "--apply", "--json"])
+        await run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(state.workspace / "tasks"), "--apply", "--json"])
         await state.broadcast({"type": "task_transitioned", "task_id": task_id, "new_state": new_state})
-    return JSONResponse(data, status_code=200 if code == 0 else 400)
+    status_code = 504 if code == 504 else (200 if code == 0 else 400)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_sync_index(request: Request) -> JSONResponse:
     tasks_dir = state.workspace / "tasks"
-    code, data = run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--apply", "--json"])
+    code, data = await run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--apply", "--json"])
     if code == 0:
         await state.broadcast({"type": "index_synced"})
-    return JSONResponse(data, status_code=200 if code == 0 else 500)
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_get_task_detail(request: Request) -> JSONResponse:
     task_id = request.path_params["task_id"]
     tasks_dir = state.workspace / "tasks"
 
-    # Search in active and done directories
     candidates = list(tasks_dir.glob(f"*/{task_id}-*.md")) + list(tasks_dir.glob(f"*/{task_id}/README.md"))
     candidates += list(tasks_dir.glob(f"done/*/{task_id}-*.md")) + list(tasks_dir.glob(f"done/*/{task_id}/README.md"))
 
@@ -180,9 +485,9 @@ async def api_get_task_detail(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_env_status(request: Request) -> JSONResponse:
-    code, data = run_ai_orch(["env", "status", "--workspace", str(state.workspace), "--json"])
+    code, data = await run_ai_orch(["env", "status", "--workspace", str(state.workspace), "--json"])
     if code != 0:
-        return JSONResponse({"error": data}, status_code=500)
+        return JSONResponse({"error": data} if not isinstance(data, dict) else data, status_code=504 if code == 504 else 500)
     return JSONResponse(data)
 
 
@@ -198,10 +503,11 @@ async def api_install_skills(request: Request) -> JSONResponse:
     if link:
         cmd.append("--link")
 
-    code, data = run_ai_orch(cmd)
+    code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "skills_installed", "repo": repo, "scope": scope})
-    return JSONResponse(data, status_code=200 if code == 0 else 500)
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_register_mcp(request: Request) -> JSONResponse:
@@ -216,10 +522,11 @@ async def api_register_mcp(request: Request) -> JSONResponse:
     if provision_venv:
         cmd.append("--provision-venv")
 
-    code, data = run_ai_orch(cmd)
+    code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "mcp_registered", "server": server})
-    return JSONResponse(data, status_code=200 if code == 0 else 500)
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_remove_skill(request: Request) -> JSONResponse:
@@ -231,18 +538,20 @@ async def api_remove_skill(request: Request) -> JSONResponse:
         return JSONResponse({"error": "skill and assistant are required"}, status_code=400)
 
     cmd = ["env", "remove-skill", str(skill), "--assistant", str(assistant), "--scope", scope, "--workspace", str(state.workspace), "--json"]
-    code, data = run_ai_orch(cmd)
+    code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "skill_removed", "skill": skill, "assistant": assistant})
-    return JSONResponse(data, status_code=200 if code == 0 else 500)
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_resolve_conflicts(request: Request) -> JSONResponse:
     cmd = ["env", "resolve-conflicts", "--workspace", str(state.workspace), "--json"]
-    code, data = run_ai_orch(cmd)
+    code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "conflicts_resolved"})
-    return JSONResponse(data, status_code=200 if code == 0 else 500)
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -250,9 +559,9 @@ async def api_resolve_conflicts(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_config_show(request: Request) -> JSONResponse:
-    code, data = run_ai_orch(["config", "show", "--workspace", str(state.workspace), "--json"])
+    code, data = await run_ai_orch(["config", "show", "--workspace", str(state.workspace), "--json"])
     if code != 0:
-        return JSONResponse({"error": data}, status_code=500)
+        return JSONResponse({"error": data} if not isinstance(data, dict) else data, status_code=504 if code == 504 else 500)
     return JSONResponse(data)
 
 
@@ -276,22 +585,25 @@ async def api_config_set_profile(request: Request) -> JSONResponse:
     if body.get("scope") == "project":
         cmd.extend(["--workspace", str(state.workspace)])
 
-    code, data = run_ai_orch(cmd)
+    code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "config_updated"})
-    return JSONResponse(data, status_code=200 if code == 0 else 500)
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_render_agents_md(request: Request) -> JSONResponse:
-    code, data = run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--json"])
-    return JSONResponse(data)
+    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--json"])
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_apply_agents_md(request: Request) -> JSONResponse:
-    code, data = run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--apply", "--json"])
+    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--apply", "--json"])
     if code == 0:
         await state.broadcast({"type": "agents_md_applied"})
-    return JSONResponse(data, status_code=200 if code == 0 else 500)
+    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +616,6 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     try:
         await websocket.send_json({"type": "connected", "workspace": str(state.workspace)})
         while True:
-            # Keepalive / ping-pong
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
@@ -317,8 +628,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 
 routes = [
+    Route("/", serve_index, methods=["GET"]),
+    Route("/index.html", serve_index, methods=["GET"]),
     Route("/api/workspace", api_get_workspace, methods=["GET"]),
-    Route("/api/workspace/switch", api_switch_workspace, methods=["POST"]),
     Route("/api/tasks", api_list_tasks, methods=["GET"]),
     Route("/api/tasks/validate", api_validate_tasks, methods=["GET"]),
     Route("/api/tasks/transition", api_transition_task, methods=["POST"]),
@@ -336,27 +648,30 @@ routes = [
     WebSocketRoute("/ws", ws_endpoint),
 ]
 
-# Static UI mount if built
-dist_dir = UI_ROOT / "frontend" / "dist"
 if dist_dir.is_dir():
-    routes.append(Mount("/", app=StaticFiles(directory=str(dist_dir), html=True), name="static"))
+    routes.append(Mount("/", app=SPAStaticFiles(directory=str(dist_dir), html=False), name="static"))
+else:
+    routes.append(Route("/{path:path}", serve_index, methods=["GET"]))
 
 app = Starlette(
     routes=routes,
+    lifespan=lifespan,
     middleware=[
-        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+        Middleware(AuthAndHostMiddleware),
     ],
 )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=8780, help="Port to listen on (default: 8780)")
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1)")
-    parser.add_argument("--workspace", default=str(DEFAULT_WORKSPACE), help="Initial workspace path")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8780")), help="Port to listen on (default: 8780)")
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"), help="Host to bind (default: 127.0.0.1)")
+    parser.add_argument("--workspace", default=str(state.workspace), help="Initial workspace path")
     args = parser.parse_args()
 
-    state.set_workspace(pathlib.Path(args.workspace))
+    state.workspace = pathlib.Path(args.workspace).resolve()
+    os.environ["PORT"] = str(args.port)
+    os.environ["HOST"] = args.host
     import uvicorn
     print(f"==> AI Orchestration Server listening on http://{args.host}:{args.port}")
     print(f"==> Active Workspace: {state.workspace}")

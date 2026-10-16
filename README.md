@@ -5,7 +5,7 @@
 `ai-orchestration-ui` provides a zero-friction visual interface for managing task backlogs, installing skills/MCPs across assistants, inspecting environment drift, and configuring the project orchestrator and role profiles.
 
 It is built as a **decoupled, embeddable architecture**:
-- **In Web Mode:** A lightweight local Python backend (`backend/server.py`) powered by Starlette/Uvicorn serves the API and static bundle over `http://localhost:8765`, with WebSocket live updates whenever `tasks/` or config files change on disk.
+- **In Web Mode:** A lightweight local Python backend (`backend/server.py`) powered by Starlette/Uvicorn serves the API and static bundle over `http://127.0.0.1:8780`, with WebSocket live updates whenever `tasks/` or config files change on disk.
 - **In VS Code Extension Mode:** The exact same bundled frontend (`frontend/dist/`) embeds directly inside a VS Code Webview panel, communicating seamlessly via `vscode.postMessage` without rewriting a single React component (`frontend/src/api.ts`).
 
 ---
@@ -49,11 +49,40 @@ flowchart TB
 # 1. Build frontend assets (Vite + React)
 cd frontend && npm install && npm run build && cd ..
 
-# 2. Launch the backend server (starts on http://localhost:8765)
-./start.sh
+# 2. Launch the backend server for a workspace (default: current directory)
+./start.sh [workspace_path]
 ```
 
-Open `http://localhost:8765` in your browser.
+Open `http://127.0.0.1:8780` in your browser.
+
+### Fixed Workspace per Process
+
+The active workspace is fixed per backend process and cannot be modified dynamically at runtime:
+- `start.sh` canonicalizes the target workspace path before directory changes and exports `AI_ORCH_WORKSPACE`.
+- To manage a different workspace, start a separate server instance passing the workspace path: `./start.sh /path/to/another/repo`.
+
+---
+
+## Security & Authentication Model
+
+The control plane implements strict local isolation and defense against cross-site scripting and DNS rebinding attacks:
+
+1. **Per-Machine Secret Token:**
+   - On first startup, a 32-byte urlsafe base64 token is generated and persisted at `~/.config/ai-orchestration/ui-token` with restricted permissions (`0600`).
+   - The config directory can be overridden using the `AI_ORCH_CONFIG_DIR` environment variable.
+   - The token persists across restarts so open tabs and sessions reconnect smoothly.
+2. **Meta Tag Injection:**
+   - The root page `/` and SPA fallback routes serve `index.html` with `<meta name="ai-orch-token" content="...">` dynamically injected into `<head>` and header `Cache-Control: no-store`.
+   - The browser frontend reads the token from this meta tag on load.
+3. **Request & WebSocket Authentication:**
+   - Every REST request to `/api/*` requires the header `X-AI-Orch-Token` matching the token (constant-time comparison). Unauthorized requests are rejected with `401 {"error":"unauthorized"}`.
+   - On encountering a `401`, the frontend automatically reloads the page once (sessionStorage-guarded) to refresh the token.
+   - The WebSocket endpoint `/ws` requires `?token=<token>`. Invalid or missing tokens result in handshake rejection / close code `4401`.
+4. **Host Header Allowlist:**
+   - Requests whose `Host` header does not match `127.0.0.1:<port>` or `localhost:<port>` are rejected with `400 Invalid Host header`.
+   - Allowed hosts can be customized via the `AI_ORCH_ALLOWED_HOSTS` environment variable (comma-separated list).
+5. **CORS Disabled:**
+   - Cross-Origin Resource Sharing (CORS) middleware is removed entirely. Cross-origin web pages cannot access or trigger endpoints.
 
 ---
 
@@ -61,7 +90,7 @@ Open `http://localhost:8765` in your browser.
 
 - **Backend:** Python 3.11+ / Starlette + Uvicorn (zero heavy dependencies), consuming `ai-orchestration/bin/ai-orch --json`.
 - **Frontend:** React 18, TypeScript, Vite, Lucide Icons, pure responsive CSS.
-- **State Synchronization:** WebSocket (`/ws`) provides instant live updates when files in `tasks/` or `orchestration.toml` are modified by CLI agents or git commands.
+- **State Synchronization:** Background file watcher (via `watchfiles` or stdlib mtime polling) with 300 ms debounce broadcasts `{"type":"changed","areas":[...]}` over `/ws` whenever `tasks/**/*.md` or configuration TOML files change.
 - **VS Code Compatibility:** `frontend/src/api.ts` detects `window.acquireVsCodeApi()` and seamlessly routes requests through `vscode.postMessage` when running in the extension.
 
 ## License
