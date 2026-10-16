@@ -49,6 +49,7 @@ export interface TaskListResponse {
   tasks_dir: string;
   emergent_tasks: TaskItem[];
   initiatives: InitiativeItem[];
+  all_tasks?: TaskItem[];
 }
 
 export interface WorkspaceInfo {

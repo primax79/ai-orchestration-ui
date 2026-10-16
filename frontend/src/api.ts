@@ -16,10 +16,40 @@ declare global {
   }
 }
 
-export const isVsCode = typeof window.acquireVsCodeApi === 'function';
+export const isVsCode = typeof window !== 'undefined' && typeof window.acquireVsCodeApi === 'function';
 export const vscode = isVsCode && window.acquireVsCodeApi ? window.acquireVsCodeApi() : null;
 
-// Helper for HTTP fetch in browser mode
+let messageSeq = 0;
+const pendingRequests = new Map<string, { resolve: (val: any) => void; reject: (err: any) => void }>();
+let globalWsListener: ((msg: any) => void) | null = null;
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('message', (event) => {
+    const { id, data, error, ok, type } = event.data || {};
+    if (id && pendingRequests.has(id)) {
+      const { resolve, reject } = pendingRequests.get(id)!;
+      pendingRequests.delete(id);
+      if (ok) {
+        resolve(data);
+      } else {
+        reject(new Error(error || 'VS Code message failed'));
+      }
+    } else if (type === 'tasks_changed' && globalWsListener) {
+      globalWsListener({ type: 'tasks_changed' });
+    }
+  });
+}
+
+function sendVsCodeMessage<T>(type: string, payload?: any): Promise<T> {
+  return new Promise((resolve, reject) => {
+    if (!vscode) return reject(new Error('VS Code API not available'));
+    const id = `req_${++messageSeq}_${Date.now()}`;
+    pendingRequests.set(id, { resolve, reject });
+    vscode.postMessage({ id, type, payload });
+  });
+}
+
+// Helper for HTTP fetch in standalone browser mode
 async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const url = endpoint.startsWith('http') ? endpoint : endpoint;
   const res = await fetch(url, {
@@ -42,10 +72,16 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> 
 
 export const api = {
   async getWorkspace(): Promise<WorkspaceInfo> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<WorkspaceInfo>('getWorkspace');
+    }
     return apiFetch<WorkspaceInfo>('/api/workspace');
   },
 
   async switchWorkspace(workspacePath: string): Promise<{ ok: boolean }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean }>('switchWorkspace', { workspacePath });
+    }
     return apiFetch<{ ok: boolean }>('/api/workspace/switch', {
       method: 'POST',
       body: JSON.stringify({ workspace_path: workspacePath }),
@@ -53,10 +89,16 @@ export const api = {
   },
 
   async getTasks(): Promise<TaskListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TaskListResponse>('getTasks');
+    }
     return apiFetch<TaskListResponse>('/api/tasks');
   },
 
   async validateTasks(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('validateTasks');
+    }
     return apiFetch('/api/tasks/validate');
   },
 
@@ -67,6 +109,9 @@ export const api = {
     verifier?: string,
     reason?: string
   ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('transitionTask', { taskId, newState, actor, verifier, reason });
+    }
     return apiFetch('/api/tasks/transition', {
       method: 'POST',
       body: JSON.stringify({
@@ -80,14 +125,23 @@ export const api = {
   },
 
   async syncIndex(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('syncIndex');
+    }
     return apiFetch('/api/tasks/sync-index', { method: 'POST' });
   },
 
   async getTaskDetail(taskId: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('getTaskDetail', { taskId });
+    }
     return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
   },
 
   async getEnvStatus(): Promise<EnvStatusResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<EnvStatusResponse>('getEnvStatus');
+    }
     return apiFetch<EnvStatusResponse>('/api/env/status');
   },
 
@@ -97,6 +151,9 @@ export const api = {
     repo = 'ai-orchestration',
     link = false
   ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('installSkills', { assistants, scope, repo, link });
+    }
     return apiFetch('/api/env/install-skills', {
       method: 'POST',
       body: JSON.stringify({ assistants, scope, repo, link }),
@@ -109,6 +166,9 @@ export const api = {
     scope: 'global' | 'project',
     provisionVenv = false
   ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('registerMcp', { server, assistants, scope, provisionVenv });
+    }
     return apiFetch('/api/env/register-mcp', {
       method: 'POST',
       body: JSON.stringify({
@@ -125,6 +185,9 @@ export const api = {
     assistant: string,
     scope: 'global' | 'project' = 'global'
   ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('removeSkill', { skill, assistant, scope });
+    }
     return apiFetch('/api/env/remove-skill', {
       method: 'POST',
       body: JSON.stringify({ skill, assistant, scope }),
@@ -132,10 +195,16 @@ export const api = {
   },
 
   async resolveConflicts(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('resolveConflicts');
+    }
     return apiFetch('/api/env/resolve-conflicts', { method: 'POST' });
   },
 
   async getConfig(): Promise<OrchestrationConfigResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<OrchestrationConfigResponse>('getConfig');
+    }
     return apiFetch<OrchestrationConfigResponse>('/api/config/show');
   },
 
@@ -147,6 +216,9 @@ export const api = {
     effort?: string,
     scope: 'global' | 'project' = 'global'
   ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('setProfile', { tool, profile, model, variant, effort, scope });
+    }
     return apiFetch('/api/config/set-profile', {
       method: 'POST',
       body: JSON.stringify({ tool, profile, model, variant, effort, scope }),
@@ -154,14 +226,27 @@ export const api = {
   },
 
   async renderAgentsMd(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('renderAgentsMd');
+    }
     return apiFetch('/api/config/render-agents-md');
   },
 
   async applyAgentsMd(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('applyAgentsMd');
+    }
     return apiFetch('/api/config/render-agents-md/apply', { method: 'POST' });
   },
 
   connectWebSocket(onMessage: (msg: any) => void): () => void {
+    if (isVsCode) {
+      globalWsListener = onMessage;
+      return () => {
+        globalWsListener = null;
+      };
+    }
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host || 'localhost:8780';
     const ws = new WebSocket(`${protocol}//${host}/ws`);

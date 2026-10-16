@@ -15,7 +15,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
   const [syncingIndex, setSyncingIndex] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const tasks = data?.emergent_tasks || [];
+  const tasks = data?.all_tasks || data?.emergent_tasks || [];
   const initiatives = data?.initiatives || [];
 
   // Compute stats
