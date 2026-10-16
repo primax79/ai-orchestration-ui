@@ -20,7 +20,7 @@ if not os.environ.get("AI_ORCH_BIN"):
     if candidate_bin.is_file():
         os.environ["AI_ORCH_BIN"] = str(candidate_bin)
 
-from server import app, get_initial_workspace, get_or_create_token, state  # noqa: E402
+from server import CSP_HEADER, app, get_initial_workspace, get_or_create_token, run_ai_orch, state  # noqa: E402
 
 client = TestClient(app)
 
@@ -45,19 +45,35 @@ def test_serve_frontend_index_and_meta_token():
     res = client.get("/")
     assert res.status_code == 200
     assert res.headers.get("cache-control") == "no-store"
+    assert res.headers.get("content-security-policy") == CSP_HEADER
     assert f'<meta name="ai-orch-token" content="{token}">' in res.text
 
     # /index.html
     res_index = client.get("/index.html")
     assert res_index.status_code == 200
     assert res_index.headers.get("cache-control") == "no-store"
+    assert res_index.headers.get("content-security-policy") == CSP_HEADER
     assert f'<meta name="ai-orch-token" content="{token}">' in res_index.text
 
     # SPA route fallback
     res_spa = client.get("/some/spa/route")
     assert res_spa.status_code == 200
     assert res_spa.headers.get("cache-control") == "no-store"
+    assert res_spa.headers.get("content-security-policy") == CSP_HEADER
     assert f'<meta name="ai-orch-token" content="{token}">' in res_spa.text
+
+    # Assert individual CSP directives
+    csp = res.headers["content-security-policy"]
+    assert "default-src 'self'" in csp
+    assert "script-src 'self'" in csp
+    assert "style-src 'self' 'unsafe-inline'" in csp
+    assert "connect-src 'self' ws://127.0.0.1:* ws://localhost:*" in csp
+    assert "object-src 'none'" in csp
+    assert "base-uri 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+    # Script-src must never allow 'unsafe-inline'
+    script_part = [part for part in csp.split(";") if "script-src" in part][0]
+    assert "'unsafe-inline'" not in script_part
 
 
 def test_api_auth_token():
@@ -246,3 +262,109 @@ def test_render_agents_md_with_token():
     data = res.json()
     assert "rendered_block" in data
     assert "<!-- BEGIN ai-orchestration -->" in data["rendered_block"]
+
+
+@pytest.mark.anyio
+async def test_process_group_cleanup_grandchild(monkeypatch, tmp_path):
+    child_pid_file = tmp_path / "child.pid"
+    grandchild_pid_file = tmp_path / "grandchild.pid"
+
+    # Stub CLI script that writes its PID, spawns a grandchild writing its PID, then sleeps
+    stub_script = tmp_path / "stub_grandchild.sh"
+    stub_script.write_text(
+        f"#!/bin/sh\n"
+        f"echo $$ > '{child_pid_file}'\n"
+        f"sleep 30 &\n"
+        f"echo $! > '{grandchild_pid_file}'\n"
+        f"sleep 30\n",
+        encoding="utf-8",
+    )
+    stub_script.chmod(0o755)
+
+    monkeypatch.setenv("AI_ORCH_BIN", str(stub_script))
+
+    # Execute run_ai_orch with 1s timeout
+    code, res = await run_ai_orch([], timeout=1.0)
+    assert code == 504
+    assert isinstance(res, dict)
+    assert "CLI command timed out" in res.get("error", "")
+
+    assert child_pid_file.is_file()
+    assert grandchild_pid_file.is_file()
+
+    child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+    grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+
+    # Wait briefly for OS process cleanup
+    for _ in range(20):
+        try:
+            os.kill(child_pid, 0)
+            time.sleep(0.05)
+        except (ProcessLookupError, OSError):
+            break
+
+    for _ in range(20):
+        try:
+            os.kill(grandchild_pid, 0)
+            time.sleep(0.05)
+        except (ProcessLookupError, OSError):
+            break
+
+    # After the 504, both the child and grandchild PIDs are gone (os.kill(pid, 0) raises)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)
+
+
+@pytest.mark.anyio
+async def test_process_group_cleanup_on_cancellation(monkeypatch, tmp_path):
+    child_pid_file = tmp_path / "child.pid"
+    grandchild_pid_file = tmp_path / "grandchild.pid"
+
+    stub_script = tmp_path / "stub_cancel.sh"
+    stub_script.write_text(
+        f"#!/bin/sh\n"
+        f"echo $$ > '{child_pid_file}'\n"
+        f"sleep 30 &\n"
+        f"echo $! > '{grandchild_pid_file}'\n"
+        f"sleep 30\n",
+        encoding="utf-8",
+    )
+    stub_script.chmod(0o755)
+
+    monkeypatch.setenv("AI_ORCH_BIN", str(stub_script))
+
+    task = asyncio.create_task(run_ai_orch([], timeout=30.0))
+    for _ in range(20):
+        if child_pid_file.is_file() and grandchild_pid_file.is_file():
+            break
+        await asyncio.sleep(0.05)
+
+    child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+    grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    for _ in range(20):
+        try:
+            os.kill(child_pid, 0)
+            time.sleep(0.05)
+        except (ProcessLookupError, OSError):
+            break
+
+    for _ in range(20):
+        try:
+            os.kill(grandchild_pid, 0)
+            time.sleep(0.05)
+        except (ProcessLookupError, OSError):
+            break
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)

@@ -83,6 +83,34 @@ The control plane implements strict local isolation and defense against cross-si
    - Allowed hosts can be customized via the `AI_ORCH_ALLOWED_HOSTS` environment variable (comma-separated list).
 5. **CORS Disabled:**
    - Cross-Origin Resource Sharing (CORS) middleware is removed entirely. Cross-origin web pages cannot access or trigger endpoints.
+6. **Content-Security-Policy (CSP):**
+   - Every HTML response (index page and SPA fallback routes) carries a strict CSP header:
+     `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`
+   - Disallows inline scripts entirely while allowing necessary local WebSocket connections and React inline style attributes.
+7. **Process-Group Isolation & Cleanup:**
+   - Asynchronous CLI subprocesses run in independent process sessions (`start_new_session=True`).
+   - On timeout or coroutine cancellation, `SIGTERM` is dispatched to the entire process group (`os.killpg`), followed by `SIGKILL` after 5 seconds if necessary, preventing orphaned child and grandchild background processes.
+
+---
+
+## Development
+
+### Running the Backend Tests
+
+Run the test suite using `uv` without manually configuring a virtualenv:
+
+```bash
+uv run --no-project --with-requirements backend/requirements-dev.txt python -m pytest backend/test_server.py
+```
+
+Alternatively, use a local Python virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements-dev.txt
+python -m pytest backend/test_server.py
+```
 
 ---
 

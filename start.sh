@@ -10,16 +10,16 @@ PORT="${PORT:-8780}"
 HOST="${HOST:-127.0.0.1}"
 
 if [[ -z "${PYTHON_EXE:-}" ]]; then
-  if [[ -f "${SCRIPT_DIR}/../kilo-mcp/.venv/bin/python" ]]; then
+  if [[ -f "${SCRIPT_DIR}/.venv/bin/python" ]]; then
+    PYTHON_EXE="${SCRIPT_DIR}/.venv/bin/python"
+  elif [[ -f "${SCRIPT_DIR}/../kilo-mcp/.venv/bin/python" ]]; then
     PYTHON_EXE="${SCRIPT_DIR}/../kilo-mcp/.venv/bin/python"
-  elif [[ -f "${SCRIPT_DIR}/../../../../../kilo-mcp/.venv/bin/python" ]]; then
-    PYTHON_EXE="${SCRIPT_DIR}/../../../../../kilo-mcp/.venv/bin/python"
-  elif command -v python3 >/dev/null 2>&1 && python3 -c "import uvicorn" >/dev/null 2>&1; then
-    PYTHON_EXE="python3"
   else
     PYTHON_EXE="python3"
   fi
 fi
+
+echo "==> Using Python interpreter: ${PYTHON_EXE}"
 
 if [[ ! -d "${SCRIPT_DIR}/frontend/dist" ]]; then
   echo "==> Building frontend assets with Vite..."

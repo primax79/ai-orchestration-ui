@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import secrets
+import signal
 import sys
 from typing import Any, AsyncGenerator
 from urllib.parse import parse_qs
@@ -174,6 +175,63 @@ class OrchestrationState:
 state = OrchestrationState(get_initial_workspace())
 
 
+async def _cleanup_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Terminate the process group of proc (SIGTERM, then SIGKILL after 5s), drain pipes, and await completion."""
+    pgid = proc.pid
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (ProcessLookupError, OSError):
+        pass
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except (asyncio.TimeoutError, TimeoutError):
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+
+    # Always drain/close pipes and await proc.wait() so no zombie remains
+    if proc.stdout:
+        try:
+            while not proc.stdout.at_eof():
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+        except Exception:
+            pass
+
+    if proc.stderr:
+        try:
+            while not proc.stderr.at_eof():
+                chunk = await proc.stderr.read(65536)
+                if not chunk:
+                    break
+        except Exception:
+            pass
+
+    if proc._transport and not proc._transport.is_closing():
+        try:
+            proc._transport.close()
+        except Exception:
+            pass
+
+    try:
+        await proc.wait()
+    except Exception:
+        pass
+
+
 async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[int, dict[str, Any] | str]:
     """Execute `./bin/ai-orch <args...>` asynchronously and return (exit_code, parsed_json_or_text)."""
     bin_path = get_ai_orch_bin()
@@ -196,19 +254,19 @@ async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[in
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
     except Exception as exc:
         return 1, f"Failed to execute CLI command: {exc}"
 
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+    except (asyncio.TimeoutError, TimeoutError):
+        await _cleanup_process_group(proc)
         return 504, {"error": f"CLI command timed out after {timeout} seconds"}
+    except asyncio.CancelledError:
+        await asyncio.shield(_cleanup_process_group(proc))
+        raise
 
     out = stdout_bytes.decode("utf-8", errors="replace").strip()
     err = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -220,10 +278,20 @@ async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[in
 
 
 # ---------------------------------------------------------------------------
-# Static Serving & SPA Fallback with Meta Tag Injection
+# Static Serving & SPA Fallback with Meta Tag Injection and CSP
 # ---------------------------------------------------------------------------
 
 dist_dir = UI_ROOT / "frontend" / "dist"
+
+CSP_HEADER = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self' ws://127.0.0.1:* ws://localhost:*; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'"
+)
 
 
 async def serve_index(request: Request) -> Response:
@@ -245,7 +313,13 @@ async def serve_index(request: Request) -> Response:
     else:
         content = f"{meta_tag}\n{content}"
 
-    return HTMLResponse(content, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(
+        content,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": CSP_HEADER,
+        },
+    )
 
 
 class SPAStaticFiles(StaticFiles):
