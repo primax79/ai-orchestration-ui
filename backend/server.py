@@ -287,6 +287,7 @@ CSP_HEADER = (
     "default-src 'self'; "
     "script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
     "connect-src 'self' ws://127.0.0.1:* ws://localhost:*; "
     "object-src 'none'; "
     "base-uri 'none'; "

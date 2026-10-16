@@ -1,3 +1,5 @@
 starlette>=0.37.0
+# websockets is required for /ws: plain uvicorn answers WebSocket upgrades with HTTP 200
 uvicorn>=0.29.0
+websockets>=12.0
 watchfiles>=0.21.0

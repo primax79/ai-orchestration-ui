@@ -21,6 +21,13 @@ fi
 
 echo "==> Using Python interpreter: ${PYTHON_EXE}"
 
+# websockets is mandatory: without it uvicorn silently answers /ws upgrades with HTTP 200
+if ! "${PYTHON_EXE}" -c "import starlette, uvicorn, websockets" 2>/dev/null; then
+  echo "error: ${PYTHON_EXE} lacks the backend dependencies (starlette, uvicorn, websockets)." >&2
+  echo "       Create the UI venv: python3 -m venv ${SCRIPT_DIR}/.venv && ${SCRIPT_DIR}/.venv/bin/pip install -r ${SCRIPT_DIR}/backend/requirements.txt" >&2
+  exit 1
+fi
+
 if [[ ! -d "${SCRIPT_DIR}/frontend/dist" ]]; then
   echo "==> Building frontend assets with Vite..."
   (cd "${SCRIPT_DIR}/frontend" && npm run build)
