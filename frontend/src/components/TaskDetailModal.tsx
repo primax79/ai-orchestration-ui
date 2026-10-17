@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   X,
   CheckCircle,
@@ -18,11 +18,12 @@ import {
   Send,
   Paperclip,
 } from 'lucide-react';
-import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord } from '../types';
-import { api } from '../api';
+import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord, TreeNode, StructurePlanItem, TaskState } from '../types';
+import { api, taskStructureApi } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
 import { TaskRunsPanel } from './TaskRunsPanel';
+import { ConfirmDialog } from './ConfirmDialog';
 import {
   AttachmentItem,
   getAttachmentInfo,
@@ -32,6 +33,8 @@ import { TextViewerModal } from './TextViewerModal';
 
 interface TaskDetailModalProps {
   task: TaskItem;
+  tree?: Record<string, TreeNode>;
+  onSelectTask?: (task: TaskItem) => void;
   initialRunId?: string;
   onClose: () => void;
   onActionComplete: () => void;
@@ -76,6 +79,8 @@ const getStoredDocView = (): TaskDocView => {
 
 export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   task,
+  tree,
+  onSelectTask,
   initialRunId,
   onClose,
   onActionComplete,
@@ -97,6 +102,23 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [transitionError, setTransitionError] = useState<string | null>(null);
   const [indexOutOfSync, setIndexOutOfSync] = useState(false);
   const [showRunDialog, setShowRunDialog] = useState(false);
+
+  // Structure action dialog states
+  const [showAddSubtaskModal, setShowAddSubtaskModal] = useState(false);
+  const [subtaskTitle, setSubtaskTitle] = useState('');
+  const [subtaskKind, setSubtaskKind] = useState('feature');
+  const [subtaskLoading, setSubtaskLoading] = useState(false);
+  const [subtaskError, setSubtaskError] = useState<string | null>(null);
+
+  const [structureConfirmData, setStructureConfirmData] = useState<{
+    isOpen: boolean;
+    title: string;
+    summary?: string;
+    plan?: StructurePlanItem[];
+    planHash?: string;
+    actionType: 'add-child' | 'expand' | 'collapse';
+    extraPayload?: any;
+  } | null>(null);
 
   // Sync currentTask when incoming prop changes
   useEffect(() => {
@@ -127,6 +149,203 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       !currentTask.id.includes('.') &&
       !currentTask.id.startsWith('INIT-') &&
       currentTask.kind !== 'initiative_task');
+
+  const isContainer = Boolean(
+    currentTask.is_container ||
+    currentTask.node_type === 'container' ||
+    currentTask.node_type === 'initiative' ||
+    currentTask.is_leaf === false ||
+    (tree && tree[currentTask.id]?.is_container)
+  );
+
+  const breadcrumbs = useMemo(() => {
+    const list: Array<{ id: string; title: string; task?: TaskItem }> = [];
+    if (!currentTask?.id) return list;
+
+    if (tree && tree[currentTask.id]) {
+      let cur: TreeNode | undefined = tree[currentTask.id];
+      const visited = new Set<string>();
+      while (cur && !visited.has(cur.id)) {
+        visited.add(cur.id);
+        const nodeTask: TaskItem = {
+          id: cur.id,
+          title: cur.title,
+          category: cur.category || (cur.id.startsWith('T') ? 'emergent' : 'initiative'),
+          priority: cur.priority || 'P2',
+          priority_source: cur.priority_source,
+          priority_reason: cur.priority_reason,
+          size: cur.size,
+          size_source: cur.size_source,
+          state: (cur.derived_state || cur.state) as TaskState,
+          derived_state: cur.derived_state,
+          executor: cur.executor || 'kilo',
+          handoff: cur.handoff,
+          file_path: cur.file_path,
+          is_done: ['done', 'done with a caveat', 'dropped'].includes((cur.derived_state || cur.state) as string),
+          bundle_sha256: cur.bundle_sha256,
+          task_bundle_sha256: cur.task_hash,
+          labels: cur.labels,
+          label_sources: cur.label_sources,
+          kind: cur.kind || (cur.id.startsWith('T') ? 'emergent' : 'initiative_task'),
+          parent: cur.parent,
+          depth: cur.depth,
+          node_type: cur.node_type,
+          is_leaf: cur.is_leaf,
+          is_container: cur.is_container,
+          children: cur.children,
+          fields: cur.fields,
+          leaves_done: cur.leaves_done,
+          leaves_total: cur.leaves_total,
+        };
+        list.unshift({ id: cur.id, title: cur.title, task: nodeTask });
+        if (cur.parent && tree[cur.parent]) {
+          cur = tree[cur.parent];
+        } else {
+          break;
+        }
+      }
+    } else {
+      if (currentTask.id.includes('.')) {
+        const parts = currentTask.id.split('.');
+        for (let i = 1; i <= parts.length; i++) {
+          const segId = parts.slice(0, i).join('.');
+          list.push({ id: segId, title: segId === currentTask.id ? currentTask.title : segId });
+        }
+      } else {
+        list.push({ id: currentTask.id, title: currentTask.title });
+      }
+    }
+    return list;
+  }, [currentTask, tree]);
+
+  const inheritedItems = useMemo(() => {
+    const items: Array<{ key: string; value: string; source: string }> = [];
+    const nodeFromTree = tree ? tree[currentTask.id] : undefined;
+    const fields = nodeFromTree?.fields || currentTask.fields;
+
+    if (fields) {
+      for (const [k, f] of Object.entries(fields)) {
+        if (f && typeof f.source === 'string' && f.source.startsWith('inherited')) {
+          const valStr = typeof f.value === 'object' ? JSON.stringify(f.value) : String(f.value ?? '-');
+          items.push({ key: k, value: valStr, source: f.source });
+        }
+      }
+    }
+
+    if (currentTask.priority_source && currentTask.priority_source.startsWith('inherited')) {
+      if (!items.some((i) => i.key.toLowerCase() === 'priority')) {
+        items.push({ key: 'Priority', value: currentTask.priority, source: currentTask.priority_source });
+      }
+    }
+
+    if (nodeFromTree?.label_sources) {
+      for (const [lbl, src] of Object.entries(nodeFromTree.label_sources)) {
+        if (src && src.startsWith('inherited')) {
+          items.push({ key: `Label (${lbl})`, value: lbl, source: src });
+        }
+      }
+    }
+
+    return items;
+  }, [currentTask, tree]);
+
+  const handleOpenAddSubtask = () => {
+    setShowAddSubtaskModal(true);
+    setSubtaskTitle('');
+    setSubtaskKind('feature');
+    setSubtaskError(null);
+  };
+
+  const handlePreviewAddSubtask = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!subtaskTitle.trim()) return;
+
+    setSubtaskLoading(true);
+    setSubtaskError(null);
+    try {
+      const res = await taskStructureApi.previewAddChild(currentTask.id, {
+        title: subtaskTitle.trim(),
+        kind: subtaskKind,
+      });
+      if (!res.ok) {
+        throw new Error(res.error || 'Preview failed');
+      }
+      setStructureConfirmData({
+        isOpen: true,
+        title: `Confirm Add Subtask under ${currentTask.id}`,
+        summary: res.summary || `Add subtask ${res.allocated_id || ''} under ${currentTask.id}`,
+        plan: res.plan,
+        planHash: res.plan_hash || res.hash,
+        actionType: 'add-child',
+        extraPayload: { title: subtaskTitle.trim(), kind: subtaskKind },
+      });
+      setShowAddSubtaskModal(false);
+    } catch (err: any) {
+      setSubtaskError(err?.message || String(err));
+    } finally {
+      setSubtaskLoading(false);
+    }
+  };
+
+  const handlePreviewExpand = async () => {
+    try {
+      const res = await taskStructureApi.previewExpandTask(currentTask.id);
+      if (!res.ok) {
+        throw new Error(res.error || 'Preview failed');
+      }
+      setStructureConfirmData({
+        isOpen: true,
+        title: `Expand ${currentTask.id} to folder`,
+        summary: res.summary || `Convert inline task ${currentTask.id} into a folder bundle`,
+        plan: res.plan,
+        planHash: res.plan_hash || res.hash,
+        actionType: 'expand',
+      });
+    } catch (err: any) {
+      alert(`Expand failed: ${err.message || String(err)}`);
+    }
+  };
+
+  const handlePreviewCollapse = async () => {
+    try {
+      const res = await taskStructureApi.previewCollapseTask(currentTask.id);
+      if (!res.ok) {
+        throw new Error(res.error || 'Preview failed');
+      }
+      setStructureConfirmData({
+        isOpen: true,
+        title: `Collapse ${currentTask.id} to block`,
+        summary: res.summary || `Collapse folder ${currentTask.id} back into a block`,
+        plan: res.plan,
+        planHash: res.plan_hash || res.hash,
+        actionType: 'collapse',
+      });
+    } catch (err: any) {
+      alert(`Collapse failed: ${err.message || String(err)}`);
+    }
+  };
+
+  const handleApplyStructureConfirm = async (planHash?: string) => {
+    if (!structureConfirmData) return;
+    const { actionType, extraPayload } = structureConfirmData;
+    const hash = planHash || structureConfirmData.planHash || '';
+
+    if (actionType === 'add-child') {
+      await taskStructureApi.addChild(currentTask.id, {
+        title: extraPayload.title,
+        kind: extraPayload.kind,
+        expect_plan_hash: hash,
+      });
+    } else if (actionType === 'expand') {
+      await taskStructureApi.expandTask(currentTask.id, { expect_plan_hash: hash });
+    } else if (actionType === 'collapse') {
+      await taskStructureApi.collapseTask(currentTask.id, { expect_plan_hash: hash });
+    }
+
+    setStructureConfirmData(null);
+    await reloadTaskDetailAndState();
+    onActionComplete();
+  };
 
   const [taskBlobUrls, setTaskBlobUrls] = useState<Record<string, string>>({});
   const [viewingTextAttachment, setViewingTextAttachment] = useState<{ filename: string; size?: number } | null>(null);
@@ -466,6 +685,54 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           borderBottom: '1px solid #334155',
         }}>
           <div>
+            {/* Breadcrumbs */}
+            {breadcrumbs.length > 1 && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.35rem',
+                  fontSize: '0.75rem',
+                  color: '#94a3b8',
+                  marginBottom: '0.4rem',
+                  flexWrap: 'wrap',
+                }}
+              >
+                {breadcrumbs.map((bc: { id: string; title: string; task?: TaskItem }, idx: number) => {
+                  const isCurrent = idx === breadcrumbs.length - 1;
+                  return (
+                    <React.Fragment key={bc.id}>
+                      {idx > 0 && <span style={{ color: '#475569' }}>/</span>}
+                      {isCurrent ? (
+                        <span style={{ color: '#cbd5e1', fontWeight: 600 }}>{bc.id}</span>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            if (bc.task) {
+                              setCurrentTask(bc.task);
+                            }
+                            onSelectTask?.(bc.task || ({ id: bc.id, title: bc.title } as TaskItem));
+                          }}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            padding: 0,
+                            color: '#818cf8',
+                            cursor: 'pointer',
+                            fontSize: '0.75rem',
+                            textDecoration: 'underline',
+                          }}
+                          title={bc.title}
+                        >
+                          {bc.id}
+                        </button>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+            )}
+
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
               <span style={{
                 fontSize: '0.75rem',
@@ -600,6 +867,48 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               <code style={{ fontSize: '0.8rem', color: '#e2e8f0', fontFamily: 'monospace', display: 'block', wordBreak: 'break-all' }}>
                 {currentTask.handoff}
               </code>
+            </div>
+          )}
+
+          {/* Inheritance section when data exists */}
+          {inheritedItems.length > 0 && (
+            <div style={{
+              backgroundColor: '#0f172a',
+              border: '1px solid #334155',
+              borderRadius: '0.5rem',
+              padding: '0.75rem 1rem',
+              marginBottom: '1.5rem',
+            }}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                fontSize: '0.75rem',
+                fontWeight: 600,
+                color: '#818cf8',
+                textTransform: 'uppercase',
+                marginBottom: '0.5rem',
+              }}>
+                <span>Inheritance</span>
+              </div>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                gap: '0.6rem',
+                fontSize: '0.8rem',
+              }}>
+                {inheritedItems.map((item: { key: string; value: string; source: string }) => (
+                  <div key={item.key} style={{ display: 'flex', flexDirection: 'column' }}>
+                    <span style={{ color: '#64748b', fontSize: '0.7rem', textTransform: 'uppercase', fontWeight: 600 }}>
+                      {item.key}
+                    </span>
+                    <span style={{ color: '#e2e8f0', fontWeight: 500, wordBreak: 'break-word' }}>
+                      {item.value}{' '}
+                      <span style={{ color: '#818cf8', fontSize: '0.75rem' }}>({item.source})</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 
@@ -1425,212 +1734,330 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             Current State: <strong style={{ color: '#cbd5e1' }}>{currentTask.state}</strong>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
-            {/* Run button for emergent tasks in active states */}
-            {(currentTask.kind === 'emergent' || currentTask.id.startsWith('T')) &&
-              currentTask.state !== 'open' &&
-              currentTask.state !== 'done' &&
-              currentTask.state !== 'done with a caveat' &&
-              currentTask.state !== 'dropped' &&
-              currentTask.state !== 'verified' && (
-                <button
-                  onClick={() => setShowRunDialog(true)}
-                  disabled={loading}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    padding: '0.4rem 0.8rem',
-                    borderRadius: '0.375rem',
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            {isContainer ? (
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                width: '100%',
+                flexWrap: 'wrap',
+                gap: '0.75rem',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                  <span style={{
+                    fontSize: '0.75rem',
+                    padding: '0.2rem 0.5rem',
+                    borderRadius: '1rem',
+                    backgroundColor: '#312e81',
+                    color: '#c7d2fe',
                     border: '1px solid #6366f1',
-                    backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                    color: '#a5b4fc',
                     fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  <Play size={14} />
-                  <span>Run…</span>
-                </button>
-              )}
+                  }}>
+                    Derived State: {currentTask.derived_state || currentTask.state}
+                  </span>
+                  <span style={{ fontSize: '0.8rem', color: '#94a3b8' }}>
+                    Progress: <strong style={{ color: '#f1f5f9' }}>{currentTask.leaves_done ?? 0} / {currentTask.leaves_total ?? 0}</strong> leaves done
+                  </span>
+                  <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
+                    (Transitions apply to leaves only)
+                  </span>
+                </div>
 
-            {currentTask.state === 'open' && (
-              currentTask.kind === 'emergent' || currentTask.id.startsWith('T') ? (
-                <button
-                  onClick={() => setShowRunDialog(true)}
-                  disabled={loading}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    padding: '0.4rem 0.8rem',
-                    borderRadius: '0.375rem',
-                    border: 'none',
-                    backgroundColor: '#4f46e5',
-                    color: '#fff',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  <Play size={15} />
-                  <span>Run…</span>
-                </button>
-              ) : (
-                <button
-                  onClick={() => handleTransition('in progress')}
-                  disabled={loading}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    padding: '0.4rem 0.8rem',
-                    borderRadius: '0.375rem',
-                    border: 'none',
-                    backgroundColor: '#6366f1',
-                    color: '#fff',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
-                  <span>Start Task (In Progress)</span>
-                </button>
-              )
-            )}
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <button
+                    onClick={handleOpenAddSubtask}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.3rem',
+                      padding: '0.4rem 0.8rem',
+                      borderRadius: '0.375rem',
+                      border: 'none',
+                      backgroundColor: '#6366f1',
+                      color: '#fff',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      fontSize: '0.8rem',
+                    }}
+                  >
+                    <Plus size={14} />
+                    <span>Add Subtask</span>
+                  </button>
 
-            {/* Pause button when in progress */}
-            {currentTask.state === 'in progress' && (
-              <button
-                onClick={() => handleTransition('paused')}
-                disabled={loading}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.3rem',
-                  padding: '0.4rem 0.8rem',
-                  borderRadius: '0.375rem',
-                  border: '1px solid #f59e0b',
-                  backgroundColor: 'transparent',
-                  color: '#f59e0b',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
-              >
-                {loading ? <Loader2 size={15} className="spin" /> : <Pause size={15} />}
-                <span>Pause</span>
-              </button>
-            )}
-
-            {/* Resume button when paused */}
-            {currentTask.state === 'paused' && (
-              <button
-                onClick={() => handleTransition('in progress')}
-                disabled={loading}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.3rem',
-                  padding: '0.4rem 0.8rem',
-                  borderRadius: '0.375rem',
-                  border: 'none',
-                  backgroundColor: '#6366f1',
-                  color: '#fff',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
-              >
-                {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
-                <span>Resume Task (In Progress)</span>
-              </button>
-            )}
-
-            {/* R6: Generic delivered transition is HIDDEN when task has runs */}
-            {currentTask.state === 'in progress' && taskRuns.length === 0 && (
-              <button
-                onClick={() => handleTransition('delivered')}
-                disabled={loading}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.3rem',
-                  padding: '0.4rem 0.8rem',
-                  borderRadius: '0.375rem',
-                  border: 'none',
-                  backgroundColor: '#0ea5e9',
-                  color: '#fff',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
-              >
-                {loading ? <Loader2 size={15} className="spin" /> : <CheckCircle size={15} />}
-                <span>Mark Delivered (Needs Verification)</span>
-              </button>
-            )}
-
-            {currentTask.state === 'delivered' && (
+                  {currentTask.is_folder && !currentTask.id.startsWith('INIT-') && (
+                    <button
+                      onClick={handlePreviewCollapse}
+                      style={{
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #475569',
+                        backgroundColor: '#0f172a',
+                        color: '#cbd5e1',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                        fontSize: '0.8rem',
+                      }}
+                    >
+                      Collapse to Block
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
               <>
-                <button
-                  onClick={() => setShowBounceInput(true)}
-                  disabled={loading}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    padding: '0.4rem 0.8rem',
-                    borderRadius: '0.375rem',
-                    border: '1px solid #ef4444',
-                    backgroundColor: 'transparent',
-                    color: '#f87171',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  <RotateCcw size={15} />
-                  <span>Bounce</span>
-                </button>
+                {/* Structure actions for open leaf: Add Subtask and Expand */}
+                {currentTask.state === 'open' && (
+                  <>
+                    <button
+                      onClick={handleOpenAddSubtask}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.25rem',
+                        padding: '0.4rem 0.75rem',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #475569',
+                        backgroundColor: '#0f172a',
+                        color: '#cbd5e1',
+                        fontSize: '0.8rem',
+                        fontWeight: 500,
+                        cursor: 'pointer',
+                      }}
+                      title="Add child subtask (converts leaf into container)"
+                    >
+                      <Plus size={14} />
+                      <span>Add Subtask</span>
+                    </button>
 
-                <button
-                  onClick={() => handleTransition('verified', 'operator:owner', 'Verified by human operator in UI')}
-                  disabled={loading}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.3rem',
-                    padding: '0.4rem 0.8rem',
-                    borderRadius: '0.375rem',
-                    border: 'none',
-                    backgroundColor: '#10b981',
-                    color: '#fff',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
-                  <span>Approve (Verified)</span>
-                </button>
+                    {!currentTask.is_folder && !currentTask.id.startsWith('INIT-') && (
+                      <button
+                        onClick={handlePreviewExpand}
+                        style={{
+                          padding: '0.4rem 0.75rem',
+                          borderRadius: '0.375rem',
+                          border: '1px solid #475569',
+                          backgroundColor: '#0f172a',
+                          color: '#cbd5e1',
+                          fontSize: '0.8rem',
+                          fontWeight: 500,
+                          cursor: 'pointer',
+                        }}
+                        title="Expand inline task to folder bundle"
+                      >
+                        Expand to Folder
+                      </button>
+                    )}
+                  </>
+                )}
+
+                {/* Optional agent run trigger when in flight */}
+                {taskRuns.length > 0 &&
+                  currentTask.state !== 'open' &&
+                  currentTask.state !== 'done' &&
+                  currentTask.state !== 'done with a caveat' &&
+                  currentTask.state !== 'dropped' &&
+                  currentTask.state !== 'verified' && (
+                    <button
+                      onClick={() => setShowRunDialog(true)}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #6366f1',
+                        backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                        color: '#a5b4fc',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <Play size={14} />
+                      <span>Run…</span>
+                    </button>
+                  )}
+
+                {currentTask.state === 'open' && (
+                  currentTask.kind === 'emergent' || currentTask.id.startsWith('T') ? (
+                    <button
+                      onClick={() => setShowRunDialog(true)}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: 'none',
+                        backgroundColor: '#4f46e5',
+                        color: '#fff',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <Play size={15} />
+                      <span>Run…</span>
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => handleTransition('in progress')}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: 'none',
+                        backgroundColor: '#6366f1',
+                        color: '#fff',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+                      <span>Start Task (In Progress)</span>
+                    </button>
+                  )
+                )}
+
+                {/* Pause button when in progress */}
+                {currentTask.state === 'in progress' && (
+                  <button
+                    onClick={() => handleTransition('paused')}
+                    disabled={loading}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.3rem',
+                      padding: '0.4rem 0.8rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #f59e0b',
+                      backgroundColor: 'transparent',
+                      color: '#f59e0b',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {loading ? <Loader2 size={15} className="spin" /> : <Pause size={15} />}
+                    <span>Pause</span>
+                  </button>
+                )}
+
+                {/* Resume button when paused */}
+                {currentTask.state === 'paused' && (
+                  <button
+                    onClick={() => handleTransition('in progress')}
+                    disabled={loading}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.3rem',
+                      padding: '0.4rem 0.8rem',
+                      borderRadius: '0.375rem',
+                      border: 'none',
+                      backgroundColor: '#6366f1',
+                      color: '#fff',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+                    <span>Resume Task (In Progress)</span>
+                  </button>
+                )}
+
+                {/* R6: Generic delivered transition is HIDDEN when task has runs */}
+                {currentTask.state === 'in progress' && taskRuns.length === 0 && (
+                  <button
+                    onClick={() => handleTransition('delivered')}
+                    disabled={loading}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.3rem',
+                      padding: '0.4rem 0.8rem',
+                      borderRadius: '0.375rem',
+                      border: 'none',
+                      backgroundColor: '#0ea5e9',
+                      color: '#fff',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {loading ? <Loader2 size={15} className="spin" /> : <CheckCircle size={15} />}
+                    <span>Mark Delivered (Needs Verification)</span>
+                  </button>
+                )}
+
+                {currentTask.state === 'delivered' && (
+                  <>
+                    <button
+                      onClick={() => setShowBounceInput(true)}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #ef4444',
+                        backgroundColor: 'transparent',
+                        color: '#f87171',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <RotateCcw size={15} />
+                      <span>Bounce</span>
+                    </button>
+
+                    <button
+                      onClick={() => handleTransition('verified', 'operator:owner', 'Verified by human operator in UI')}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: 'none',
+                        backgroundColor: '#10b981',
+                        color: '#fff',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
+                      <span>Approve (Verified)</span>
+                    </button>
+                  </>
+                )}
+
+                {currentTask.state === 'verified' && (
+                  <button
+                    onClick={() => handleTransition('done', undefined, 'Completed and integrated')}
+                    disabled={loading}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.3rem',
+                      padding: '0.4rem 0.8rem',
+                      borderRadius: '0.375rem',
+                      border: 'none',
+                      backgroundColor: '#10b981',
+                      color: '#fff',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
+                    <span>Close Task (Done)</span>
+                  </button>
+                )}
               </>
-            )}
-
-            {currentTask.state === 'verified' && (
-              <button
-                onClick={() => handleTransition('done', undefined, 'Completed and integrated')}
-                disabled={loading}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.3rem',
-                  padding: '0.4rem 0.8rem',
-                  borderRadius: '0.375rem',
-                  border: 'none',
-                  backgroundColor: '#10b981',
-                  color: '#fff',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
-              >
-                {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
-                <span>Close Task (Done)</span>
-              </button>
             )}
           </div>
         </div>
@@ -1659,6 +2086,163 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           size={viewingTextAttachment.size}
           fetchContent={() => api.getTaskAttachment(currentTask.id, viewingTextAttachment.filename)}
           onClose={() => setViewingTextAttachment(null)}
+        />
+      )}
+
+      {/* Add Subtask Modal */}
+      {showAddSubtaskModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1100,
+            padding: '1rem',
+          }}
+          onClick={() => setShowAddSubtaskModal(false)}
+        >
+          <div
+            style={{
+              backgroundColor: '#1e293b',
+              border: '1px solid #334155',
+              borderRadius: '0.5rem',
+              maxWidth: '520px',
+              width: '100%',
+              padding: '1.25rem',
+              boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ fontSize: '1.1rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.5rem' }}>
+              Add Subtask under {currentTask.id}
+            </h3>
+            <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginBottom: '1rem' }}>
+              Parent: <strong style={{ color: '#f1f5f9' }}>{currentTask.id} - {currentTask.title}</strong>
+            </div>
+
+            {subtaskError && (
+              <div
+                style={{
+                  backgroundColor: '#7f1d1d',
+                  color: '#fecaca',
+                  padding: '0.5rem 0.75rem',
+                  borderRadius: '0.375rem',
+                  marginBottom: '1rem',
+                  fontSize: '0.8rem',
+                }}
+              >
+                {subtaskError}
+              </div>
+            )}
+
+            <form onSubmit={handlePreviewAddSubtask} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                  Subtask Title *
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Implement component hierarchy view"
+                  value={subtaskTitle}
+                  onChange={(e) => setSubtaskTitle(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: '#0f172a',
+                    color: '#f8fafc',
+                    fontSize: '0.85rem',
+                    boxSizing: 'border-box',
+                  }}
+                  autoFocus
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                  Kind
+                </label>
+                <select
+                  value={subtaskKind}
+                  onChange={(e) => setSubtaskKind(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: '#0f172a',
+                    color: '#f8fafc',
+                    fontSize: '0.85rem',
+                    boxSizing: 'border-box',
+                  }}
+                >
+                  <option value="feature">feature</option>
+                  <option value="fix">fix</option>
+                  <option value="refactor">refactor</option>
+                  <option value="test">test</option>
+                  <option value="doc">doc</option>
+                </select>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => setShowAddSubtaskModal(false)}
+                  style={{
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: 'transparent',
+                    color: '#cbd5e1',
+                    fontSize: '0.8rem',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={subtaskLoading || !subtaskTitle.trim()}
+                  style={{
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: 'none',
+                    backgroundColor: '#6366f1',
+                    color: '#fff',
+                    fontWeight: 600,
+                    fontSize: '0.8rem',
+                    cursor: subtaskLoading ? 'not-allowed' : 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                  }}
+                >
+                  {subtaskLoading && <Loader2 size={13} className="spin" />}
+                  <span>Preview & Confirm</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Structure Action Confirm Dialog */}
+      {structureConfirmData && (
+        <ConfirmDialog
+          isOpen={structureConfirmData.isOpen}
+          title={structureConfirmData.title}
+          summary={structureConfirmData.summary}
+          plan={structureConfirmData.plan}
+          hash={structureConfirmData.planHash}
+          applyButtonText="Confirm & Apply"
+          cancelButtonText="Cancel"
+          onApply={handleApplyStructureConfirm}
+          onCancel={() => setStructureConfirmData(null)}
         />
       )}
     </div>

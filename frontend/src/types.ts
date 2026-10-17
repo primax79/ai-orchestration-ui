@@ -46,6 +46,21 @@ export interface TaskItem {
   task_bundle_sha256?: string;
   attachments?: string[];
   attachment_details?: AttachmentDetail[];
+  parent?: string | null;
+  depth?: number;
+  node_type?: string;
+  is_leaf?: boolean;
+  is_container?: boolean;
+  is_folder?: boolean;
+  children?: string[];
+  fields?: Record<string, TreeNodeField>;
+  derived_state?: TaskState | string | null;
+  leaves_done?: number;
+  leaves_total?: number;
+  labels?: string[];
+  label_sources?: Record<string, string>;
+  priority_source?: string;
+  size_source?: string;
 }
 
 export interface InitiativeItem {
@@ -62,6 +77,7 @@ export interface TaskListResponse {
   emergent_tasks: TaskItem[];
   initiatives: InitiativeItem[];
   all_tasks?: TaskItem[];
+  tree?: Record<string, TreeNode>;
 }
 
 export interface WorkspaceInfo {
@@ -816,6 +832,92 @@ export interface AnswerAndResumeResponse {
   reason?: string;
   error?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Task Hierarchy / Tree Types (Task 11.3)
+// ---------------------------------------------------------------------------
+
+export interface TreeNodeField {
+  value: any;
+  source: string;
+}
+
+export interface TreeNode {
+  kind?: string;
+  id: string;
+  title: string;
+  parent: string | null;
+  depth: number;
+  node_type: 'initiative' | 'leaf' | 'container' | 'microtask' | string;
+  is_leaf: boolean;
+  is_container: boolean;
+  children: string[];
+  fields?: Record<string, TreeNodeField>;
+  labels?: string[];
+  label_sources?: Record<string, string>;
+  depends_on?: string[];
+  expanded_depends_on?: string[];
+  state: TaskState;
+  canonical_state: TaskState;
+  derived_state: TaskState | null;
+  leaves_done: number;
+  leaves_total: number;
+  file_path?: string;
+  rel_path?: string;
+  is_folder?: boolean;
+  in_done?: boolean;
+  in_closed_section?: boolean;
+  bundle_sha256?: string;
+  task_hash?: string;
+  priority: Priority;
+  priority_source?: string;
+  priority_reason?: string;
+  size?: string;
+  size_source?: string;
+  executor?: string;
+  handoff?: string;
+  category?: string;
+  slug?: string;
+}
+
+export interface StructurePlanItem {
+  action: string;
+  path: string;
+  before_hash: string;
+}
+
+export interface StructureActionResponse {
+  ok: boolean;
+  dry_run?: boolean;
+  allocated_id?: string;
+  plan_hash?: string;
+  hash?: string;
+  summary?: string;
+  plan?: StructurePlanItem[];
+  error?: string;
+  folder?: string;
+}
+
+export interface AddChildPayload {
+  parent?: string;
+  title: string;
+  kind?: string;
+  expect_plan_hash?: string;
+}
+
+export interface ReopenTaskPayload {
+  reason: string;
+  expect_plan_hash?: string;
+}
+
+export interface ExpandTaskPayload {
+  expect_plan_hash?: string;
+}
+
+export interface CollapseTaskPayload {
+  expect_plan_hash?: string;
+}
+
 
 
 

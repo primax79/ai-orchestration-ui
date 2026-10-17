@@ -36,6 +36,7 @@ import {
   TriageProposalResponse,
   AcceptTriagePayload,
   AcceptTriageResponse,
+  StructureActionResponse,
 } from './types';
 
 // Custom ApiError to carry HTTP status and response payload
@@ -1306,4 +1307,102 @@ export const answerAndResumeApi: AnswerAndResumeApiExtensions = {
 };
 
 Object.assign(api, answerAndResumeApi);
+
+// ---------------------------------------------------------------------------
+// Task Structure Operations (Task 11.3)
+// ---------------------------------------------------------------------------
+
+export interface TaskStructureApiExtensions {
+  previewAddChild(parentId: string, payload: { title: string; kind?: string }): Promise<StructureActionResponse>;
+  addChild(parentId: string, payload: { title: string; kind?: string; expect_plan_hash: string }): Promise<StructureActionResponse>;
+  previewExpandTask(taskId: string): Promise<StructureActionResponse>;
+  expandTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse>;
+  previewCollapseTask(taskId: string): Promise<StructureActionResponse>;
+  collapseTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse>;
+  previewReopenTask(taskId: string, payload: { reason: string }): Promise<StructureActionResponse>;
+  reopenTask(taskId: string, payload: { reason: string; expect_plan_hash: string }): Promise<StructureActionResponse>;
+}
+
+export const taskStructureApi: TaskStructureApiExtensions = {
+  async previewAddChild(parentId: string, payload: { title: string; kind?: string }): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('previewAddChild', { id: parentId, ...payload });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(parentId)}/child/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async addChild(parentId: string, payload: { title: string; kind?: string; expect_plan_hash: string }): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('addChild', { id: parentId, ...payload });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(parentId)}/child`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewExpandTask(taskId: string): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('previewExpandTask', { id: taskId });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/expand/preview`, {
+      method: 'POST',
+    });
+  },
+
+  async expandTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('expandTask', { id: taskId, ...payload });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/expand`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewCollapseTask(taskId: string): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('previewCollapseTask', { id: taskId });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/collapse/preview`, {
+      method: 'POST',
+    });
+  },
+
+  async collapseTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('collapseTask', { id: taskId, ...payload });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/collapse`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewReopenTask(taskId: string, payload: { reason: string }): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('previewReopenTask', { id: taskId, ...payload });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/reopen/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async reopenTask(taskId: string, payload: { reason: string; expect_plan_hash: string }): Promise<StructureActionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<StructureActionResponse>('reopenTask', { id: taskId, ...payload });
+    }
+    return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/reopen`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+};
+
+Object.assign(api, taskStructureApi);
+
 

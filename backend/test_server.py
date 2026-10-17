@@ -2849,3 +2849,121 @@ def test_timeline_graph_and_edit_endpoints(monkeypatch, tmp_path):
     finally:
         state.workspace = old_ws
 
+
+def test_task_structure_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+    (tasks_dir / "01-test").mkdir()
+    (tasks_dir / "01-test" / "plan.md").write_text(
+        "# 01 - Test Initiative\n\n"
+        "## Tasks\n\n"
+        "### 01.1 - Root Task\n\n"
+        "- **Status:** `open` · **Priority:** P2 · **Size:** M\n"
+        "- **Goal:** Root task goal\n\n"
+        "### 01.2 - Child Task\n\n"
+        "- **Status:** `open` · **Priority:** P2 · **Size:** S\n"
+        "- **Goal:** Child task goal\n",
+        encoding="utf-8",
+    )
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # 1. Unauthenticated checks
+        assert client.post("/api/tasks/01/child/preview").status_code == 401
+        assert client.post("/api/tasks/01/child").status_code == 401
+        assert client.post("/api/tasks/01.1/expand/preview").status_code == 401
+        assert client.post("/api/tasks/01.1/expand").status_code == 401
+        assert client.post("/api/tasks/01.1/collapse/preview").status_code == 401
+        assert client.post("/api/tasks/01.1/collapse").status_code == 401
+        assert client.post("/api/tasks/01.1/reopen/preview").status_code == 401
+        assert client.post("/api/tasks/01.1/reopen").status_code == 401
+
+        # 2. Validation checks
+        assert client.post("/api/tasks/invalid-id!/child/preview", headers=headers, json={"title": "foo"}).status_code == 400
+        assert client.post("/api/tasks/01/child/preview", headers=headers, json={"title": ""}).status_code == 400
+        assert client.post("/api/tasks/01/child", headers=headers, json={"title": "foo"}).status_code == 400
+        assert client.post("/api/tasks/01.1/reopen/preview", headers=headers, json={"reason": ""}).status_code == 400
+
+        # 3. Child add preview on initiative 01
+        res_child_prev = client.post("/api/tasks/01/child/preview", headers=headers, json={"title": "New Third Task"})
+        assert res_child_prev.status_code == 200
+        prev_data = res_child_prev.json()
+        assert prev_data.get("ok") is True
+        assert prev_data.get("dry_run") is True
+        assert prev_data.get("allocated_id") == "01.3"
+        plan_hash = prev_data.get("plan_hash")
+        assert plan_hash
+
+        # 4. Stale plan hash on child add apply
+        res_stale = client.post("/api/tasks/01/child", headers=headers, json={"title": "New Third Task", "expect_plan_hash": "deadbeef" * 8})
+        assert res_stale.status_code == 409
+
+        # 5. Successful child add apply
+        res_apply = client.post("/api/tasks/01/child", headers=headers, json={"title": "New Third Task", "expect_plan_hash": plan_hash})
+        assert res_apply.status_code == 200
+        apply_data = res_apply.json()
+        assert apply_data.get("ok") is True
+        assert apply_data.get("allocated_id") == "01.3"
+
+        # Check detail endpoint retrieves new child 01.3
+        res_detail = client.get("/api/tasks/01.3", headers=headers)
+        assert res_detail.status_code == 200
+        assert "New Third Task" in res_detail.json().get("content", "")
+
+        # 6. Expand preview and apply on 01.2
+        res_exp_prev = client.post("/api/tasks/01.2/expand/preview", headers=headers)
+        assert res_exp_prev.status_code == 200
+        exp_hash = res_exp_prev.json().get("plan_hash")
+        assert exp_hash
+
+        res_exp_stale = client.post("/api/tasks/01.2/expand", headers=headers, json={"expect_plan_hash": "badhash"})
+        assert res_exp_stale.status_code == 409
+
+        res_exp_ok = client.post("/api/tasks/01.2/expand", headers=headers, json={"expect_plan_hash": exp_hash})
+        assert res_exp_ok.status_code == 200
+
+        # 7. Container transition refused with 400
+        res_trans_container = client.post("/api/tasks/transition", headers=headers, json={"task_id": "01", "new_state": "done"})
+        assert res_trans_container.status_code == 400
+        assert "derived state" in res_trans_container.json().get("error", "")
+
+        # 8. Child add on a folder emergent task creates T###.1
+        fld_dir = tasks_dir / "methodology" / "T040-sample-folder"
+        fld_dir.mkdir(parents=True)
+        (fld_dir / "README.md").write_text(
+            "# T040 Sample Folder Task\n\n"
+            "- id: T040\n"
+            "- title: Sample Folder Task\n"
+            "- category: methodology\n"
+            "- priority: P1\n"
+            "- state: open\n"
+            "- goal: Folder goal\n",
+            encoding="utf-8",
+        )
+        res_fld_prev = client.post("/api/tasks/T040/child/preview", headers=headers, json={"title": "First Subtask"})
+        assert res_fld_prev.status_code == 200
+        fld_prev_data = res_fld_prev.json()
+        assert fld_prev_data.get("ok") is True
+        assert fld_prev_data.get("allocated_id") == "T040.1"
+        fld_hash = fld_prev_data.get("plan_hash")
+
+        res_fld_apply = client.post("/api/tasks/T040/child", headers=headers, json={"title": "First Subtask", "expect_plan_hash": fld_hash})
+        assert res_fld_apply.status_code == 200
+        assert res_fld_apply.json().get("allocated_id") == "T040.1"
+
+        # Verify detail of T040.1
+        res_sub_detail = client.get("/api/tasks/T040.1", headers=headers)
+        assert res_sub_detail.status_code == 200
+        assert "First Subtask" in res_sub_detail.json().get("content", "")
+
+    finally:
+        state.workspace = old_ws
+
+

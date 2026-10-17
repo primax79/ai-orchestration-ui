@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import hmac
 import json
 import os
@@ -372,7 +373,14 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
     if isinstance(data, dict):
         reason = str(data.get("reason") or "").lower()
         err_val = f"{data.get('error', '')} {data.get('message', '')}".lower()
-        if data.get("error") in ("stale-task", "stale-task-hash", "lock-timeout", "stale-note") or reason in (
+        if data.get("error") in (
+            "stale-task",
+            "stale-task-hash",
+            "lock-timeout",
+            "stale-note",
+            "plan-hash-mismatch",
+            "task-hash-mismatch",
+        ) or reason in (
             "stale-task",
             "stale-task-hash",
             "stale-note",
@@ -462,6 +470,7 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "plan tasks do not support attachments" in err_str
         or "plan-task-attachments-unsupported" in err_str
         or "attachment-limit-reached" in err_str
+        or "derived state" in err_str
     ):
         return 400
 
@@ -741,7 +750,7 @@ async def api_validate_tasks(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
-TASK_MUTATION_ID_RE = re.compile(r"^(T\d{3,}|\d{2,}\.\d+)$")
+TASK_MUTATION_ID_RE = re.compile(r"^(T\d{3,}(\.\d+)*|\d{2,}(\.\d+)*)$")
 VALID_PRIORITIES = {"P0", "P1", "P2", "P3"}
 VALID_SIZES = {"XS", "S", "M", "L", "XL"}
 
@@ -982,6 +991,291 @@ async def api_set_deps(request: Request) -> JSONResponse:
     return await _handle_set_deps(request, is_preview=False)
 
 
+# ---------------------------------------------------------------------------
+# REST Endpoints: Task Structure Operations (11.3)
+# ---------------------------------------------------------------------------
+
+async def _handle_child_add(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    parent_id = task_id or str(body.get("parent") or body.get("parent_id") or "").strip()
+    if not parent_id or not TASK_MUTATION_ID_RE.match(parent_id):
+        return JSONResponse({"error": f"Invalid parent id {parent_id!r}"}, status_code=400)
+
+    title = str(body.get("title") or "").strip()
+    if not title:
+        return JSONResponse({"error": "title is required"}, status_code=400)
+    kind = str(body.get("kind") or "feature").strip()
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "child", "add", parent_id, "--title", title, "--kind", kind, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    else:
+        expect_plan_hash = (
+            body.get("expect_plan_hash")
+            or body.get("expect_hash")
+            or body.get("plan_hash")
+            or request.query_params.get("expect_plan_hash")
+            or request.query_params.get("expect_hash")
+            or request.headers.get("x-expect-plan-hash")
+        )
+        if not expect_plan_hash:
+            return JSONResponse({"error": "expect_plan_hash is required on apply"}, status_code=400)
+        cmd.extend(["--expect-plan-hash", str(expect_plan_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                if "plan_hash" in data and "hash" not in data:
+                    data["hash"] = data["plan_hash"]
+                if "summary" not in data:
+                    alloc_id = data.get("allocated_id", "")
+                    data["summary"] = f"Add child task {alloc_id} under {parent_id}" if alloc_id else f"Add child task under {parent_id}"
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    err_msg = str(data.get("error", "") if isinstance(data, dict) else data)
+    if "child add under the file/folder leaf" in err_msg:
+        cands = list(tasks_dir.glob(f"*/{parent_id}-*/README.md")) + list(tasks_dir.glob(f"*/{parent_id}/README.md"))
+        cands += list(tasks_dir.glob(f"done/*/{parent_id}-*/README.md")) + list(tasks_dir.glob(f"done/*/{parent_id}/README.md"))
+        if cands:
+            readme_file = cands[0]
+            text = readme_file.read_text(encoding="utf-8")
+            state_m = re.search(r"^-\s+(?:state|status):\s*([a-z ]+)", text, re.MULTILINE | re.IGNORECASE)
+            leaf_state = state_m.group(1).strip().lower() if state_m else "open"
+            if leaf_state != "open":
+                return JSONResponse({"error": f"Cannot add child to in-flight leaf {parent_id!r} in state {leaf_state!r}. Leaf must be in state 'open'."}, status_code=400)
+
+            existing_nums = [int(m.group(1)) for m in re.finditer(rf"^###\s+{re.escape(parent_id)}\.(\d+)\b", text, re.MULTILINE)]
+            next_num = max(existing_nums) + 1 if existing_nums else 1
+            alloc_id = f"{parent_id}.{next_num}"
+
+            before_hash = hashlib.sha256(readme_file.read_bytes()).hexdigest()
+            rel_path = str(readme_file.relative_to(tasks_dir))
+            plan = [{"action": "modify", "before_hash": before_hash, "path": rel_path}]
+            plan_hash = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+            if is_preview:
+                return JSONResponse({
+                    "ok": True,
+                    "dry_run": True,
+                    "allocated_id": alloc_id,
+                    "plan": plan,
+                    "plan_hash": plan_hash,
+                    "hash": plan_hash,
+                    "summary": f"Add child task {alloc_id} under {parent_id}",
+                }, status_code=200)
+            else:
+                expect_plan_hash = (
+                    body.get("expect_plan_hash")
+                    or body.get("expect_hash")
+                    or body.get("plan_hash")
+                    or request.query_params.get("expect_plan_hash")
+                    or request.query_params.get("expect_hash")
+                    or request.headers.get("x-expect-plan-hash")
+                )
+                if not expect_plan_hash:
+                    return JSONResponse({"error": "expect_plan_hash is required on apply"}, status_code=400)
+                if expect_plan_hash != plan_hash:
+                    return JSONResponse({"error": f"Plan hash mismatch: expected {expect_plan_hash}, but recomputed {plan_hash}"}, status_code=409)
+
+                lines = text.splitlines()
+                filtered_lines = [ln for ln in lines if not re.match(r"^-\s+(?:state|status):\s*", ln, re.IGNORECASE)]
+                new_text = "\n".join(filtered_lines)
+
+                child_block = (
+                    f"\n### {alloc_id} - {title}\n\n"
+                    f"- **Status:** `open` · **Kind:** {kind}\n"
+                    f"- **Goal:** {title}\n"
+                )
+                if "## Subtasks" in new_text:
+                    closed_m = re.search(r"^##\s+Closed\b", new_text, re.MULTILINE)
+                    if closed_m:
+                        new_text = new_text[:closed_m.start()] + child_block + "\n" + new_text[closed_m.start():]
+                    else:
+                        new_text = new_text.rstrip() + "\n" + child_block
+                else:
+                    new_text = new_text.rstrip() + f"\n\n## Subtasks\n{child_block}"
+
+                readme_file.write_text(new_text, encoding="utf-8")
+                await state.broadcast({"type": "changed", "areas": ["tasks"]})
+                return JSONResponse({"ok": True, "allocated_id": alloc_id, "plan_hash": plan_hash}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_child_add(request: Request) -> JSONResponse:
+    return await _handle_child_add(request, is_preview=True)
+
+
+async def api_child_add(request: Request) -> JSONResponse:
+    return await _handle_child_add(request, is_preview=False)
+
+
+async def _handle_expand(request: Request, is_preview: bool = False) -> JSONResponse:
+    node_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    node_id = node_id or str(body.get("id") or body.get("node_id") or "").strip()
+    if not node_id or not TASK_MUTATION_ID_RE.match(node_id):
+        return JSONResponse({"error": f"Invalid node id {node_id!r}"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "expand", node_id, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    else:
+        expect_plan_hash = (
+            body.get("expect_plan_hash")
+            or body.get("expect_hash")
+            or body.get("plan_hash")
+            or request.query_params.get("expect_plan_hash")
+            or request.query_params.get("expect_hash")
+            or request.headers.get("x-expect-plan-hash")
+        )
+        if not expect_plan_hash:
+            return JSONResponse({"error": "expect_plan_hash is required on apply"}, status_code=400)
+        cmd.extend(["--expect-plan-hash", str(expect_plan_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                if "plan_hash" in data and "hash" not in data:
+                    data["hash"] = data["plan_hash"]
+                if "summary" not in data:
+                    data["summary"] = f"Expand node {node_id} into folder"
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_expand(request: Request) -> JSONResponse:
+    return await _handle_expand(request, is_preview=True)
+
+
+async def api_expand(request: Request) -> JSONResponse:
+    return await _handle_expand(request, is_preview=False)
+
+
+async def _handle_collapse(request: Request, is_preview: bool = False) -> JSONResponse:
+    node_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    node_id = node_id or str(body.get("id") or body.get("node_id") or "").strip()
+    if not node_id or not TASK_MUTATION_ID_RE.match(node_id):
+        return JSONResponse({"error": f"Invalid node id {node_id!r}"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "collapse", node_id, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    else:
+        expect_plan_hash = (
+            body.get("expect_plan_hash")
+            or body.get("expect_hash")
+            or body.get("plan_hash")
+            or request.query_params.get("expect_plan_hash")
+            or request.query_params.get("expect_hash")
+            or request.headers.get("x-expect-plan-hash")
+        )
+        if not expect_plan_hash:
+            return JSONResponse({"error": "expect_plan_hash is required on apply"}, status_code=400)
+        cmd.extend(["--expect-plan-hash", str(expect_plan_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                if "plan_hash" in data and "hash" not in data:
+                    data["hash"] = data["plan_hash"]
+                if "summary" not in data:
+                    data["summary"] = f"Collapse node {node_id} back into block"
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_collapse(request: Request) -> JSONResponse:
+    return await _handle_collapse(request, is_preview=True)
+
+
+async def api_collapse(request: Request) -> JSONResponse:
+    return await _handle_collapse(request, is_preview=False)
+
+
+async def _handle_reopen(request: Request, is_preview: bool = False) -> JSONResponse:
+    node_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    node_id = node_id or str(body.get("id") or body.get("node_id") or "").strip()
+    if not node_id or not TASK_MUTATION_ID_RE.match(node_id):
+        return JSONResponse({"error": f"Invalid node id {node_id!r}"}, status_code=400)
+
+    reason = str(body.get("reason") or "").strip()
+    if not reason:
+        return JSONResponse({"error": "reason is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "reopen", node_id, "--reason", reason, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    else:
+        expect_plan_hash = (
+            body.get("expect_plan_hash")
+            or body.get("expect_hash")
+            or body.get("plan_hash")
+            or request.query_params.get("expect_plan_hash")
+            or request.query_params.get("expect_hash")
+            or request.headers.get("x-expect-plan-hash")
+        )
+        if not expect_plan_hash:
+            return JSONResponse({"error": "expect_plan_hash is required on apply"}, status_code=400)
+        cmd.extend(["--expect-plan-hash", str(expect_plan_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                if "plan_hash" in data and "hash" not in data:
+                    data["hash"] = data["plan_hash"]
+                if "summary" not in data:
+                    data["summary"] = f"Reopen node {node_id}: {reason}"
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_reopen(request: Request) -> JSONResponse:
+    return await _handle_reopen(request, is_preview=True)
+
+
+async def api_reopen(request: Request) -> JSONResponse:
+    return await _handle_reopen(request, is_preview=False)
+
+
 async def api_transition_task(request: Request) -> JSONResponse:
     try:
         body = await request.json()
@@ -1052,7 +1346,7 @@ async def api_sync_index(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
-TASK_DETAIL_ID_RE = re.compile(r"^(T\d{3,}|\d{2,}\.\d+|INIT-\d{2,})$")
+TASK_DETAIL_ID_RE = re.compile(r"^(T\d{3,}(\.\d+)*|\d{2,}(\.\d+)*|INIT-\d{2,})$")
 
 
 def _plan_for_initiative(tasks_dir: pathlib.Path, init_id: str) -> pathlib.Path | None:
@@ -1095,8 +1389,41 @@ async def api_get_task_detail(request: Request) -> JSONResponse:
         if plan is None:
             return JSONResponse({"error": f"Plan for initiative {init_id} not found"}, status_code=404)
         plan_text = plan.read_text(encoding="utf-8")
-        content = plan_text if task_id.startswith("INIT-") else _plan_task_block(plan_text, task_id)
+        content = plan_text if (task_id.startswith("INIT-") or task_id == init_id) else _plan_task_block(plan_text, task_id)
         if content is None:
+            # Check if it was expanded into a folder
+            candidates = list(tasks_dir.glob(f"**/{task_id}-*/README.md")) + list(tasks_dir.glob(f"**/{task_id}/README.md"))
+            if candidates:
+                target_file = candidates[0]
+                content = target_file.read_text(encoding="utf-8")
+                return JSONResponse({
+                    "task_id": task_id,
+                    "file_path": str(target_file),
+                    "relative_path": str(target_file.relative_to(state.workspace)),
+                    "is_folder_bundle": True,
+                    "is_plan_task": True,
+                    "content": content,
+                    "progress_content": None,
+                })
+            if "." in task_id:
+                parts = task_id.split(".")
+                for i in range(len(parts) - 1, 0, -1):
+                    p_id = ".".join(parts[:i])
+                    p_cands = list(tasks_dir.glob(f"**/{p_id}-*/README.md")) + list(tasks_dir.glob(f"**/{p_id}/README.md"))
+                    for pc in p_cands:
+                        if pc.is_file():
+                            p_text = pc.read_text(encoding="utf-8")
+                            block = _plan_task_block(p_text, task_id)
+                            if block:
+                                return JSONResponse({
+                                    "task_id": task_id,
+                                    "file_path": str(pc),
+                                    "relative_path": str(pc.relative_to(state.workspace)),
+                                    "is_folder_bundle": False,
+                                    "is_plan_task": True,
+                                    "content": block,
+                                    "progress_content": None,
+                                })
             return JSONResponse({"error": f"Task {task_id} not found in {plan.relative_to(state.workspace)}"}, status_code=404)
         return JSONResponse({
             "task_id": task_id,
@@ -1108,10 +1435,29 @@ async def api_get_task_detail(request: Request) -> JSONResponse:
             "progress_content": None,
         })
 
-    candidates = list(tasks_dir.glob(f"*/{task_id}-*.md")) + list(tasks_dir.glob(f"*/{task_id}/README.md"))
-    candidates += list(tasks_dir.glob(f"done/*/{task_id}-*.md")) + list(tasks_dir.glob(f"done/*/{task_id}/README.md"))
+    candidates = list(tasks_dir.glob(f"**/{task_id}-*.md")) + list(tasks_dir.glob(f"**/{task_id}/README.md"))
+    candidates += list(tasks_dir.glob(f"done/**/{task_id}-*.md")) + list(tasks_dir.glob(f"done/**/{task_id}/README.md"))
 
     if not candidates:
+        if "." in task_id:
+            parts = task_id.split(".")
+            for i in range(len(parts) - 1, 0, -1):
+                parent_id = ".".join(parts[:i])
+                parent_cands = list(tasks_dir.glob(f"**/{parent_id}-*/README.md")) + list(tasks_dir.glob(f"**/{parent_id}/README.md"))
+                parent_cands += list(tasks_dir.glob(f"done/**/{parent_id}-*/README.md")) + list(tasks_dir.glob(f"done/**/{parent_id}/README.md"))
+                for pc in parent_cands:
+                    if pc.is_file():
+                        p_text = pc.read_text(encoding="utf-8")
+                        block = _plan_task_block(p_text, task_id)
+                        if block:
+                            return JSONResponse({
+                                "task_id": task_id,
+                                "file_path": str(pc),
+                                "relative_path": str(pc.relative_to(state.workspace)),
+                                "is_folder_bundle": False,
+                                "content": block,
+                                "progress_content": None,
+                            })
         return JSONResponse({"error": f"Task {task_id} file not found"}, status_code=404)
 
     target_file = candidates[0]
@@ -3173,6 +3519,24 @@ routes = [
     Route("/api/tasks/{id}/size", api_set_size, methods=["POST"]),
     Route("/api/tasks/{id}/deps/preview", api_preview_set_deps, methods=["POST"]),
     Route("/api/tasks/{id}/deps", api_set_deps, methods=["POST"]),
+    Route("/api/tasks/{id}/child/preview", api_preview_child_add, methods=["POST"]),
+    Route("/api/tasks/{id}/child", api_child_add, methods=["POST"]),
+    Route("/api/tasks/{id}/children/preview", api_preview_child_add, methods=["POST"]),
+    Route("/api/tasks/{id}/children", api_child_add, methods=["POST"]),
+    Route("/api/tasks/child/preview", api_preview_child_add, methods=["POST"]),
+    Route("/api/tasks/child", api_child_add, methods=["POST"]),
+    Route("/api/tasks/{id}/expand/preview", api_preview_expand, methods=["POST"]),
+    Route("/api/tasks/{id}/expand", api_expand, methods=["POST"]),
+    Route("/api/tasks/expand/preview", api_preview_expand, methods=["POST"]),
+    Route("/api/tasks/expand", api_expand, methods=["POST"]),
+    Route("/api/tasks/{id}/collapse/preview", api_preview_collapse, methods=["POST"]),
+    Route("/api/tasks/{id}/collapse", api_collapse, methods=["POST"]),
+    Route("/api/tasks/collapse/preview", api_preview_collapse, methods=["POST"]),
+    Route("/api/tasks/collapse", api_collapse, methods=["POST"]),
+    Route("/api/tasks/{id}/reopen/preview", api_preview_reopen, methods=["POST"]),
+    Route("/api/tasks/{id}/reopen", api_reopen, methods=["POST"]),
+    Route("/api/tasks/reopen/preview", api_preview_reopen, methods=["POST"]),
+    Route("/api/tasks/reopen", api_reopen, methods=["POST"]),
     Route("/api/tasks/transition", api_transition_task, methods=["POST"]),
     Route("/api/tasks/sync-index/preview", api_preview_sync_index, methods=["GET"]),
     Route("/api/tasks/sync-index", api_sync_index, methods=["POST"]),

@@ -1,0 +1,1329 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import {
+  ChevronRight,
+  ChevronDown,
+  Layers,
+  Folder,
+  FileText,
+  Plus,
+  Maximize2,
+  Minimize2,
+  Copy,
+  Check,
+  RotateCcw,
+  FolderPlus,
+  Loader2,
+} from 'lucide-react';
+import {
+  TaskItem,
+  TaskListResponse,
+  TaskState,
+  TreeNode,
+  Priority,
+  StructurePlanItem,
+} from '../types';
+import { taskStructureApi } from '../api';
+import { ConfirmDialog } from './ConfirmDialog';
+
+const TREE_EXPANDED_KEY = 'ai-orch:tree-expanded-nodes';
+
+const ALL_STATES: TaskState[] = [
+  'open',
+  'in progress',
+  'paused',
+  'bounced',
+  'waiting',
+  'blocked',
+  'delivered',
+  'verified',
+  'done',
+  'done with a caveat',
+  'dropped',
+];
+const CLOSED_STATES: TaskState[] = ['done', 'done with a caveat', 'dropped'];
+export const DEFAULT_TREE_STATES = ALL_STATES.filter((st) => !CLOSED_STATES.includes(st));
+
+const getStoredExpanded = (): Record<string, boolean> => {
+  try {
+    const raw = localStorage.getItem(TREE_EXPANDED_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore storage/parse errors
+  }
+  return {};
+};
+
+const storeExpanded = (expanded: Record<string, boolean>) => {
+  try {
+    localStorage.setItem(TREE_EXPANDED_KEY, JSON.stringify(expanded));
+  } catch {
+    // Ignore storage errors
+  }
+};
+
+const getStateColor = (state: string): { bg: string; text: string; border: string } => {
+  switch (state) {
+    case 'done':
+    case 'done with a caveat':
+      return { bg: '#064e3b', text: '#6ee7b7', border: '#059669' };
+    case 'in progress':
+      return { bg: '#312e81', text: '#c7d2fe', border: '#6366f1' };
+    case 'verified':
+      return { bg: '#065f46', text: '#a7f3d0', border: '#10b981' };
+    case 'delivered':
+      return { bg: '#0c4a6e', text: '#bae6fd', border: '#0284c7' };
+    case 'paused':
+      return { bg: '#78350f', text: '#fde68a', border: '#d97706' };
+    case 'waiting':
+      return { bg: '#831843', text: '#fbcfe8', border: '#db2777' };
+    case 'blocked':
+    case 'bounced':
+      return { bg: '#7f1d1d', text: '#fca5a5', border: '#ef4444' };
+    case 'dropped':
+      return { bg: '#1e293b', text: '#94a3b8', border: '#475569' };
+    case 'open':
+    default:
+      return { bg: '#1e293b', text: '#cbd5e1', border: '#334155' };
+  }
+};
+
+const getPriorityColor = (priority: Priority) => {
+  switch (priority) {
+    case 'P0':
+      return { bg: '#ef4444', text: '#fff' };
+    case 'P1':
+      return { bg: '#f59e0b', text: '#fff' };
+    case 'P2':
+      return { bg: '#3b82f6', text: '#fff' };
+    case 'P3':
+    default:
+      return { bg: '#64748b', text: '#fff' };
+  }
+};
+
+interface TaskTreeViewProps {
+  data: TaskListResponse | null;
+  visibleStates: TaskState[];
+  onVisibleStatesChange: (states: TaskState[]) => void;
+  onSelectTask: (task: TaskItem) => void;
+  onRefresh: () => void;
+}
+
+export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
+  data,
+  visibleStates,
+  onVisibleStatesChange,
+  onSelectTask,
+  onRefresh,
+}) => {
+  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>(getStoredExpanded);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // Structure action dialog states
+  const [addChildParent, setAddChildParent] = useState<TreeNode | null>(null);
+  const [addChildTitle, setAddChildTitle] = useState('');
+  const [addChildKind, setAddChildKind] = useState('feature');
+  const [addChildLoading, setAddChildLoading] = useState(false);
+  const [addChildError, setAddChildError] = useState<string | null>(null);
+
+  const [confirmDialogData, setConfirmDialogData] = useState<{
+    isOpen: boolean;
+    title: string;
+    summary?: string;
+    plan?: StructurePlanItem[];
+    planHash?: string;
+    actionType: 'add-child' | 'expand' | 'collapse' | 'reopen';
+    nodeId: string;
+    extraPayload?: any;
+  } | null>(null);
+
+  const [reopenNode, setReopenNode] = useState<TreeNode | null>(null);
+  const [reopenReason, setReopenReason] = useState('');
+  const [reopenError, setReopenError] = useState<string | null>(null);
+
+  const rawTree = data?.tree;
+
+  // Build a map of tree nodes
+  const treeMap = useMemo<Record<string, TreeNode>>(() => {
+    if (rawTree && Object.keys(rawTree).length > 0) {
+      return rawTree;
+    }
+    // Fallback if tree is not populated
+    const map: Record<string, TreeNode> = {};
+    const tasks = data?.all_tasks || data?.emergent_tasks || [];
+    for (const t of tasks) {
+      map[t.id] = {
+        id: t.id,
+        title: t.title,
+        parent: null,
+        depth: 0,
+        node_type: t.kind === 'initiative_task' ? 'leaf' : 'emergent_task',
+        is_leaf: true,
+        is_container: false,
+        children: [],
+        state: t.state,
+        canonical_state: t.state,
+        derived_state: null,
+        leaves_done: CLOSED_STATES.includes(t.state) ? 1 : 0,
+        leaves_total: 1,
+        priority: t.priority,
+        size: t.size || 'M',
+        executor: t.executor,
+        category: t.category,
+        handoff: t.handoff,
+      };
+    }
+    return map;
+  }, [rawTree, data]);
+
+  // Recursively determine if a node or any of its descendant leaves matches the visibleStates filter
+  const isNodeVisible = useCallback(
+    (nodeId: string): boolean => {
+      const node = treeMap[nodeId];
+      if (!node) return false;
+
+      if (node.is_leaf) {
+        return visibleStates.includes(node.state as TaskState);
+      }
+
+      // Container: visible if any child is visible
+      if (node.children && node.children.length > 0) {
+        return node.children.some((childId) => isNodeVisible(childId));
+      }
+
+      // Empty container: visible if open is selected
+      const effState = (node.derived_state || node.state || 'open') as TaskState;
+      return visibleStates.includes(effState);
+    },
+    [treeMap, visibleStates]
+  );
+
+  // Group root nodes
+  const { initiativeRoots, emergentCategories } = useMemo(() => {
+    const initRoots: TreeNode[] = [];
+    const emergentByCat: Record<string, TreeNode[]> = {};
+
+    for (const node of Object.values(treeMap)) {
+      if (node.parent === null) {
+        if (node.node_type === 'initiative' || (!node.id.startsWith('T') && !node.id.includes('.'))) {
+          initRoots.push(node);
+        } else {
+          const cat = node.category || 'general';
+          if (!emergentByCat[cat]) {
+            emergentByCat[cat] = [];
+          }
+          emergentByCat[cat].push(node);
+        }
+      }
+    }
+
+    // Sort initiatives numerically
+    initRoots.sort((a, b) => {
+      const numA = parseInt(a.id, 10) || 0;
+      const numB = parseInt(b.id, 10) || 0;
+      return numA - numB;
+    });
+
+    // Sort emergent nodes in each category
+    for (const cat of Object.keys(emergentByCat)) {
+      emergentByCat[cat].sort((a, b) => a.id.localeCompare(b.id));
+    }
+
+    return { initiativeRoots: initRoots, emergentCategories: emergentByCat };
+  }, [treeMap]);
+
+  // Toggle node expansion
+  const toggleExpand = useCallback((nodeId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setExpandedNodes((prev) => {
+      const next = { ...prev, [nodeId]: !prev[nodeId] };
+      storeExpanded(next);
+      return next;
+    });
+  }, []);
+
+  // Expand all / Collapse all
+  const expandAll = useCallback(() => {
+    const all: Record<string, boolean> = {};
+    for (const id of Object.keys(treeMap)) {
+      all[id] = true;
+    }
+    setExpandedNodes(all);
+    storeExpanded(all);
+  }, [treeMap]);
+
+  const collapseAll = useCallback(() => {
+    setExpandedNodes({});
+    storeExpanded({});
+  }, []);
+
+  // Default expansion: if no stored state, expand open initiatives and containers with pending work
+  useEffect(() => {
+    const current = getStoredExpanded();
+    if (Object.keys(current).length === 0 && Object.keys(treeMap).length > 0) {
+      const initial: Record<string, boolean> = {};
+      for (const node of Object.values(treeMap)) {
+        if (node.is_container) {
+          const derived = node.derived_state || node.state;
+          if (!CLOSED_STATES.includes(derived as TaskState)) {
+            initial[node.id] = true;
+          }
+        }
+      }
+      setExpandedNodes(initial);
+      storeExpanded(initial);
+    }
+  }, [treeMap]);
+
+  const copyHandoff = (e: React.MouseEvent, handoff?: string, id?: string, title?: string) => {
+    e.stopPropagation();
+    const textToCopy = handoff || `Work on task ${id}: ${title}`;
+    navigator.clipboard.writeText(textToCopy);
+    if (id) {
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 2000);
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Structure Actions
+  // -------------------------------------------------------------------------
+
+  const handleOpenAddChild = (node: TreeNode, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setAddChildParent(node);
+    setAddChildTitle('');
+    setAddChildKind('feature');
+    setAddChildError(null);
+  };
+
+  const handlePreviewAddChild = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!addChildParent || !addChildTitle.trim()) return;
+
+    setAddChildLoading(true);
+    setAddChildError(null);
+    try {
+      const res = await taskStructureApi.previewAddChild(addChildParent.id, {
+        title: addChildTitle.trim(),
+        kind: addChildKind,
+      });
+
+      if (!res.ok) {
+        throw new Error(res.error || 'Preview failed');
+      }
+
+      setConfirmDialogData({
+        isOpen: true,
+        title: `Confirm Add Subtask under ${addChildParent.id}`,
+        summary: res.summary || `Add subtask ${res.allocated_id || ''} under ${addChildParent.id}`,
+        plan: res.plan,
+        planHash: res.plan_hash || res.hash,
+        actionType: 'add-child',
+        nodeId: addChildParent.id,
+        extraPayload: {
+          title: addChildTitle.trim(),
+          kind: addChildKind,
+          allocatedId: res.allocated_id,
+        },
+      });
+      setAddChildParent(null);
+    } catch (err: any) {
+      setAddChildError(err?.message || String(err));
+    } finally {
+      setAddChildLoading(false);
+    }
+  };
+
+  const handlePreviewExpand = async (node: TreeNode, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const res = await taskStructureApi.previewExpandTask(node.id);
+      if (!res.ok) {
+        throw new Error(res.error || 'Preview failed');
+      }
+      setConfirmDialogData({
+        isOpen: true,
+        title: `Expand ${node.id} to folder`,
+        summary: res.summary || `Convert inline task ${node.id} into a folder bundle`,
+        plan: res.plan,
+        planHash: res.plan_hash || res.hash,
+        actionType: 'expand',
+        nodeId: node.id,
+      });
+    } catch (err: any) {
+      alert(`Expand failed: ${err.message || String(err)}`);
+    }
+  };
+
+  const handlePreviewCollapse = async (node: TreeNode, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const res = await taskStructureApi.previewCollapseTask(node.id);
+      if (!res.ok) {
+        throw new Error(res.error || 'Preview failed');
+      }
+      setConfirmDialogData({
+        isOpen: true,
+        title: `Collapse ${node.id} to block`,
+        summary: res.summary || `Collapse folder ${node.id} back into a single block`,
+        plan: res.plan,
+        planHash: res.plan_hash || res.hash,
+        actionType: 'collapse',
+        nodeId: node.id,
+      });
+    } catch (err: any) {
+      alert(`Collapse failed: ${err.message || String(err)}`);
+    }
+  };
+
+  const handleOpenReopen = (node: TreeNode, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setReopenNode(node);
+    setReopenReason('');
+    setReopenError(null);
+  };
+
+  const handlePreviewReopen = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!reopenNode || !reopenReason.trim()) return;
+
+    try {
+      const res = await taskStructureApi.previewReopenTask(reopenNode.id, {
+        reason: reopenReason.trim(),
+      });
+      if (!res.ok) {
+        throw new Error(res.error || 'Preview failed');
+      }
+      setConfirmDialogData({
+        isOpen: true,
+        title: `Reopen Task ${reopenNode.id}`,
+        summary: res.summary || `Reopen task ${reopenNode.id}: ${reopenReason.trim()}`,
+        plan: res.plan,
+        planHash: res.plan_hash || res.hash,
+        actionType: 'reopen',
+        nodeId: reopenNode.id,
+        extraPayload: { reason: reopenReason.trim() },
+      });
+      setReopenNode(null);
+    } catch (err: any) {
+      setReopenError(err?.message || String(err));
+    }
+  };
+
+  const handleApplyConfirmDialog = async (planHash?: string) => {
+    if (!confirmDialogData) return;
+    const { actionType, nodeId, extraPayload } = confirmDialogData;
+    const hash = planHash || confirmDialogData.planHash || '';
+
+    if (actionType === 'add-child') {
+      await taskStructureApi.addChild(nodeId, {
+        title: extraPayload.title,
+        kind: extraPayload.kind,
+        expect_plan_hash: hash,
+      });
+      // Automatically expand parent so the new child is visible
+      setExpandedNodes((prev) => {
+        const next = { ...prev, [nodeId]: true };
+        storeExpanded(next);
+        return next;
+      });
+    } else if (actionType === 'expand') {
+      await taskStructureApi.expandTask(nodeId, { expect_plan_hash: hash });
+      setExpandedNodes((prev) => {
+        const next = { ...prev, [nodeId]: true };
+        storeExpanded(next);
+        return next;
+      });
+    } else if (actionType === 'collapse') {
+      await taskStructureApi.collapseTask(nodeId, { expect_plan_hash: hash });
+    } else if (actionType === 'reopen') {
+      await taskStructureApi.reopenTask(nodeId, {
+        reason: extraPayload.reason,
+        expect_plan_hash: hash,
+      });
+    }
+
+    setConfirmDialogData(null);
+    onRefresh();
+  };
+
+  // Convert a TreeNode to a TaskItem for modal display
+  const handleSelectNode = (node: TreeNode) => {
+    const taskItem: TaskItem = {
+      id: node.id,
+      title: node.title,
+      category: node.category || (node.id.startsWith('T') ? 'emergent' : 'initiative'),
+      priority: node.priority || 'P2',
+      priority_reason: node.priority_reason,
+      priority_source: node.priority_source,
+      size: node.size,
+      size_source: node.size_source,
+      state: (node.derived_state || node.state) as TaskState,
+      derived_state: node.derived_state,
+      executor: node.executor || 'kilo',
+      handoff: node.handoff,
+      file_path: node.file_path,
+      is_done: CLOSED_STATES.includes((node.derived_state || node.state) as TaskState),
+      bundle_sha256: node.bundle_sha256,
+      task_bundle_sha256: node.task_hash,
+      labels: node.labels,
+      label_sources: node.label_sources,
+      kind: node.kind || (node.id.startsWith('T') ? 'emergent' : 'initiative_task'),
+      parent: node.parent,
+      depth: node.depth,
+      node_type: node.node_type,
+      is_leaf: node.is_leaf,
+      is_container: node.is_container,
+      children: node.children,
+      fields: node.fields,
+      leaves_done: node.leaves_done,
+      leaves_total: node.leaves_total,
+    };
+    onSelectTask(taskItem);
+  };
+
+  // Render a node row recursively
+  const renderNode = (nodeId: string, level: number = 0) => {
+    const node = treeMap[nodeId];
+    if (!node) return null;
+    if (!isNodeVisible(nodeId)) return null;
+
+    const isExpanded = !!expandedNodes[node.id];
+    const hasChildren = node.children && node.children.length > 0;
+    const isContainer = node.is_container || hasChildren;
+    const stateVal = (isContainer ? node.derived_state || node.state : node.state) || 'open';
+    const stateColors = getStateColor(stateVal);
+    const priorityColors = getPriorityColor(node.priority || 'P2');
+
+    const doneCount = node.leaves_done ?? 0;
+    const totalCount = node.leaves_total ?? (hasChildren ? node.children.length : 1);
+    const progressPct = totalCount > 0 ? Math.min(100, Math.round((doneCount / totalCount) * 100)) : 0;
+
+    const canAddChild = isContainer || (node.is_leaf && node.state === 'open');
+    const canExpand = node.is_leaf && !node.is_folder && node.state === 'open' && !node.id.startsWith('INIT-');
+    const canCollapse = node.is_folder && hasChildren && node.children.every((cid) => treeMap[cid]?.is_leaf);
+    const canReopen = node.is_leaf && CLOSED_STATES.includes(node.state as TaskState);
+
+    return (
+      <div key={node.id} style={{ display: 'flex', flexDirection: 'column' }}>
+        <div
+          onClick={() => handleSelectNode(node)}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.6rem',
+            padding: '0.55rem 0.75rem',
+            paddingLeft: `${0.75 + level * 1.5}rem`,
+            borderBottom: '1px solid #334155',
+            backgroundColor: level % 2 === 0 ? '#1e293b' : '#1a2436',
+            cursor: 'pointer',
+            transition: 'background-color 0.15s ease',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#27354f')}
+          onMouseLeave={(e) =>
+            (e.currentTarget.style.backgroundColor = level % 2 === 0 ? '#1e293b' : '#1a2436')
+          }
+        >
+          {/* Chevron for expandable containers */}
+          {isContainer ? (
+            <button
+              onClick={(e) => toggleExpand(node.id, e)}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: '#94a3b8',
+                cursor: 'pointer',
+                padding: '0.1rem',
+                display: 'flex',
+                alignItems: 'center',
+              }}
+              title={isExpanded ? 'Collapse' : 'Expand'}
+            >
+              {isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+            </button>
+          ) : (
+            <span style={{ width: '16px', display: 'flex', justifyContent: 'center' }}>
+              <span
+                style={{
+                  width: '6px',
+                  height: '6px',
+                  borderRadius: '50%',
+                  backgroundColor: '#64748b',
+                }}
+              />
+            </span>
+          )}
+
+          {/* Node Icon */}
+          {node.node_type === 'initiative' ? (
+            <Layers size={16} color="#818cf8" />
+          ) : isContainer ? (
+            <Folder size={15} color="#38bdf8" />
+          ) : (
+            <FileText size={15} color="#94a3b8" />
+          )}
+
+          {/* Priority (Leaves only, or container with priority) */}
+          {!isContainer && (
+            <span
+              style={{
+                fontSize: '0.68rem',
+                fontWeight: 700,
+                padding: '0.1rem 0.35rem',
+                borderRadius: '0.2rem',
+                backgroundColor: priorityColors.bg,
+                color: priorityColors.text,
+              }}
+              title={`Priority: ${node.priority || 'P2'}${node.priority_source ? ` (${node.priority_source})` : ''}`}
+            >
+              {node.priority || 'P2'}
+            </span>
+          )}
+
+          {/* Size (Leaves only) */}
+          {!isContainer && node.size && (
+            <span
+              style={{
+                fontSize: '0.68rem',
+                fontWeight: 600,
+                padding: '0.1rem 0.35rem',
+                borderRadius: '0.2rem',
+                backgroundColor: '#334155',
+                color: '#cbd5e1',
+              }}
+            >
+              {node.size}
+            </span>
+          )}
+
+          {/* ID */}
+          <span
+            style={{
+              fontSize: '0.85rem',
+              fontWeight: 700,
+              color: node.node_type === 'initiative' ? '#818cf8' : '#38bdf8',
+              fontFamily: 'monospace',
+              minWidth: '3.2rem',
+            }}
+          >
+            {node.id}
+          </span>
+
+          {/* Title */}
+          <span
+            style={{
+              fontSize: '0.88rem',
+              fontWeight: isContainer ? 600 : 500,
+              color: '#f8fafc',
+              flex: 1,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+            title={node.title}
+          >
+            {node.title}
+          </span>
+
+          {/* Progress bar for containers */}
+          {isContainer && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                minWidth: '150px',
+                maxWidth: '200px',
+              }}
+              title={`${doneCount} of ${totalCount} leaves done (${progressPct}%)`}
+            >
+              <div
+                style={{
+                  flex: 1,
+                  height: '6px',
+                  backgroundColor: '#0f172a',
+                  borderRadius: '3px',
+                  overflow: 'hidden',
+                  border: '1px solid #334155',
+                }}
+              >
+                <div
+                  style={{
+                    height: '100%',
+                    width: `${progressPct}%`,
+                    backgroundColor: progressPct === 100 ? '#10b981' : '#6366f1',
+                    borderRadius: '2px',
+                    transition: 'width 0.3s ease',
+                  }}
+                />
+              </div>
+              <span style={{ fontSize: '0.72rem', color: '#94a3b8', minWidth: '42px', textAlign: 'right' }}>
+                {doneCount}/{totalCount}
+              </span>
+            </div>
+          )}
+
+          {/* State Badge */}
+          <span
+            style={{
+              fontSize: '0.72rem',
+              fontWeight: 600,
+              padding: '0.12rem 0.45rem',
+              borderRadius: '1rem',
+              backgroundColor: stateColors.bg,
+              color: stateColors.text,
+              border: `1px solid ${stateColors.border}`,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {stateVal}
+          </span>
+
+          {/* Executor */}
+          {!isContainer && (
+            <span
+              style={{
+                fontSize: '0.75rem',
+                color: '#94a3b8',
+                minWidth: '55px',
+                textAlign: 'right',
+              }}
+            >
+              {node.executor || 'kilo'}
+            </span>
+          )}
+
+          {/* Actions */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.3rem',
+              marginLeft: '0.4rem',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {canAddChild && (
+              <button
+                onClick={(e) => handleOpenAddChild(node, e)}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.2rem',
+                  fontSize: '0.7rem',
+                  padding: '0.15rem 0.4rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #475569',
+                  backgroundColor: '#0f172a',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                }}
+                title="Add child subtask"
+              >
+                <Plus size={12} />
+                <span>Subtask</span>
+              </button>
+            )}
+
+            {canExpand && (
+              <button
+                onClick={(e) => handlePreviewExpand(node, e)}
+                style={{
+                  fontSize: '0.7rem',
+                  padding: '0.15rem 0.4rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #475569',
+                  backgroundColor: '#0f172a',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                }}
+                title="Expand block into folder"
+              >
+                Expand
+              </button>
+            )}
+
+            {canCollapse && (
+              <button
+                onClick={(e) => handlePreviewCollapse(node, e)}
+                style={{
+                  fontSize: '0.7rem',
+                  padding: '0.15rem 0.4rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #475569',
+                  backgroundColor: '#0f172a',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                }}
+                title="Collapse folder back into block"
+              >
+                Collapse
+              </button>
+            )}
+
+            {canReopen && (
+              <button
+                onClick={(e) => handleOpenReopen(node, e)}
+                style={{
+                  fontSize: '0.7rem',
+                  padding: '0.15rem 0.4rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #d97706',
+                  backgroundColor: '#78350f',
+                  color: '#fef3c7',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.2rem',
+                }}
+                title="Reopen task"
+              >
+                <RotateCcw size={11} />
+                <span>Reopen</span>
+              </button>
+            )}
+
+            {!isContainer && (
+              <button
+                onClick={(e) => copyHandoff(e, node.handoff, node.id, node.title)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: copiedId === node.id ? '#10b981' : '#64748b',
+                  cursor: 'pointer',
+                  padding: '0.15rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                }}
+                title="Copy handoff command"
+              >
+                {copiedId === node.id ? <Check size={13} /> : <Copy size={13} />}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Children (rendered if expanded) */}
+        {isContainer && isExpanded && hasChildren && (
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            {node.children.map((childId) => renderNode(childId, level + 1))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Compute overall count of visible leaves
+  const totalLeavesCount = useMemo(() => {
+    let count = 0;
+    for (const node of Object.values(treeMap)) {
+      if (node.is_leaf) count++;
+    }
+    return count;
+  }, [treeMap]);
+
+  const visibleLeavesCount = useMemo(() => {
+    let count = 0;
+    for (const node of Object.values(treeMap)) {
+      if (node.is_leaf && isNodeVisible(node.id)) count++;
+    }
+    return count;
+  }, [treeMap, isNodeVisible]);
+
+  const toggleTreeState = (st: TaskState) => {
+    if (visibleStates.includes(st)) {
+      onVisibleStatesChange(visibleStates.filter((s) => s !== st));
+    } else {
+      onVisibleStatesChange([...visibleStates, st]);
+    }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+      {/* Top Filter & Expansion Bar */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: '0.75rem',
+          backgroundColor: '#1e293b',
+          border: '1px solid #334155',
+          borderRadius: '0.5rem',
+          padding: '0.75rem 1rem',
+        }}
+      >
+        {/* Visible states filter */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '0.75rem', color: '#94a3b8', marginRight: '0.25rem', fontWeight: 600 }}>
+            Visible states:
+          </span>
+          {ALL_STATES.map((st) => {
+            const count = Object.values(treeMap).filter((t) => t.is_leaf && t.state === st).length;
+            const active = visibleStates.includes(st);
+            return (
+              <button
+                key={st}
+                onClick={() => toggleTreeState(st)}
+                aria-pressed={active}
+                style={{
+                  fontSize: '0.72rem',
+                  padding: '0.15rem 0.5rem',
+                  borderRadius: '1rem',
+                  border: `1px solid ${active ? '#6366f1' : '#334155'}`,
+                  backgroundColor: active ? '#312e81' : 'transparent',
+                  color: active ? '#e0e7ff' : count > 0 ? '#94a3b8' : '#475569',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                }}
+              >
+                {st} ({count})
+              </button>
+            );
+          })}
+
+          <span style={{ color: '#334155', margin: '0 0.2rem' }}>|</span>
+
+          {[
+            { label: 'Not closed', states: DEFAULT_TREE_STATES },
+            { label: 'All', states: ALL_STATES },
+            { label: 'None', states: [] as TaskState[] },
+          ].map((preset) => (
+            <button
+              key={preset.label}
+              onClick={() => onVisibleStatesChange(preset.states)}
+              style={{
+                fontSize: '0.72rem',
+                padding: '0.15rem 0.5rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #334155',
+                backgroundColor: '#0f172a',
+                color: '#cbd5e1',
+                cursor: 'pointer',
+              }}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Global Expand/Collapse & Counts */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <div style={{ display: 'flex', gap: '0.35rem' }}>
+            <button
+              onClick={expandAll}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.25rem',
+                fontSize: '0.72rem',
+                padding: '0.2rem 0.5rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #334155',
+                backgroundColor: '#0f172a',
+                color: '#cbd5e1',
+                cursor: 'pointer',
+              }}
+              title="Expand all containers"
+            >
+              <Maximize2 size={12} />
+              <span>Expand All</span>
+            </button>
+            <button
+              onClick={collapseAll}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.25rem',
+                fontSize: '0.72rem',
+                padding: '0.2rem 0.5rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #334155',
+                backgroundColor: '#0f172a',
+                color: '#cbd5e1',
+                cursor: 'pointer',
+              }}
+              title="Collapse all containers"
+            >
+              <Minimize2 size={12} />
+              <span>Collapse All</span>
+            </button>
+          </div>
+
+          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+            Showing {visibleLeavesCount} of {totalLeavesCount} leaves
+          </span>
+        </div>
+      </div>
+
+      {/* Planned Initiatives Section */}
+      {initiativeRoots.length > 0 && (
+        <div
+          style={{
+            backgroundColor: '#1e293b',
+            borderRadius: '0.5rem',
+            border: '1px solid #334155',
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            style={{
+              padding: '0.75rem 1rem',
+              backgroundColor: '#0f172a',
+              borderBottom: '1px solid #334155',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+            }}
+          >
+            <Layers size={17} color="#818cf8" />
+            <h3 style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
+              Planned Initiatives
+            </h3>
+            <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: 'auto' }}>
+              {initiativeRoots.filter((r) => isNodeVisible(r.id)).length} initiative(s) visible
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            {initiativeRoots.map((init) => renderNode(init.id, 0))}
+          </div>
+        </div>
+      )}
+
+      {/* Emergent Tasks by Category */}
+      {Object.keys(emergentCategories).length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              padding: '0.25rem 0',
+            }}
+          >
+            <FolderPlus size={18} color="#38bdf8" />
+            <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
+              Emergent Tasks & Microtasks
+            </h3>
+          </div>
+
+          {Object.entries(emergentCategories).map(([category, nodes]) => {
+            const visibleCategoryNodes = nodes.filter((n) => isNodeVisible(n.id));
+            if (visibleCategoryNodes.length === 0) return null;
+
+            return (
+              <div
+                key={category}
+                style={{
+                  backgroundColor: '#1e293b',
+                  borderRadius: '0.5rem',
+                  border: '1px solid #334155',
+                  overflow: 'hidden',
+                }}
+              >
+                <div
+                  style={{
+                    padding: '0.6rem 1rem',
+                    backgroundColor: '#0f172a',
+                    borderBottom: '1px solid #334155',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                  }}
+                >
+                  <Folder size={15} color="#cbd5e1" />
+                  <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#cbd5e1' }}>
+                    {category}
+                  </span>
+                  <span style={{ fontSize: '0.72rem', color: '#64748b', marginLeft: 'auto' }}>
+                    {visibleCategoryNodes.length} task(s)
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column' }}>
+                  {nodes.map((node) => renderNode(node.id, 0))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Add Subtask Form Dialog */}
+      {addChildParent && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+            padding: '1rem',
+          }}
+          onClick={() => setAddChildParent(null)}
+        >
+          <div
+            style={{
+              backgroundColor: '#1e293b',
+              border: '1px solid #334155',
+              borderRadius: '0.5rem',
+              maxWidth: '520px',
+              width: '100%',
+              padding: '1.25rem',
+              boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ fontSize: '1.1rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.5rem' }}>
+              Add Subtask under {addChildParent.id}
+            </h3>
+            <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginBottom: '1rem' }}>
+              Parent: <strong style={{ color: '#f1f5f9' }}>{addChildParent.id} - {addChildParent.title}</strong>
+            </div>
+
+            {addChildError && (
+              <div
+                style={{
+                  backgroundColor: '#7f1d1d',
+                  color: '#fecaca',
+                  padding: '0.5rem 0.75rem',
+                  borderRadius: '0.375rem',
+                  marginBottom: '1rem',
+                  fontSize: '0.8rem',
+                }}
+              >
+                {addChildError}
+              </div>
+            )}
+
+            <form onSubmit={handlePreviewAddChild} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                  Subtask Title *
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Implement component hierarchy view"
+                  value={addChildTitle}
+                  onChange={(e) => setAddChildTitle(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: '#0f172a',
+                    color: '#f8fafc',
+                    fontSize: '0.85rem',
+                    boxSizing: 'border-box',
+                  }}
+                  autoFocus
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                  Kind
+                </label>
+                <select
+                  value={addChildKind}
+                  onChange={(e) => setAddChildKind(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: '#0f172a',
+                    color: '#f8fafc',
+                    fontSize: '0.85rem',
+                    boxSizing: 'border-box',
+                  }}
+                >
+                  <option value="feature">feature</option>
+                  <option value="fix">fix</option>
+                  <option value="refactor">refactor</option>
+                  <option value="test">test</option>
+                  <option value="doc">doc</option>
+                </select>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => setAddChildParent(null)}
+                  style={{
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: 'transparent',
+                    color: '#cbd5e1',
+                    fontSize: '0.8rem',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={addChildLoading || !addChildTitle.trim()}
+                  style={{
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: 'none',
+                    backgroundColor: '#6366f1',
+                    color: '#fff',
+                    fontWeight: 600,
+                    fontSize: '0.8rem',
+                    cursor: addChildLoading ? 'not-allowed' : 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                  }}
+                >
+                  {addChildLoading && <Loader2 size={13} className="spin" />}
+                  <span>Preview & Confirm</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Reopen Prompt Dialog */}
+      {reopenNode && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.75)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+            padding: '1rem',
+          }}
+          onClick={() => setReopenNode(null)}
+        >
+          <div
+            style={{
+              backgroundColor: '#1e293b',
+              border: '1px solid #334155',
+              borderRadius: '0.5rem',
+              maxWidth: '480px',
+              width: '100%',
+              padding: '1.25rem',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ fontSize: '1.1rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.5rem' }}>
+              Reopen Task {reopenNode.id}
+            </h3>
+            <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginBottom: '1rem' }}>
+              Task is currently closed. Provide a reason to reopen:
+            </div>
+
+            {reopenError && (
+              <div
+                style={{
+                  backgroundColor: '#7f1d1d',
+                  color: '#fecaca',
+                  padding: '0.5rem 0.75rem',
+                  borderRadius: '0.375rem',
+                  marginBottom: '1rem',
+                  fontSize: '0.8rem',
+                }}
+              >
+                {reopenError}
+              </div>
+            )}
+
+            <form onSubmit={handlePreviewReopen} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                  Reopen Reason *
+                </label>
+                <textarea
+                  required
+                  rows={3}
+                  placeholder="Explain why this task is being reopened..."
+                  value={reopenReason}
+                  onChange={(e) => setReopenReason(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: '#0f172a',
+                    color: '#f8fafc',
+                    fontSize: '0.85rem',
+                    boxSizing: 'border-box',
+                  }}
+                  autoFocus
+                />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => setReopenNode(null)}
+                  style={{
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: 'transparent',
+                    color: '#cbd5e1',
+                    fontSize: '0.8rem',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={!reopenReason.trim()}
+                  style={{
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: 'none',
+                    backgroundColor: '#d97706',
+                    color: '#fff',
+                    fontWeight: 600,
+                    fontSize: '0.8rem',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Preview Reopen
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation Dialog with Plan / Diff */}
+      {confirmDialogData && (
+        <ConfirmDialog
+          isOpen={confirmDialogData.isOpen}
+          title={confirmDialogData.title}
+          summary={confirmDialogData.summary}
+          plan={confirmDialogData.plan}
+          hash={confirmDialogData.planHash}
+          applyButtonText="Confirm & Apply"
+          cancelButtonText="Cancel"
+          onApply={handleApplyConfirmDialog}
+          onCancel={() => setConfirmDialogData(null)}
+        />
+      )}
+    </div>
+  );
+};
