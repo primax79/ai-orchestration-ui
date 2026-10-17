@@ -564,3 +564,53 @@ export interface InboxToTaskResponse {
   [key: string]: any;
 }
 
+// ---------------------------------------------------------------------------
+// Use Cases & Validation (Spec 15)
+// ---------------------------------------------------------------------------
+
+export type UseCaseStatus = 'draft' | 'active' | 'verified' | 'failing' | 'partial';
+export type UseCaseVerdict = 'pass' | 'fail' | 'partial' | 'untested';
+export type UseCaseVerificationType = 'automated-probe' | 'e2e' | 'code-audit' | 'api-probe';
+
+export interface UseCaseItem {
+  id: string;
+  title: string;
+  actor: string;
+  status: UseCaseStatus;
+  priority: Priority;
+  linked_tasks: string[];
+  verification_type: UseCaseVerificationType;
+  last_tested?: string | null;
+  last_verdict?: UseCaseVerdict | null;
+  description?: string;
+  preconditions?: string;
+  scenario?: string;
+  verification_command?: string;
+  acceptance_criteria?: string;
+  validation_log?: string;
+  file_path?: string;
+  rel_path?: string;
+  content?: string;
+}
+
+export interface UseCaseListResponse {
+  ok: boolean;
+  tasks_dir: string;
+  total: number;
+  use_cases: UseCaseItem[];
+}
+
+export interface ValidationCampaignResult {
+  ok: boolean;
+  timestamp: string;
+  readiness_score: number;
+  total: number;
+  passed: number;
+  failed: number;
+  regressions_count: number;
+  regressions: any[];
+  report_file: string;
+  results: any[];
+}
+
+

@@ -857,6 +857,55 @@ export const api = {
     });
   },
 
+  // -------------------------------------------------------------------------
+  // Use Cases (Spec 15)
+  // -------------------------------------------------------------------------
+
+  async getUseCases(status?: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('getUseCases', { status });
+    }
+    const q = status && status !== 'all' ? `?status=${encodeURIComponent(status)}` : '';
+    return apiFetch(`/api/use-cases${q}`);
+  },
+
+  async getUseCase(id: string): Promise<{ ok: boolean; use_case: any }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('getUseCase', { id });
+    }
+    return apiFetch(`/api/use-cases/${encodeURIComponent(id)}`);
+  },
+
+  async createUseCase(data: any): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('createUseCase', data);
+    }
+    return apiFetch('/api/use-cases', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+
+  async validateUseCase(id: string, options?: { timeout?: number; actor?: string }): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('validateUseCase', { id, ...options });
+    }
+    return apiFetch(`/api/use-cases/${encodeURIComponent(id)}/validate`, {
+      method: 'POST',
+      body: JSON.stringify(options || {}),
+    });
+  },
+
+  async runValidationCampaign(options?: { filter_actor?: string; timeout?: number }): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('runValidationCampaign', options);
+    }
+    return apiFetch('/api/use-cases/campaign', {
+      method: 'POST',
+      body: JSON.stringify(options || {}),
+    });
+  },
+
   connectWebSocket(
     onMessage: (msg: any) => void,
     onStatusChange?: (status: 'connected' | 'disconnected') => void

@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Layers, HelpCircle, Inbox, DownloadCloud, Activity, Settings, RefreshCw, FolderGit2, Terminal } from 'lucide-react';
+import { Layers, HelpCircle, Inbox, DownloadCloud, Activity, Settings, RefreshCw, FolderGit2, Terminal, CheckCircle2 } from 'lucide-react';
 import { WorkspaceInfo } from '../types';
 
 interface NavbarProps {
-  activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'installer' | 'doctor' | 'config';
-  setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'installer' | 'doctor' | 'config') => void;
+  activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'installer' | 'doctor' | 'config';
+  setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'installer' | 'doctor' | 'config') => void;
   workspace: WorkspaceInfo | null;
   onRefresh: () => void;
   isWsConnected: boolean;
@@ -71,6 +71,12 @@ export const Navbar: React.FC<NavbarProps> = ({
       shortLabel: 'Runs',
       badge: activeRunsCount,
       badgeColor: '#0ea5e9',
+    },
+    {
+      key: 'use-cases' as const,
+      icon: <CheckCircle2 size={16} />,
+      label: 'Use Cases & Validation',
+      shortLabel: 'Use Cases',
     },
     {
       key: 'installer' as const,

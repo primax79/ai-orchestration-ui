@@ -255,6 +255,7 @@ _READ_ONLY_PREFIXES = {
     ("tasks", "list"), ("tasks", "validate"), ("questions", "list"), ("questions", "show"),
     ("inbox", "list"), ("inbox", "show"), ("config", "show"), ("env", "status"),
     ("run", "list"), ("run", "show"), ("run", "logs"), ("run", "options"),
+    ("use-cases", "list"), ("use-cases", "show"),
 }
 # Per event loop: asyncio primitives cannot be shared across loops (tests run several).
 _cli_semaphores: dict[int, asyncio.Semaphore] = {}
@@ -2162,6 +2163,78 @@ async def api_inbox_to_task(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Use Cases & E2E Validation Endpoints (Spec 15)
+# ---------------------------------------------------------------------------
+
+async def api_list_use_cases(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    code, data = await run_ai_orch(["use-cases", "list", "--tasks-dir", str(tasks_dir), "--json"])
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 500)
+
+
+async def api_get_use_case(request: Request) -> JSONResponse:
+    uc_id = request.path_params["uc_id"]
+    tasks_dir = state.workspace / "tasks"
+    code, data = await run_ai_orch(["use-cases", "show", uc_id, "--tasks-dir", str(tasks_dir), "--json"])
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 404)
+
+
+async def api_create_use_case(request: Request) -> JSONResponse:
+    body = await request.json()
+    tasks_dir = state.workspace / "tasks"
+    cmd = [
+        "use-cases", "create",
+        "--id", str(body.get("id", "")),
+        "--title", str(body.get("title", "")),
+        "--tasks-dir", str(tasks_dir),
+        "--json",
+    ]
+    for opt_field in ("actor", "status", "priority", "verification_type", "verification_command", "description", "preconditions", "scenario"):
+        if body.get(opt_field):
+            cmd.extend([f"--{opt_field.replace('_', '-')}", str(body[opt_field])])
+    if body.get("linked_tasks"):
+        lt_val = ",".join(body["linked_tasks"]) if isinstance(body["linked_tasks"], list) else str(body["linked_tasks"])
+        cmd.extend(["--linked-tasks", lt_val])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "use_cases_changed", "action": "created", "id": body.get("id")})
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 400)
+
+
+async def api_validate_use_case(request: Request) -> JSONResponse:
+    uc_id = request.path_params["uc_id"]
+    tasks_dir = state.workspace / "tasks"
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    timeout = str(body.get("timeout", 60))
+    actor = str(body.get("actor", "automated-probe"))
+
+    cmd = ["use-cases", "validate", uc_id, "--timeout", timeout, "--actor", actor, "--tasks-dir", str(tasks_dir), "--json"]
+    code, data = await run_ai_orch(cmd)
+    await state.broadcast({"type": "use_cases_changed", "action": "validated", "id": uc_id})
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200)
+
+
+async def api_run_campaign(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    cmd = ["use-cases", "campaign", "--tasks-dir", str(tasks_dir), "--json"]
+    if body.get("filter_actor"):
+        cmd.extend(["--filter-actor", str(body["filter_actor"])])
+    code, data = await run_ai_orch(cmd)
+    await state.broadcast({"type": "use_cases_changed", "action": "campaign_completed"})
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket Endpoint: Live File & State Updates
 # ---------------------------------------------------------------------------
 
@@ -2238,6 +2311,11 @@ routes = [
     Route("/api/inbox/{id}/discard", api_discard_inbox_note, methods=["POST"]),
     Route("/api/inbox/{id}/reopen", api_reopen_inbox_note, methods=["POST"]),
     Route("/api/inbox/{id}/to-task", api_inbox_to_task, methods=["POST"]),
+    Route("/api/use-cases", api_list_use_cases, methods=["GET"]),
+    Route("/api/use-cases", api_create_use_case, methods=["POST"]),
+    Route("/api/use-cases/campaign", api_run_campaign, methods=["POST"]),
+    Route("/api/use-cases/{uc_id}", api_get_use_case, methods=["GET"]),
+    Route("/api/use-cases/{uc_id}/validate", api_validate_use_case, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ]
 

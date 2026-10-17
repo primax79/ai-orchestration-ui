@@ -1827,3 +1827,53 @@ def test_cli_guard_shares_identical_reads_and_caps_concurrency(monkeypatch):
     assert calls == 11  # one shared read + ten writes
     assert peak <= srv.MAX_CLI_PROCESSES
     assert srv._inflight_reads == {}
+
+
+def test_use_cases_api_endpoints(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    ws = tmp_path / "sample_ws"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+    monkeypatch.setattr(state, "workspace", ws)
+
+    # 1. Create a use case
+    create_body = {
+        "id": "UC001",
+        "title": "Search Cars by Budget",
+        "actor": "Buyer",
+        "status": "active",
+        "priority": "P1",
+        "verification_command": "echo 'CAR_DATA'",
+        "description": "Filter by price",
+    }
+    res_post = client.post("/api/use-cases", json=create_body, headers=headers)
+    assert res_post.status_code == 200
+    assert res_post.json()["ok"] is True
+    assert res_post.json()["id"] == "UC001"
+
+    # 2. List use cases
+    res_list = client.get("/api/use-cases", headers=headers)
+    assert res_list.status_code == 200
+    list_data = res_list.json()
+    assert list_data["ok"] is True
+    assert list_data["total"] == 1
+    assert list_data["use_cases"][0]["id"] == "UC001"
+
+    # 3. Get use case detail
+    res_get = client.get("/api/use-cases/UC001", headers=headers)
+    assert res_get.status_code == 200
+    assert res_get.json()["use_case"]["title"] == "Search Cars by Budget"
+
+    # 4. Validate use case
+    res_val = client.post("/api/use-cases/UC001/validate", json={"actor": "test-runner"}, headers=headers)
+    assert res_val.status_code == 200
+    assert res_val.json()["verdict"] == "pass"
+
+    # 5. Run validation campaign
+    res_camp = client.post("/api/use-cases/campaign", json={}, headers=headers)
+    assert res_camp.status_code == 200
+    assert res_camp.json()["passed"] == 1
+    assert res_camp.json()["readiness_score"] == 100.0

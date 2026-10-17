@@ -9,6 +9,7 @@ import { TaskDetailModal } from './components/TaskDetailModal';
 import { SkillInstaller } from './components/SkillInstaller';
 import { EnvironmentDoctor } from './components/EnvironmentDoctor';
 import { OrchestrationConfigurator } from './components/OrchestrationConfigurator';
+import { UseCasesManager } from './components/UseCasesManager';
 import { api } from './api';
 import {
   WorkspaceInfo,
@@ -85,7 +86,7 @@ const PanelLoading: React.FC<{ label: string }> = ({ label }) => (
 );
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'installer' | 'doctor' | 'config'>('backlog');
+  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'installer' | 'doctor' | 'config'>('backlog');
 
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
 
@@ -395,6 +396,12 @@ export const App: React.FC = () => {
                 setModalTaskAndRun({ task, runId });
               }}
             />
+          </div>
+        )}
+
+        {activeTab === 'use-cases' && (
+          <div>
+            <UseCasesManager onRefresh={loadTasks} />
           </div>
         )}
 
