@@ -15,8 +15,9 @@ import {
   Loader2,
   FileText,
   Check,
+  Play,
 } from 'lucide-react';
-import { QuestionItem, TaskItem } from '../types';
+import { QuestionItem, TaskItem, AnswerAndResumePreviewResponse } from '../types';
 import { api } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -170,6 +171,47 @@ export function buildWithdrawSummary(
   return summary;
 }
 
+export function buildAnswerAndResumeSummary(
+  q: QuestionItem,
+  choice: string,
+  text: string | undefined,
+  preview: AnswerAndResumePreviewResponse,
+  allQuestions: QuestionItem[]
+): string {
+  let choiceDisplay = choice;
+  if (choice === 'open') {
+    choiceDisplay = 'Open answer';
+  } else if (q.options) {
+    const opt = q.options.find((o) => o.label === choice);
+    if (opt) {
+      choiceDisplay = `${opt.label} — ${opt.title}${opt.consequence ? `: ${opt.consequence}` : ''}`;
+    }
+  }
+
+  const effects = computeEffects(q, allQuestions);
+  const effectsText = effects.map((e) => `- ${e}`).join('\n');
+
+  let summary = `### Question\n**${q.id}**: ${q.question}\n\n### Chosen Option\n${choiceDisplay}`;
+
+  if (text && text.trim()) {
+    summary += `\n\n### Free Text\n${text.trim()}`;
+  }
+
+  summary += `\n\n### Target Run to Continue\n\`${preview.run_id || q.origin_run || '-'}\``;
+
+  if (preview.prompt) {
+    summary += `\n\n### Continuation Prompt\n\`\`\`text\n${preview.prompt}\n\`\`\``;
+  }
+
+  if (preview.plan_hash) {
+    summary += `\n\n### Plan Hash\n\`${preview.plan_hash}\``;
+  }
+
+  summary += `\n\n### Effect\n${effectsText}\n- Origin run session will be resumed with continuation instructions`;
+
+  return summary;
+}
+
 export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefresh }) => {
   const [subTab, setSubTab] = useState<'open' | 'history'>('open');
   const [questions, setQuestions] = useState<QuestionItem[]>([]);
@@ -192,6 +234,17 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
     choiceTitle: string;
     text?: string;
   } | null>(null);
+
+  // Confirmation modal for answer & resume run
+  const [confirmingAnswerAndResume, setConfirmingAnswerAndResume] = useState<{
+    question: QuestionItem;
+    choice: string;
+    choiceTitle: string;
+    text?: string;
+    preview: AnswerAndResumePreviewResponse;
+  } | null>(null);
+  const [resumeLoading, setResumeLoading] = useState<string | null>(null);
+  const [resumeError, setResumeError] = useState<string | null>(null);
 
   // Withdraw modal / prompt
   const [withdrawingQuestion, setWithdrawingQuestion] = useState<{
@@ -375,6 +428,68 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
     onRefresh?.();
   };
 
+  const handleAnswerAndResumeClick = async (q: QuestionItem) => {
+    const choice = selectedChoices[q.id];
+    if (!choice) return;
+
+    const text = answerTexts[q.id] || '';
+    if (choice === 'open' && !text.trim()) {
+      return;
+    }
+
+    let choiceTitle = choice;
+    if (choice === 'open') {
+      choiceTitle = 'Open answer';
+    } else if (q.options) {
+      const opt = q.options.find((o) => o.label === choice);
+      if (opt) {
+        choiceTitle = `${opt.label} — ${opt.title}${opt.consequence ? `: ${opt.consequence}` : ''}`;
+      }
+    }
+
+    setResumeLoading(q.id);
+    setResumeError(null);
+    try {
+      const preview = await (api as any).previewAnswerAndResume(q.id, {
+        choice,
+        text: text.trim() ? text : undefined,
+      });
+      if (!preview.ok) {
+        setResumeError(preview.error || 'Failed to preview run continuation');
+        return;
+      }
+      setConfirmingAnswerAndResume({
+        question: q,
+        choice,
+        choiceTitle,
+        text: text.trim() ? text : undefined,
+        preview,
+      });
+    } catch (err: any) {
+      setResumeError(err.message || 'Error previewing run continuation');
+    } finally {
+      setResumeLoading(null);
+    }
+  };
+
+  const executeAnswerAndResume = async () => {
+    if (!confirmingAnswerAndResume) return;
+    const { question, choice, text, preview } = confirmingAnswerAndResume;
+    try {
+      await (api as any).answerAndResume(question.id, {
+        choice,
+        text,
+        expect_plan_hash: preview.plan_hash,
+        by: 'owner',
+      });
+      setConfirmingAnswerAndResume(null);
+      await loadQuestions();
+      onRefresh?.();
+    } catch (err: any) {
+      setResumeError(err.message || 'Failed to answer and resume run');
+    }
+  };
+
   const executeWithdraw = async () => {
     if (!withdrawingQuestion || !withdrawingQuestion.reason.trim()) return;
 
@@ -526,11 +641,46 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
               backgroundColor: '#ef4444',
               color: '#fff',
               fontSize: '0.8rem',
-              fontWeight: 600,
               cursor: 'pointer',
             }}
           >
             Retry
+          </button>
+        </div>
+      )}
+
+      {/* Resume Error Banner */}
+      {resumeError && (
+        <div
+          style={{
+            padding: '0.75rem 1rem',
+            borderRadius: '0.5rem',
+            backgroundColor: '#451a1a',
+            border: '1px solid #ef4444',
+            color: '#fca5a5',
+            marginBottom: '1.5rem',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <AlertCircle size={18} color="#ef4444" />
+            <span>{resumeError}</span>
+          </div>
+          <button
+            onClick={() => setResumeError(null)}
+            style={{
+              padding: '0.2rem 0.5rem',
+              borderRadius: '0.25rem',
+              border: 'none',
+              backgroundColor: '#ef4444',
+              color: '#fff',
+              fontSize: '0.75rem',
+              cursor: 'pointer',
+            }}
+          >
+            Dismiss
           </button>
         </div>
       )}
@@ -630,6 +780,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                       const selectedChoice = selectedChoices[q.id];
                       const currentText = answerTexts[q.id] || '';
                       const isOpenAnswer = q.open_answer === 'yes';
+                      const hasOriginRun = Boolean(q.origin_run && q.origin_run.trim() !== '-');
                       const canSubmit =
                         !!selectedChoice && (selectedChoice !== 'open' || currentText.trim().length > 0);
 
@@ -682,6 +833,23 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                               >
                                 Open
                               </span>
+
+                              {hasOriginRun && (
+                                <span
+                                  style={{
+                                    fontSize: '0.7rem',
+                                    padding: '0.15rem 0.45rem',
+                                    borderRadius: '0.25rem',
+                                    backgroundColor: '#1e1b4b',
+                                    color: '#a5b4fc',
+                                    border: '1px solid #4338ca',
+                                    fontFamily: 'monospace',
+                                  }}
+                                  title={`Origin Run: ${q.origin_run}`}
+                                >
+                                  Run: {q.origin_run}
+                                </span>
+                              )}
                             </div>
 
                             <div
@@ -984,27 +1152,57 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                               <span>Withdraw Question…</span>
                             </button>
 
-                            <button
-                              onClick={() => handleOpenAnswerSubmit(q)}
-                              disabled={!canSubmit}
-                              style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '0.4rem',
-                                padding: '0.45rem 1rem',
-                                borderRadius: '0.375rem',
-                                border: 'none',
-                                backgroundColor: canSubmit ? '#4f46e5' : '#334155',
-                                color: canSubmit ? '#fff' : '#64748b',
-                                fontSize: '0.85rem',
-                                fontWeight: 600,
-                                cursor: canSubmit ? 'pointer' : 'not-allowed',
-                                boxShadow: canSubmit ? '0 4px 6px -1px rgba(79, 70, 229, 0.3)' : 'none',
-                              }}
-                            >
-                              <Send size={14} />
-                              <span>Submit Decision</span>
-                            </button>
+                            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                              {hasOriginRun && (
+                                <button
+                                  onClick={() => handleAnswerAndResumeClick(q)}
+                                  disabled={!canSubmit || resumeLoading === q.id}
+                                  style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.4rem',
+                                    padding: '0.45rem 1rem',
+                                    borderRadius: '0.375rem',
+                                    border: '1px solid #6366f1',
+                                    backgroundColor: canSubmit && resumeLoading !== q.id ? '#312e81' : '#1e1b4b',
+                                    color: canSubmit && resumeLoading !== q.id ? '#c7d2fe' : '#475569',
+                                    fontSize: '0.85rem',
+                                    fontWeight: 600,
+                                    cursor: canSubmit && resumeLoading !== q.id ? 'pointer' : 'not-allowed',
+                                    boxShadow: canSubmit ? '0 4px 6px -1px rgba(99, 102, 241, 0.25)' : 'none',
+                                  }}
+                                >
+                                  {resumeLoading === q.id ? (
+                                    <Loader2 size={14} className="spin" />
+                                  ) : (
+                                    <Play size={14} />
+                                  )}
+                                  <span>Answer and resume run</span>
+                                </button>
+                              )}
+
+                              <button
+                                onClick={() => handleOpenAnswerSubmit(q)}
+                                disabled={!canSubmit}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '0.4rem',
+                                  padding: '0.45rem 1rem',
+                                  borderRadius: '0.375rem',
+                                  border: 'none',
+                                  backgroundColor: canSubmit ? '#4f46e5' : '#334155',
+                                  color: canSubmit ? '#fff' : '#64748b',
+                                  fontSize: '0.85rem',
+                                  fontWeight: 600,
+                                  cursor: canSubmit ? 'pointer' : 'not-allowed',
+                                  boxShadow: canSubmit ? '0 4px 6px -1px rgba(79, 70, 229, 0.3)' : 'none',
+                                }}
+                              >
+                                <Send size={14} />
+                                <span>Answer</span>
+                              </button>
+                            </div>
                           </div>
                         </div>
                       );
@@ -1330,6 +1528,25 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
           cancelButtonText="Back"
           onApply={executeAnswer}
           onCancel={() => setConfirmingAnswer(null)}
+        />
+      )}
+
+      {/* CONFIRM DIALOG FOR ANSWERING AND RESUMING RUN */}
+      {confirmingAnswerAndResume && (
+        <ConfirmDialog
+          isOpen={true}
+          title={`Confirm Answer & Resume Run for ${confirmingAnswerAndResume.question.id}`}
+          summary={buildAnswerAndResumeSummary(
+            confirmingAnswerAndResume.question,
+            confirmingAnswerAndResume.choice,
+            confirmingAnswerAndResume.text,
+            confirmingAnswerAndResume.preview,
+            questions
+          )}
+          applyButtonText="Confirm & Resume Run"
+          cancelButtonText="Back"
+          onApply={executeAnswerAndResume}
+          onCancel={() => setConfirmingAnswerAndResume(null)}
         />
       )}
 

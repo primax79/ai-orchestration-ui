@@ -24,6 +24,12 @@ if not os.environ.get("AI_ORCH_BIN"):
 
 from server import CSP_HEADER, app, get_initial_workspace, get_or_create_token, run_ai_orch, state  # noqa: E402
 
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 client = TestClient(app)
 
 
@@ -1071,6 +1077,8 @@ def test_questions_auth_enforced():
     assert client.post("/api/questions", json={}).status_code == 401
     assert client.post("/api/questions/Q001/answer", json={"choice": "A"}).status_code == 401
     assert client.post("/api/questions/Q001/withdraw", json={"reason": "foo"}).status_code == 401
+    assert client.post("/api/questions/Q001/answer-and-resume/preview", json={"choice": "A"}).status_code == 401
+    assert client.post("/api/questions/Q001/answer-and-resume", json={"choice": "A"}).status_code == 401
 
     # Endpoints with bad token -> 401
     bad_headers = {"X-AI-Orch-Token": "bad-token"}
@@ -1079,6 +1087,160 @@ def test_questions_auth_enforced():
     assert client.post("/api/questions", headers=bad_headers, json={}).status_code == 401
     assert client.post("/api/questions/Q001/answer", headers=bad_headers, json={"choice": "A"}).status_code == 401
     assert client.post("/api/questions/Q001/withdraw", headers=bad_headers, json={"reason": "foo"}).status_code == 401
+    assert client.post("/api/questions/Q001/answer-and-resume/preview", headers=bad_headers, json={"choice": "A"}).status_code == 401
+    assert client.post("/api/questions/Q001/answer-and-resume", headers=bad_headers, json={"choice": "A"}).status_code == 401
+
+
+def test_questions_answer_and_resume_flow(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    ws = _setup_runs_workspace(tmp_path, monkeypatch)
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        run_id = "20261018-120000-T001-kilo-abcd"
+        run_dir = ws / ".ai-orchestration" / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_record = {
+            "run_id": run_id,
+            "task_id": "T001",
+            "mode": "execute",
+            "tool": "kilo",
+            "profile": "bulk-execution",
+            "model": "google/gemini-3.8-flash",
+            "status": "succeeded",
+            "session_id": "session-stub-1",
+            "cwd": str(ws),
+            "isolation": "none",
+            "plan_hash": "testhash12345",
+            "questions": ["Q001"],
+        }
+        (run_dir / "run.json").write_text(json.dumps(run_record, indent=2), encoding="utf-8")
+
+        # 1. Ask a question with origin-run
+        ask_payload = {
+            "question": "Which architecture pattern should we adopt?",
+            "context": "Context paragraph.",
+            "options": [
+                {"label": "A", "title": "Pattern Alpha", "consequence": "Fast and modular"},
+                {"label": "B", "title": "Pattern Beta", "consequence": "Simpler"}
+            ],
+            "recommended": "A",
+            "open_answer": True,
+            "blocks": ["T001"],
+            "decider": "owner",
+            "origin_run": run_id,
+        }
+        res_ask = client.post("/api/questions", headers=headers, json=ask_payload)
+        assert res_ask.status_code == 200
+        q_id = res_ask.json()["id"]
+
+        # 2. Preview answer and resume
+        res_prev = client.post(
+            f"/api/questions/{q_id}/answer-and-resume/preview",
+            headers=headers,
+            json={"choice": "A", "text": "Proceed with Alpha."},
+        )
+        assert res_prev.status_code == 200
+        prev_data = res_prev.json()
+        assert prev_data["ok"] is True
+        assert prev_data["continuable"] is True
+        assert prev_data["run_id"] == run_id
+        assert prev_data["plan_hash"] == "testhash12345"
+        assert "Pattern Alpha" in prev_data["prompt"]
+        assert "Proceed with Alpha." in prev_data["prompt"]
+
+        # 3. Apply: missing expect_plan_hash -> 400
+        res_apply_nohash = client.post(
+            f"/api/questions/{q_id}/answer-and-resume",
+            headers=headers,
+            json={"choice": "A"},
+        )
+        assert res_apply_nohash.status_code == 400
+
+        # 4. Apply: stale/mismatched expect_plan_hash -> 409
+        res_apply_stale = client.post(
+            f"/api/questions/{q_id}/answer-and-resume",
+            headers=headers,
+            json={"choice": "A", "expect_plan_hash": "wronghash"},
+        )
+        assert res_apply_stale.status_code == 409
+
+        # 5. Apply: matching expect_plan_hash -> 200
+        res_apply = client.post(
+            f"/api/questions/{q_id}/answer-and-resume",
+            headers=headers,
+            json={"choice": "A", "text": "Proceed with Alpha.", "expect_plan_hash": "testhash12345"},
+        )
+        assert res_apply.status_code == 200
+        apply_data = res_apply.json()
+        assert apply_data["ok"] is True
+        assert apply_data["resumed"] is True
+        assert apply_data["continued_from"] == run_id
+
+        # Check question is now answered
+        res_q = client.get(f"/api/questions/{q_id}", headers=headers)
+        assert res_q.status_code == 200
+        assert res_q.json()["question"]["status"] == "answered"
+    finally:
+        state.workspace = old_ws
+
+
+def test_questions_answer_and_resume_non_continuable(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    ws = _setup_runs_workspace(tmp_path, monkeypatch)
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # Ask question with no origin-run
+        ask_payload = {
+            "question": "Choose a color scheme?",
+            "context": "Context paragraph.",
+            "options": [
+                {"label": "A", "title": "Dark", "consequence": "Saves battery"},
+                {"label": "B", "title": "Light", "consequence": "Readable in sun"}
+            ],
+            "recommended": "A",
+            "blocks": ["T001"],
+            "decider": "owner",
+        }
+        res_ask = client.post("/api/questions", headers=headers, json=ask_payload)
+        assert res_ask.status_code == 200
+        q_id = res_ask.json()["id"]
+
+        # Preview: continuable is False
+        res_prev = client.post(
+            f"/api/questions/{q_id}/answer-and-resume/preview",
+            headers=headers,
+            json={"choice": "A"},
+        )
+        assert res_prev.status_code == 200
+        prev_data = res_prev.json()
+        assert prev_data["ok"] is True
+        assert prev_data["continuable"] is False
+        assert "no origin-run" in prev_data["reason"].lower()
+
+        # Apply: answers question, does not require expect_plan_hash, returns resumed: False
+        res_apply = client.post(
+            f"/api/questions/{q_id}/answer-and-resume",
+            headers=headers,
+            json={"choice": "A"},
+        )
+        assert res_apply.status_code == 200
+        apply_data = res_apply.json()
+        assert apply_data["ok"] is True
+        assert apply_data["resumed"] is False
+        assert "no origin-run" in apply_data["reason"].lower()
+
+        # Check question is now answered
+        res_q = client.get(f"/api/questions/{q_id}", headers=headers)
+        assert res_q.status_code == 200
+        assert res_q.json()["question"]["status"] == "answered"
+    finally:
+        state.workspace = old_ws
 
 
 def test_watcher_broadcasts_on_question_file_change(monkeypatch):

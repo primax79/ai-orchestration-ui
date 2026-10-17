@@ -780,4 +780,42 @@ export interface SetDepsPayload {
   expect_hash?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Answer and Resume Types (Task 08.6)
+// ---------------------------------------------------------------------------
+
+export interface AnswerAndResumePayload {
+  choice: string;
+  text?: string;
+  expect_plan_hash?: string;
+  by?: string;
+}
+
+export interface AnswerAndResumePreviewResponse {
+  ok: boolean;
+  continuable: boolean;
+  can_resume?: boolean;
+  run_id?: string;
+  origin_run?: string;
+  question_id?: string;
+  plan_hash?: string;
+  prompt?: string;
+  instructions?: string;
+  reason?: string;
+  error?: string;
+}
+
+export interface AnswerAndResumeResponse {
+  ok: boolean;
+  question_id: string;
+  choice: string;
+  resumed: boolean;
+  run_id?: string;
+  continued_from?: string;
+  instructions?: string;
+  reason?: string;
+  error?: string;
+}
+
+
 

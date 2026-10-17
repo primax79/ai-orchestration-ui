@@ -2120,6 +2120,252 @@ async def api_run_continue(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
+# ---------------------------------------------------------------------------
+# Answer and Resume Run (Task 08.6)
+# ---------------------------------------------------------------------------
+
+def _format_continuation_instructions(
+    question_id: str,
+    question_text: str,
+    choice: str,
+    free_text: str | None,
+    options: list[dict[str, Any]] | None = None,
+) -> str:
+    chosen_label_title = choice
+    if choice == "open":
+        chosen_label_title = "Open answer"
+    elif options:
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("label") == choice:
+                title = opt.get("title") or opt.get("text") or ""
+                if title:
+                    chosen_label_title = f"{choice} — {title}"
+                else:
+                    chosen_label_title = choice
+                break
+
+    q_summary = question_text.strip()
+    parts = [f"Answer to {question_id} ({q_summary}): {chosen_label_title}."]
+    if free_text and str(free_text).strip():
+        parts.append(str(free_text).strip())
+    return " ".join(parts)
+
+
+def _check_origin_run_continuable(
+    workspace: pathlib.Path,
+    origin_run: str | None,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    if not origin_run or origin_run == "-" or not str(origin_run).strip():
+        return False, "Question has no origin-run", None
+
+    run_dir = workspace / ".ai-orchestration" / "runs" / origin_run
+    run_json = run_dir / "run.json"
+    if not run_json.is_file():
+        return False, f"Origin run '{origin_run}' not found in runs registry", None
+
+    try:
+        record = json.loads(run_json.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"Failed to read run record for '{origin_run}': {e}", None
+
+    status = record.get("status")
+    if status not in ("succeeded", "failed", "cancelled", "lost"):
+        return False, f"Origin run '{origin_run}' is not terminal (status: {status})", record
+
+    session_id = record.get("session_id")
+    if not session_id:
+        return False, f"Origin run '{origin_run}' has no session_id; cannot continue", record
+
+    if record.get("mode") == "execute" and record.get("isolation") == "worktree":
+        wt_p = pathlib.Path(record.get("worktree_path") or record.get("cwd") or "")
+        if not wt_p.is_dir() or record.get("worktree_removed") is True:
+            return False, f"Worktree '{wt_p}' for run '{origin_run}' does not exist", record
+
+    return True, None, record
+
+
+async def api_preview_answer_and_resume(request: Request) -> JSONResponse:
+    question_id = request.path_params.get("id") or request.path_params.get("question_id")
+    if not question_id or not QUESTION_ID_RE.match(question_id):
+        return JSONResponse({"error": f"Invalid question ID {question_id!r}, must match ^Q\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    choice = body.get("choice")
+    if not choice:
+        return JSONResponse({"error": "choice is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "show", question_id, "--tasks-dir", str(tasks_dir), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+    q_data = data.get("question", data) if isinstance(data, dict) else {}
+    if q_data.get("status") and q_data.get("status") != "open":
+        return JSONResponse({"error": f"Question {question_id} is already {q_data.get('status')}"}, status_code=400)
+
+    origin_run = q_data.get("origin_run") or q_data.get("origin-run")
+    is_cont, reason, run_record = _check_origin_run_continuable(state.workspace, origin_run)
+
+    text = body.get("text")
+    if not is_cont:
+        return JSONResponse({
+            "ok": True,
+            "continuable": False,
+            "can_resume": False,
+            "reason": reason,
+            "question_id": question_id,
+            "origin_run": origin_run if origin_run and origin_run != "-" else None,
+        })
+
+    assert run_record is not None
+    plan_hash = run_record.get("plan_hash") or ""
+    prompt = _format_continuation_instructions(
+        question_id=question_id,
+        question_text=q_data.get("question", ""),
+        choice=str(choice),
+        free_text=str(text) if text is not None else None,
+        options=q_data.get("options"),
+    )
+
+    return JSONResponse({
+        "ok": True,
+        "continuable": True,
+        "can_resume": True,
+        "run_id": origin_run,
+        "origin_run": origin_run,
+        "question_id": question_id,
+        "plan_hash": plan_hash,
+        "prompt": prompt,
+        "instructions": prompt,
+    })
+
+
+async def api_answer_and_resume(request: Request) -> JSONResponse:
+    question_id = request.path_params.get("id") or request.path_params.get("question_id")
+    if not question_id or not QUESTION_ID_RE.match(question_id):
+        return JSONResponse({"error": f"Invalid question ID {question_id!r}, must match ^Q\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    choice = body.get("choice")
+    if not choice:
+        return JSONResponse({"error": "choice is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "show", question_id, "--tasks-dir", str(tasks_dir), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+    q_data = data.get("question", data) if isinstance(data, dict) else {}
+    if q_data.get("status") and q_data.get("status") != "open":
+        return JSONResponse({"error": f"Question {question_id} is already {q_data.get('status')}"}, status_code=400)
+
+    origin_run = q_data.get("origin_run") or q_data.get("origin-run")
+    is_cont, reason, run_record = _check_origin_run_continuable(state.workspace, origin_run)
+
+    text = body.get("text")
+    text_str = str(text) if text is not None else None
+    if text_str and len(text_str.encode("utf-8")) > 32 * 1024:
+        return JSONResponse({"error": "Answer text exceeds 32 KB limit"}, status_code=400)
+
+    if is_cont:
+        assert run_record is not None
+        plan_hash = run_record.get("plan_hash") or ""
+        expect_plan_hash = body.get("expect_plan_hash")
+        if not expect_plan_hash:
+            return JSONResponse({"error": "expect_plan_hash is required for continuable run"}, status_code=400)
+        if expect_plan_hash.strip().lower() != plan_hash.strip().lower():
+            return JSONResponse(
+                {
+                    "error": "plan-hash-mismatch",
+                    "detail": f"Plan hash mismatch: expected {expect_plan_hash}, actual {plan_hash}",
+                },
+                status_code=409,
+            )
+
+    # 1. Answer the question
+    ans_cmd = [
+        "questions", "answer", question_id,
+        "--choice", str(choice),
+        "--tasks-dir", str(tasks_dir),
+        "--json",
+    ]
+    if text_str:
+        ans_cmd.extend(["--text", text_str])
+    if body.get("by"):
+        ans_cmd.extend(["--by", str(body["by"])])
+
+    ans_code, ans_data = await run_ai_orch(ans_cmd)
+    if ans_code != 0:
+        status_code = map_cli_status(ans_code, ans_data)
+        return JSONResponse(ans_data if isinstance(ans_data, dict) else {"error": ans_data}, status_code=status_code)
+
+    # 2. If continuable, start continuation run
+    if is_cont:
+        prompt = _format_continuation_instructions(
+            question_id=question_id,
+            question_text=q_data.get("question", ""),
+            choice=str(choice),
+            free_text=text_str,
+            options=q_data.get("options"),
+        )
+        continue_cmd = [
+            "run", "start",
+            "--continue", origin_run,
+            "--instructions", prompt,
+            "--expect-plan-hash", plan_hash,
+            "--requested-by", "ui",
+            "--workspace", str(state.workspace),
+            "--json",
+        ]
+        r_code, r_data = await run_ai_orch(continue_cmd, timeout=60.0)
+
+        await state.broadcast({"type": "changed", "areas": ["questions", "tasks", "runs"]})
+        await state.broadcast({"type": "question_answered", "question_id": question_id, "choice": str(choice)})
+
+        if r_code == 0:
+            return JSONResponse({
+                "ok": True,
+                "question_id": question_id,
+                "choice": choice,
+                "resumed": True,
+                "run_id": r_data.get("run_id") if isinstance(r_data, dict) else None,
+                "continued_from": origin_run,
+                "instructions": prompt,
+            })
+        else:
+            return JSONResponse({
+                "ok": True,
+                "question_id": question_id,
+                "choice": choice,
+                "resumed": False,
+                "reason": f"Run continue failed to start: {r_data.get('error') if isinstance(r_data, dict) else r_data}",
+                "continued_from": origin_run,
+                "instructions": prompt,
+            })
+    else:
+        await state.broadcast({"type": "changed", "areas": ["questions", "tasks", "runs"]})
+        await state.broadcast({"type": "question_answered", "question_id": question_id, "choice": str(choice)})
+        return JSONResponse({
+            "ok": True,
+            "question_id": question_id,
+            "choice": choice,
+            "resumed": False,
+            "reason": reason,
+        })
+
+
 async def api_list_runs(request: Request) -> JSONResponse:
     cmd = ["run", "list", "--workspace", str(state.workspace), "--json"]
     task = request.query_params.get("task")
@@ -2960,6 +3206,10 @@ routes = [
     Route("/api/runs", api_run_start, methods=["POST"]),
     Route("/api/runs/{id}", api_get_run, methods=["GET"]),
     Route("/api/runs/{id}/continue", api_run_continue, methods=["POST"]),
+    Route("/api/questions/{id}/answer-and-resume/preview", api_preview_answer_and_resume, methods=["POST"]),
+    Route("/api/questions/{id}/answer-and-resume", api_answer_and_resume, methods=["POST"]),
+    Route("/api/questions/{question_id}/answer-and-resume/preview", api_preview_answer_and_resume, methods=["POST"]),
+    Route("/api/questions/{question_id}/answer-and-resume", api_answer_and_resume, methods=["POST"]),
     Route("/api/runs/{id}/logs", api_get_run_logs, methods=["GET"]),
     Route("/api/runs/{id}/triage-proposal", api_get_triage_proposal, methods=["GET"]),
     Route("/api/runs/{id}/accept-triage", api_accept_triage_run, methods=["POST"]),

@@ -1267,3 +1267,43 @@ export const timelineApi: TimelineApiExtensions = {
 };
 
 Object.assign(api, timelineApi);
+
+// ============================================================================
+// Answer and Resume API (Task 08.6)
+// ============================================================================
+
+import type {
+  AnswerAndResumePayload,
+  AnswerAndResumePreviewResponse,
+  AnswerAndResumeResponse,
+} from './types';
+
+export interface AnswerAndResumeApiExtensions {
+  previewAnswerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumePreviewResponse>;
+  answerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumeResponse>;
+}
+
+export const answerAndResumeApi: AnswerAndResumeApiExtensions = {
+  async previewAnswerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumePreviewResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<AnswerAndResumePreviewResponse>('previewAnswerAndResume', { id, ...payload });
+    }
+    return apiFetch<AnswerAndResumePreviewResponse>(`/api/questions/${encodeURIComponent(id)}/answer-and-resume/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async answerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumeResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<AnswerAndResumeResponse>('answerAndResume', { id, ...payload });
+    }
+    return apiFetch<AnswerAndResumeResponse>(`/api/questions/${encodeURIComponent(id)}/answer-and-resume`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+};
+
+Object.assign(api, answerAndResumeApi);
+

@@ -14,6 +14,7 @@ import {
   CheckCheck,
   Ban,
   FileText,
+  HelpCircle,
 } from 'lucide-react';
 import {
   TaskItem,
@@ -498,6 +499,13 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
                       <span>+{r.commits_after_base} commit{r.commits_after_base > 1 ? 's' : ''}</span>
                     </div>
                   )}
+
+                  {r.questions && r.questions.length > 0 && (
+                    <div style={{ fontSize: '0.7rem', color: '#a5b4fc', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                      <HelpCircle size={11} color="#818cf8" />
+                      <span>Waiting: {r.questions.join(', ')}</span>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -706,36 +714,63 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
                   </div>
                 )}
 
-                {/* Questions filed by run */}
-                {selectedRun.questions && selectedRun.questions.length > 0 && (
-                  <div style={{ padding: '0.5rem 0.75rem', backgroundColor: '#1e1b4b', border: '1px solid #6366f1', borderRadius: '0.25rem' }}>
-                    <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#c7d2fe', marginBottom: '0.35rem' }}>
-                      Questions filed by this run:
-                    </div>
-                    <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-                      {selectedRun.questions.map((qid) => (
-                        <button
-                          key={qid}
-                          onClick={() => onNavigateToDecisions?.(qid)}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '0.25rem',
-                            padding: '0.25rem 0.5rem',
-                            backgroundColor: '#4338ca',
-                            color: '#fff',
-                            border: 'none',
-                            borderRadius: '0.25rem',
-                            fontSize: '0.75rem',
-                            cursor: 'pointer',
-                          }}
-                        >
-                          <span>{qid}</span>
-                          <ExternalLink size={11} />
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                {/* Questions filed by run / Blocking questions */}
+                {((selectedRun.questions && selectedRun.questions.length > 0) ||
+                  (task.state === 'waiting' && task.decider && task.decider.trim() !== '-')) && (
+                  (() => {
+                    const waitingQuestions =
+                      selectedRun.questions && selectedRun.questions.length > 0
+                        ? selectedRun.questions
+                        : (task.decider || '').split(',').map((s) => s.trim()).filter((s) => s.startsWith('Q'));
+                    if (waitingQuestions.length === 0) return null;
+                    return (
+                      <div
+                        style={{
+                          padding: '0.65rem 0.85rem',
+                          backgroundColor: '#1e1b4b',
+                          border: '1px solid #6366f1',
+                          borderRadius: '0.375rem',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '0.4rem',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#c7d2fe' }}>
+                          <HelpCircle size={15} color="#818cf8" />
+                          <span>Blocking Question{waitingQuestions.length > 1 ? 's' : ''}</span>
+                        </div>
+                        <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
+                          This run is waiting for an owner decision to resume execution.
+                        </div>
+                        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '0.2rem' }}>
+                          {waitingQuestions.map((qid) => (
+                            <button
+                              key={qid}
+                              onClick={() => onNavigateToDecisions?.(qid)}
+                              title={`Answer blocking question ${qid}`}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.35rem',
+                                padding: '0.35rem 0.75rem',
+                                backgroundColor: '#4f46e5',
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: '0.25rem',
+                                fontSize: '0.75rem',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                                boxShadow: '0 2px 4px rgba(79, 70, 229, 0.3)',
+                              }}
+                            >
+                              <span>Answer {qid}</span>
+                              <ExternalLink size={12} />
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()
                 )}
 
                 {/* Verdict Box for Verify runs */}
