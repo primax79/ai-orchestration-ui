@@ -138,23 +138,29 @@ def test_ws_auth():
 async def test_slow_cli_non_blocking(monkeypatch):
     token = get_or_create_token()
 
-    # Create a stub script that sleeps 3 seconds then returns valid JSON
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-        f.write(
-            "import sys, time\n"
-            "time.sleep(3)\n"
-            'print(\'{"tasks": [], "initiatives": [], "stats": {"total": 0}}\')\n'
-        )
-        stub_path = f.name
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir)
+        started_file = tmp_path / "cli_started"
+        release_file = tmp_path / "cli_release"
 
-    try:
-        # Create a workspace with a tasks/ directory so api_list_tasks executes CLI
+        stub_path = tmp_path / "stub_slow.py"
+        stub_path.write_text(
+            "import os, pathlib, sys, time\n"
+            f"pathlib.Path({str(started_file)!r}).touch()\n"
+            f"release_path = pathlib.Path({str(release_file)!r})\n"
+            "deadline = time.monotonic() + 15.0\n"
+            "while not release_path.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            'print(\'{"tasks": [], "initiatives": [], "stats": {"total": 0}}\')\n',
+            encoding="utf-8",
+        )
+
         with tempfile.TemporaryDirectory() as tmp_ws:
             ws_path = pathlib.Path(tmp_ws)
             (ws_path / "tasks").mkdir()
             old_ws = state.workspace
             state.workspace = ws_path
-            monkeypatch.setenv("AI_ORCH_BIN", stub_path)
+            monkeypatch.setenv("AI_ORCH_BIN", str(stub_path))
 
             try:
                 transport = httpx.ASGITransport(app=app)
@@ -163,34 +169,36 @@ async def test_slow_cli_non_blocking(monkeypatch):
                     slow_task = asyncio.create_task(
                         async_client.get("/api/tasks", headers={"X-AI-Orch-Token": token})
                     )
-                    # Yield to event loop to allow slow CLI process to spawn
-                    await asyncio.sleep(0.2)
+                    # Poll until slow CLI process is running
+                    deadline = time.monotonic() + 10.0
+                    while not started_file.exists() and time.monotonic() < deadline:
+                        await asyncio.sleep(0.01)
+                    assert started_file.is_file(), "Slow CLI process did not start within 10s"
 
-                    # Concurrently launch fast workspace request
+                    # Concurrently launch fast workspace request while slow CLI is still running
                     start_time = time.monotonic()
                     fast_res = await async_client.get("/api/workspace", headers={"X-AI-Orch-Token": token})
                     elapsed = time.monotonic() - start_time
 
                     assert fast_res.status_code == 200
-                    # Fast request must complete quickly, not blocked by the 3s stub
-                    assert elapsed < 1.5
+                    # Fast request must complete while slow_task is still running (non-blocking)
+                    assert not slow_task.done(), "Fast request was blocked until slow CLI completed"
+                    assert elapsed < 10.0
+
+                    # Release slow CLI process
+                    release_file.touch()
 
                     # Await slow task completion
                     slow_res = await slow_task
                     assert slow_res.status_code == 200
             finally:
                 state.workspace = old_ws
-    finally:
-        try:
-            os.remove(stub_path)
-        except OSError:
-            pass
 
 
 def test_watcher_broadcasts_on_file_change(monkeypatch):
     token = get_or_create_token()
     monkeypatch.setenv("AI_ORCH_WATCH_POLLING", "1")
-    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.5")
+    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.05")
 
     with tempfile.TemporaryDirectory() as tmp_ws:
         ws_path = pathlib.Path(tmp_ws)
@@ -209,11 +217,12 @@ def test_watcher_broadcasts_on_file_change(monkeypatch):
                     init_msg = ws.receive_json()
                     assert init_msg.get("type") == "connected"
 
-                    # Touch file in tasks
-                    time.sleep(0.1)
+                    # Touch file in tasks with distinct mtime
                     initial_file.write_text("modified task content", encoding="utf-8")
+                    new_mtime = initial_file.stat().st_mtime + 2.0
+                    os.utime(initial_file, (new_mtime, new_mtime))
 
-                    # Wait for changed broadcast within 2 seconds
+                    # Wait for changed broadcast
                     broadcast_msg = ws.receive_json()
                     assert broadcast_msg.get("type") == "changed"
                     assert "tasks" in broadcast_msg.get("areas", [])
@@ -286,6 +295,30 @@ async def test_process_group_cleanup_grandchild(monkeypatch, tmp_path):
 
     monkeypatch.setenv("AI_ORCH_BIN", str(stub_script))
 
+    async def fake_wait_for(coro, timeout):
+        comm_task = asyncio.create_task(coro)
+        try:
+            # Poll up to 10s for child and grandchild PIDs to be recorded before timing out
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if child_pid_file.is_file() and grandchild_pid_file.is_file():
+                    c = child_pid_file.read_text(encoding="utf-8").strip()
+                    g = grandchild_pid_file.read_text(encoding="utf-8").strip()
+                    if c and g:
+                        break
+                await asyncio.sleep(0.01)
+            else:
+                raise TimeoutError("Child and grandchild PIDs were not written within 10s")
+            raise asyncio.TimeoutError()
+        finally:
+            comm_task.cancel()
+            try:
+                await comm_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    monkeypatch.setattr("server.asyncio.wait_for", fake_wait_for)
+
     # Execute run_ai_orch with 1s timeout
     code, res = await run_ai_orch([], timeout=1.0)
     assert code == 504
@@ -298,18 +331,20 @@ async def test_process_group_cleanup_grandchild(monkeypatch, tmp_path):
     child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
     grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
 
-    # Wait briefly for OS process cleanup
-    for _ in range(20):
+    # Wait for OS process cleanup (generous timeout >= 10s)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
         try:
             os.kill(child_pid, 0)
-            time.sleep(0.05)
+            await asyncio.sleep(0.02)
         except (ProcessLookupError, OSError):
             break
 
-    for _ in range(20):
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
         try:
             os.kill(grandchild_pid, 0)
-            time.sleep(0.05)
+            await asyncio.sleep(0.02)
         except (ProcessLookupError, OSError):
             break
 
@@ -340,29 +375,40 @@ async def test_process_group_cleanup_on_cancellation(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_ORCH_BIN", str(stub_script))
 
     task = asyncio.create_task(run_ai_orch([], timeout=30.0))
-    for _ in range(20):
+    deadline = time.monotonic() + 10.0
+    child_pid = grandchild_pid = None
+    while time.monotonic() < deadline:
         if child_pid_file.is_file() and grandchild_pid_file.is_file():
-            break
-        await asyncio.sleep(0.05)
+            c_text = child_pid_file.read_text(encoding="utf-8").strip()
+            g_text = grandchild_pid_file.read_text(encoding="utf-8").strip()
+            if c_text and g_text:
+                try:
+                    child_pid = int(c_text)
+                    grandchild_pid = int(g_text)
+                    break
+                except ValueError:
+                    pass
+        await asyncio.sleep(0.02)
 
-    child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
-    grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+    assert child_pid is not None and grandchild_pid is not None, "PIDs not captured within 10s"
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    for _ in range(20):
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
         try:
             os.kill(child_pid, 0)
-            time.sleep(0.05)
+            await asyncio.sleep(0.02)
         except (ProcessLookupError, OSError):
             break
 
-    for _ in range(20):
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
         try:
             os.kill(grandchild_pid, 0)
-            time.sleep(0.05)
+            await asyncio.sleep(0.02)
         except (ProcessLookupError, OSError):
             break
 
@@ -1038,7 +1084,7 @@ def test_questions_auth_enforced():
 def test_watcher_broadcasts_on_question_file_change(monkeypatch):
     token = get_or_create_token()
     monkeypatch.setenv("AI_ORCH_WATCH_POLLING", "1")
-    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.5")
+    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.05")
 
     with tempfile.TemporaryDirectory() as tmp_ws:
         ws_path = pathlib.Path(tmp_ws)
@@ -1056,11 +1102,12 @@ def test_watcher_broadcasts_on_question_file_change(monkeypatch):
                     init_msg = ws.receive_json()
                     assert init_msg.get("type") == "connected"
 
-                    # Touch question file
-                    time.sleep(0.1)
+                    # Touch question file with distinct mtime
                     q_file.write_text("modified question content", encoding="utf-8")
+                    new_mtime = q_file.stat().st_mtime + 2.0
+                    os.utime(q_file, (new_mtime, new_mtime))
 
-                    # Wait for changed broadcast within 2 seconds
+                    # Wait for changed broadcast
                     broadcast_msg = ws.receive_json()
                     assert broadcast_msg.get("type") == "changed"
                     areas = broadcast_msg.get("areas", [])
@@ -1193,10 +1240,10 @@ def test_runs_options_preview_start_show_logs_delivered_cleanup(monkeypatch, tmp
         run_id = start_data["run_id"]
         assert start_data.get("status") == "starting"
 
-        # 6. Poll show until succeeded
+        # 6. Poll show until succeeded (generous timeout up to 30s)
         run_record = None
-        for _ in range(30):
-            time.sleep(0.5)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             res_show = client.get(f"/api/runs/{run_id}", headers=headers)
             assert res_show.status_code == 200
             show_data = res_show.json()
@@ -1204,6 +1251,7 @@ def test_runs_options_preview_start_show_logs_delivered_cleanup(monkeypatch, tmp
             run_record = show_data.get("run", {})
             if run_record.get("status") == "succeeded":
                 break
+            time.sleep(0.1)
 
         assert run_record is not None
         assert run_record.get("status") == "succeeded"
@@ -1276,8 +1324,13 @@ def test_runs_cancel_long_sleeping_stub(monkeypatch, tmp_path):
         assert res_start.status_code == 200
         run_id = res_start.json()["run_id"]
 
-        # Wait briefly for process to spawn
-        time.sleep(1.0)
+        # Poll until process is spawned and running (up to 15s)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            res_show = client.get(f"/api/runs/{run_id}", headers=headers)
+            if res_show.status_code == 200 and res_show.json().get("run", {}).get("status") == "running":
+                break
+            time.sleep(0.05)
 
         # Cancel
         res_cancel = client.post(f"/api/runs/{run_id}/cancel", headers=headers)
@@ -1286,8 +1339,13 @@ def test_runs_cancel_long_sleeping_stub(monkeypatch, tmp_path):
         assert cancel_data.get("ok") is True
         assert cancel_data.get("status") == "cancelled"
 
-        # Verify show returns cancelled
-        res_show = client.get(f"/api/runs/{run_id}", headers=headers)
+        # Verify show returns cancelled (poll up to 15s)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            res_show = client.get(f"/api/runs/{run_id}", headers=headers)
+            if res_show.status_code == 200 and res_show.json().get("run", {}).get("status") == "cancelled":
+                break
+            time.sleep(0.05)
         assert res_show.status_code == 200
         assert res_show.json()["run"]["status"] == "cancelled"
     finally:
@@ -1316,7 +1374,7 @@ def test_runs_bad_id_format(monkeypatch, tmp_path):
 def test_runs_watcher_broadcast(monkeypatch, tmp_path):
     token = get_or_create_token()
     monkeypatch.setenv("AI_ORCH_WATCH_POLLING", "1")
-    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.5")
+    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.05")
 
     runs_dir = tmp_path / ".ai-orchestration" / "runs" / "20261017-123456-T001-kilo-1234"
     runs_dir.mkdir(parents=True)
@@ -1331,9 +1389,10 @@ def test_runs_watcher_broadcast(monkeypatch, tmp_path):
                 init_msg = ws.receive_json()
                 assert init_msg.get("type") == "connected"
 
-                # Touch run.json (metadata only)
-                time.sleep(0.1)
+                # Touch run.json with distinct mtime
                 run_file.write_text(json.dumps({"run_id": "20261017-123456-T001-kilo-1234", "status": "running"}), encoding="utf-8")
+                new_mtime = run_file.stat().st_mtime + 2.0
+                os.utime(run_file, (new_mtime, new_mtime))
 
                 # Wait for broadcast
                 broadcast_msg = ws.receive_json()
@@ -1660,7 +1719,7 @@ def test_inbox_bad_ids_and_input_validation(monkeypatch, tmp_path):
 def test_inbox_watcher_broadcasts_on_inbox_change(monkeypatch):
     token = get_or_create_token()
     monkeypatch.setenv("AI_ORCH_WATCH_POLLING", "1")
-    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.5")
+    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.05")
 
     with tempfile.TemporaryDirectory() as tmp_ws:
         ws_path = pathlib.Path(tmp_ws)
@@ -1678,8 +1737,9 @@ def test_inbox_watcher_broadcasts_on_inbox_change(monkeypatch):
                     init_msg = ws.receive_json()
                     assert init_msg.get("type") == "connected"
 
-                    time.sleep(0.1)
                     note_file.write_text("modified note content", encoding="utf-8")
+                    new_mtime = note_file.stat().st_mtime + 2.0
+                    os.utime(note_file, (new_mtime, new_mtime))
 
                     broadcast_msg = ws.receive_json()
                     assert broadcast_msg.get("type") == "changed"
