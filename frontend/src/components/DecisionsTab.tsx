@@ -41,6 +41,135 @@ function formatAge(dateStr: string): string {
   }
 }
 
+export function getBlockedTasks(q: QuestionItem): Array<{ taskId: string; priorState: string }> {
+  if (q.blocks_parsed && q.blocks_parsed.length > 0) {
+    return q.blocks_parsed.map(([taskId, state]) => ({
+      taskId,
+      priorState: state || 'open',
+    }));
+  }
+  if (!q.blocks || q.blocks.trim() === '-') {
+    return [];
+  }
+  const results: Array<{ taskId: string; priorState: string }> = [];
+  const parts = q.blocks.split(',');
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed || trimmed === '-') continue;
+    const match = trimmed.match(/^([^\s(]+)(?:\s*\(([^)]+)\))?/);
+    if (match) {
+      results.push({
+        taskId: match[1],
+        priorState: match[2] || 'open',
+      });
+    }
+  }
+  return results;
+}
+
+export function questionBlocksTask(q: QuestionItem, taskId: string): boolean {
+  if (q.blocks_parsed && q.blocks_parsed.length > 0) {
+    return q.blocks_parsed.some(([tid]) => tid === taskId);
+  }
+  if (!q.blocks || q.blocks.trim() === '-') {
+    return false;
+  }
+  const parts = q.blocks.split(',');
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed || trimmed === '-') continue;
+    const match = trimmed.match(/^([^\s(]+)/);
+    if (match && match[1] === taskId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function computeEffects(currentQ: QuestionItem, allQuestions: QuestionItem[]): string[] {
+  const blockedTasks = getBlockedTasks(currentQ);
+  if (blockedTasks.length === 0) {
+    return ['No tasks blocked'];
+  }
+
+  return blockedTasks.map(({ taskId, priorState }) => {
+    const otherOpen = allQuestions.filter(
+      (q) => q.status === 'open' && q.id !== currentQ.id && questionBlocksTask(q, taskId)
+    );
+    if (otherOpen.length > 0) {
+      const qIds = otherOpen.map((q) => q.id).join(', ');
+      return `${taskId}: stays waiting (${qIds} still open)`;
+    }
+
+    let targetState = priorState;
+    if (targetState === 'waiting') {
+      for (const q of allQuestions) {
+        if (q.id !== currentQ.id && questionBlocksTask(q, taskId)) {
+          const bt = getBlockedTasks(q).find((b) => b.taskId === taskId);
+          if (bt && bt.priorState && bt.priorState !== 'waiting') {
+            targetState = bt.priorState;
+            break;
+          }
+        }
+      }
+      if (targetState === 'waiting') {
+        targetState = 'open';
+      }
+    }
+
+    return `${taskId} → ${targetState}`;
+  });
+}
+
+export function buildAnswerSummary(
+  q: QuestionItem,
+  choice: string,
+  text: string | undefined,
+  allQuestions: QuestionItem[]
+): string {
+  let choiceDisplay = choice;
+  if (choice === 'open') {
+    choiceDisplay = 'Open answer';
+  } else if (q.options) {
+    const opt = q.options.find((o) => o.label === choice);
+    if (opt) {
+      choiceDisplay = `${opt.label} — ${opt.title}${opt.consequence ? `: ${opt.consequence}` : ''}`;
+    }
+  }
+
+  const effects = computeEffects(q, allQuestions);
+  const effectsText = effects.map((e) => `- ${e}`).join('\n');
+
+  let summary = `### Question\n**${q.id}**: ${q.question}\n\n### Chosen Option\n${choiceDisplay}`;
+
+  if (text && text.trim()) {
+    summary += `\n\n### Free Text\n${text.trim()}`;
+  }
+
+  summary += `\n\n### Effect\n${effectsText}`;
+
+  return summary;
+}
+
+export function buildWithdrawSummary(
+  q: QuestionItem,
+  reason: string,
+  allQuestions: QuestionItem[]
+): string {
+  const effects = computeEffects(q, allQuestions);
+  const effectsText = effects.map((e) => `- ${e}`).join('\n');
+
+  let summary = `### Question\n**${q.id}**: ${q.question}`;
+
+  if (reason && reason.trim()) {
+    summary += `\n\n### Reason\n${reason.trim()}`;
+  }
+
+  summary += `\n\n### Effect\n${effectsText}`;
+
+  return summary;
+}
+
 export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefresh }) => {
   const [subTab, setSubTab] = useState<'open' | 'history'>('open');
   const [questions, setQuestions] = useState<QuestionItem[]>([]);
@@ -215,7 +344,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
 
     let choiceTitle = choice;
     if (choice === 'open') {
-      choiceTitle = 'Other / open answer';
+      choiceTitle = 'Open answer';
     } else if (q.options) {
       const opt = q.options.find((o) => o.label === choice);
       if (opt) {
@@ -249,20 +378,13 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
   const executeWithdraw = async () => {
     if (!withdrawingQuestion || !withdrawingQuestion.reason.trim()) return;
 
-    setWithdrawingQuestion((prev) => (prev ? { ...prev, submitting: true, error: undefined } : null));
-    try {
-      await api.withdrawQuestion(withdrawingQuestion.question.id, {
-        reason: withdrawingQuestion.reason.trim(),
-        by: 'owner',
-      });
-      setWithdrawingQuestion(null);
-      await loadQuestions();
-      onRefresh?.();
-    } catch (e: any) {
-      setWithdrawingQuestion((prev) =>
-        prev ? { ...prev, submitting: false, error: e.message || String(e) } : null
-      );
-    }
+    await api.withdrawQuestion(withdrawingQuestion.question.id, {
+      reason: withdrawingQuestion.reason.trim(),
+      by: 'owner',
+    });
+    setWithdrawingQuestion(null);
+    await loadQuestions();
+    onRefresh?.();
   };
 
   return (
@@ -1198,9 +1320,12 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
         <ConfirmDialog
           isOpen={true}
           title={`Confirm Answer for ${confirmingAnswer.question.id}`}
-          summary={`### Question\n**${confirmingAnswer.question.question}**\n\n**Selected Choice:** ${confirmingAnswer.choiceTitle}\n\n${
-            confirmingAnswer.text ? `**Answer Text / Notes:**\n\n${confirmingAnswer.text}` : ''
-          }`}
+          summary={buildAnswerSummary(
+            confirmingAnswer.question,
+            confirmingAnswer.choice,
+            confirmingAnswer.text,
+            questions
+          )}
           applyButtonText="Confirm & Answer"
           cancelButtonText="Back"
           onApply={executeAnswer}
@@ -1208,154 +1333,59 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
         />
       )}
 
-      {/* WITHDRAW REASON MODAL */}
+      {/* CONFIRM DIALOG FOR WITHDRAWING */}
       {withdrawingQuestion && (
-        <div
-          style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            backgroundColor: 'rgba(0, 0, 0, 0.75)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 2000,
-            padding: '1.5rem',
-          }}
+        <ConfirmDialog
+          isOpen={true}
+          title={`Confirm Withdrawal for ${withdrawingQuestion.question.id}`}
+          summary={buildWithdrawSummary(
+            withdrawingQuestion.question,
+            withdrawingQuestion.reason,
+            questions
+          )}
+          applyButtonText="Confirm Withdraw"
+          cancelButtonText="Cancel"
+          danger={true}
+          isApplyDisabled={!withdrawingQuestion.reason.trim()}
+          onApply={executeWithdraw}
+          onCancel={() => setWithdrawingQuestion(null)}
         >
-          <div
-            style={{
-              backgroundColor: '#1e293b',
-              border: '1px solid #ef4444',
-              borderRadius: '0.75rem',
-              width: '100%',
-              maxWidth: '550px',
-              padding: '1.5rem',
-              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.6)',
-            }}
-          >
-            <div
+          <div style={{ marginTop: '0.5rem' }}>
+            <label
               style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '0.5rem',
-                marginBottom: '1rem',
+                display: 'block',
+                fontSize: '0.8rem',
+                fontWeight: 600,
+                color: '#fca5a5',
+                marginBottom: '0.4rem',
               }}
             >
-              <RotateCcw size={20} color="#ef4444" />
-              <h2 style={{ fontSize: '1.15rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
-                Withdraw Question {withdrawingQuestion.question.id}
-              </h2>
-            </div>
-
-            <p style={{ fontSize: '0.85rem', color: '#cbd5e1', marginBottom: '1rem' }}>
-              Withdrawing this question will cancel the decision request and restore any blocked tasks
-              back to their prior state. A withdrawal reason is required.
-            </p>
-
-            <div style={{ marginBottom: '1rem' }}>
-              <label
-                style={{
-                  display: 'block',
-                  fontSize: '0.8rem',
-                  fontWeight: 600,
-                  color: '#fca5a5',
-                  marginBottom: '0.4rem',
-                }}
-              >
-                Withdrawal Reason (Required):
-              </label>
-              <textarea
-                value={withdrawingQuestion.reason}
-                onChange={(e) =>
-                  setWithdrawingQuestion((prev) =>
-                    prev ? { ...prev, reason: e.target.value } : null
-                  )
-                }
-                placeholder="Explain why this question is being withdrawn (e.g. requirement changed, obsolete, decided out-of-band)..."
-                rows={3}
-                style={{
-                  width: '100%',
-                  padding: '0.6rem 0.75rem',
-                  backgroundColor: '#0f172a',
-                  border: '1px solid #ef4444',
-                  borderRadius: '0.375rem',
-                  color: '#f8fafc',
-                  fontSize: '0.85rem',
-                  lineHeight: 1.4,
-                  resize: 'vertical',
-                }}
-              />
-            </div>
-
-            {withdrawingQuestion.error && (
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.5rem',
-                  padding: '0.6rem 0.75rem',
-                  borderRadius: '0.375rem',
-                  backgroundColor: '#451a1a',
-                  color: '#fca5a5',
-                  fontSize: '0.8rem',
-                  marginBottom: '1rem',
-                }}
-              >
-                <AlertCircle size={15} color="#ef4444" />
-                <span>{withdrawingQuestion.error}</span>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.6rem' }}>
-              <button
-                onClick={() => setWithdrawingQuestion(null)}
-                disabled={withdrawingQuestion.submitting}
-                style={{
-                  padding: '0.45rem 0.9rem',
-                  borderRadius: '0.375rem',
-                  border: '1px solid #475569',
-                  backgroundColor: 'transparent',
-                  color: '#cbd5e1',
-                  fontSize: '0.85rem',
-                  cursor: withdrawingQuestion.submitting ? 'not-allowed' : 'pointer',
-                }}
-              >
-                Cancel
-              </button>
-
-              <button
-                onClick={executeWithdraw}
-                disabled={!withdrawingQuestion.reason.trim() || withdrawingQuestion.submitting}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.4rem',
-                  padding: '0.45rem 1rem',
-                  borderRadius: '0.375rem',
-                  border: 'none',
-                  backgroundColor: '#ef4444',
-                  color: '#fff',
-                  fontSize: '0.85rem',
-                  fontWeight: 600,
-                  cursor:
-                    !withdrawingQuestion.reason.trim() || withdrawingQuestion.submitting
-                      ? 'not-allowed'
-                      : 'pointer',
-                }}
-              >
-                {withdrawingQuestion.submitting ? (
-                  <Loader2 size={15} className="spin" />
-                ) : (
-                  <RotateCcw size={15} />
-                )}
-                <span>Confirm Withdraw</span>
-              </button>
-            </div>
+              Withdrawal Reason (Required):
+            </label>
+            <textarea
+              value={withdrawingQuestion.reason}
+              onChange={(e) =>
+                setWithdrawingQuestion((prev) =>
+                  prev ? { ...prev, reason: e.target.value } : null
+                )
+              }
+              placeholder="Explain why this question is being withdrawn (e.g. requirement changed, obsolete, decided out-of-band)..."
+              rows={3}
+              style={{
+                width: '100%',
+                padding: '0.6rem 0.75rem',
+                backgroundColor: '#0f172a',
+                border: '1px solid #ef4444',
+                borderRadius: '0.375rem',
+                color: '#f8fafc',
+                fontSize: '0.85rem',
+                lineHeight: 1.4,
+                resize: 'vertical',
+                outline: 'none',
+              }}
+            />
           </div>
-        </div>
+        </ConfirmDialog>
       )}
     </div>
   );

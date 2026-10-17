@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { AlertTriangle, AlertCircle, CheckCircle2, X, Loader2 } from 'lucide-react';
+import { AlertTriangle, AlertCircle, CheckCircle2, X, Loader2, RotateCcw } from 'lucide-react';
 import { SafeMarkdown } from './SafeMarkdown';
 
 export interface PlanItem {
@@ -31,6 +31,9 @@ export interface ConfirmDialogProps {
   hash?: string;
   applyButtonText?: string;
   cancelButtonText?: string;
+  danger?: boolean;
+  isApplyDisabled?: boolean;
+  children?: React.ReactNode;
   onApply: (hash?: string) => Promise<void>;
   onCancel: () => void;
   onRefetchPreview?: () => Promise<ConfirmDialogPreviewData>;
@@ -46,6 +49,9 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
   hash: initialHash,
   applyButtonText = 'Apply',
   cancelButtonText = 'Cancel',
+  danger = false,
+  isApplyDisabled = false,
+  children,
   onApply,
   onCancel,
   onRefetchPreview,
@@ -173,7 +179,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
       <div
         style={{
           backgroundColor: '#1e293b',
-          border: '1px solid #334155',
+          border: `1px solid ${danger ? '#ef4444' : '#334155'}`,
           borderRadius: '0.75rem',
           width: '100%',
           maxWidth: '920px',
@@ -196,7 +202,11 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <AlertCircle size={20} color="#818cf8" />
+            {danger ? (
+              <RotateCcw size={20} color="#ef4444" />
+            ) : (
+              <AlertCircle size={20} color="#818cf8" />
+            )}
             <h2 style={{ fontSize: '1.15rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
               {title}
             </h2>
@@ -224,6 +234,9 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
               <SafeMarkdown content={summary} />
             </div>
           )}
+
+          {/* Custom Children Form Elements */}
+          {children}
 
           {/* Stale (409) Error Banner */}
           {staleError && (
@@ -390,7 +403,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
           )}
 
           {/* Empty changes fallback */}
-          {!plan?.length && !diff && (
+          {!plan?.length && !diff && !summary && !children && (
             <div style={{ textAlign: 'center', padding: '1.5rem', color: '#94a3b8', fontSize: '0.85rem' }}>
               No modifications required.
             </div>
@@ -436,7 +449,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
 
             <button
               onClick={handleApply}
-              disabled={isApplying || isRefetching}
+              disabled={isApplying || isRefetching || isApplyDisabled}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -444,16 +457,26 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
                 padding: '0.45rem 1rem',
                 borderRadius: '0.375rem',
                 border: 'none',
-                backgroundColor: '#4f46e5',
-                color: '#fff',
+                backgroundColor: isApplyDisabled
+                  ? '#334155'
+                  : danger
+                  ? '#ef4444'
+                  : '#4f46e5',
+                color: isApplyDisabled ? '#64748b' : '#fff',
                 fontSize: '0.85rem',
                 fontWeight: 600,
-                cursor: isApplying || isRefetching ? 'not-allowed' : 'pointer',
-                boxShadow: '0 4px 6px -1px rgba(79, 70, 229, 0.3)',
+                cursor: isApplying || isRefetching || isApplyDisabled ? 'not-allowed' : 'pointer',
+                boxShadow: isApplyDisabled
+                  ? 'none'
+                  : danger
+                  ? '0 4px 6px -1px rgba(239, 68, 68, 0.3)'
+                  : '0 4px 6px -1px rgba(79, 70, 229, 0.3)',
               }}
             >
               {isApplying || isRefetching ? (
                 <Loader2 size={16} className="spin" />
+              ) : danger ? (
+                <RotateCcw size={16} />
               ) : (
                 <CheckCircle2 size={16} />
               )}
