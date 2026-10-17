@@ -2157,6 +2157,10 @@ def _check_origin_run_continuable(
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     if not origin_run or origin_run == "-" or not str(origin_run).strip():
         return False, "Question has no origin-run", None
+    origin_run = str(origin_run).strip()
+    # The id comes from a question file: validate it before building a path from it.
+    if not RUN_ID_RE.match(origin_run):
+        return False, f"Invalid origin-run id {origin_run!r}", None
 
     run_dir = workspace / ".ai-orchestration" / "runs" / origin_run
     run_json = run_dir / "run.json"
