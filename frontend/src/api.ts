@@ -88,10 +88,16 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> 
     headers['X-AI-Orch-Token'] = token;
   }
 
-  const res = await fetch(url, {
-    ...options,
-    headers,
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers,
+    });
+  } catch {
+    // fetch() rejects only on network failure: the backend is down or unreachable
+    throw new Error('Server not reachable: is ./start.sh still running?');
+  }
 
   if (!res.ok) {
     if (res.status === 401) {
