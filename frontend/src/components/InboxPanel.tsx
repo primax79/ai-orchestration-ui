@@ -22,6 +22,8 @@ import {
   Check,
   ExternalLink,
   Info,
+  FileDown,
+  FileText,
 } from 'lucide-react';
 import {
   InboxNoteItem,
@@ -30,10 +32,17 @@ import {
   InboxToTaskPayload,
   RunRecord,
   TriageProposal,
+  AttachmentDetail,
 } from '../types';
 import { api, ApiError } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
+import {
+  AttachmentItem,
+  getAttachmentInfo,
+  downloadAttachmentBlob,
+} from './AttachmentComponents';
+import { TextViewerModal } from './TextViewerModal';
 
 const ALL_STATUSES: InboxNoteStatus[] = ['draft', 'ready', 'processing', 'processed', 'discarded'];
 const ALL_KINDS: Array<InboxNoteKind | 'all'> = ['all', 'note', 'bug', 'feature', 'idea', 'request', 'question'];
@@ -114,6 +123,7 @@ interface AttachmentThumbnailProps {
   canRemove?: boolean;
   onRemove?: () => void;
   onBlobLoaded?: (name: string, blobUrl: string) => void;
+  details?: AttachmentDetail[];
 }
 
 const AttachmentThumbnail: React.FC<AttachmentThumbnailProps> = ({
@@ -123,12 +133,15 @@ const AttachmentThumbnail: React.FC<AttachmentThumbnailProps> = ({
   canRemove = false,
   onRemove,
   onBlobLoaded,
+  details,
 }) => {
+  const info = getAttachmentInfo(name, details);
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(info.class === 'image');
   const [error, setError] = useState(false);
 
   useEffect(() => {
+    if (info.class !== 'image') return;
     let active = true;
     let url: string | null = null;
 
@@ -164,7 +177,49 @@ const AttachmentThumbnail: React.FC<AttachmentThumbnailProps> = ({
         URL.revokeObjectURL(url);
       }
     };
-  }, [noteId, name]);
+  }, [noteId, name, info.class]);
+
+  if (info.class === 'text') {
+    return (
+      <div
+        style={{
+          width: size,
+          height: size,
+          borderRadius: '0.375rem',
+          border: '1px solid #334155',
+          backgroundColor: '#0f172a',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0,
+        }}
+        title={name}
+      >
+        <FileText size={Math.max(14, Math.floor(size * 0.45))} color="#818cf8" />
+      </div>
+    );
+  }
+
+  if (info.class === 'pdf') {
+    return (
+      <div
+        style={{
+          width: size,
+          height: size,
+          borderRadius: '0.375rem',
+          border: '1px solid #334155',
+          backgroundColor: '#0f172a',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0,
+        }}
+        title={name}
+      >
+        <FileDown size={Math.max(14, Math.floor(size * 0.45))} color="#f43f5e" />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -606,7 +661,9 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const [body, setBody] = useState<string>(initialNote?.body || '');
   const [status, setStatus] = useState<string>(initialNote?.status || 'draft');
   const [attachments, setAttachments] = useState<string[]>(initialNote?.attachments || []);
+  const [attachmentDetails, setAttachmentDetails] = useState<AttachmentDetail[]>(initialNote?.attachment_details || []);
   const [currentHash, setCurrentHash] = useState<string | undefined>(initialNote?.bundle_sha256);
+  const [viewingTextAttachment, setViewingTextAttachment] = useState<{ filename: string; size?: number } | null>(null);
 
   const [isPreview, setIsPreview] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -661,6 +718,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       setBody(initialNote.body || '');
       setStatus(initialNote.status || 'draft');
       setAttachments(initialNote.attachments || []);
+      setAttachmentDetails(initialNote.attachment_details || []);
       setCurrentHash(initialNote.bundle_sha256);
       lastSavedValues.current = {
         title: initialNote.title || '',
@@ -676,6 +734,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       setBody('');
       setStatus('draft');
       setAttachments([]);
+      setAttachmentDetails([]);
       setCurrentHash(undefined);
       lastSavedValues.current = { title: '', kind: 'note', about: '', body: '' };
     }
@@ -902,10 +961,23 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           }
           return prev;
         });
+        const fname = filename || (file instanceof File ? file.name : '');
+        const detectedClass = (resUpload.class as any) || (
+          file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(resUpload.attachment) || /\.(png|jpe?g|gif|webp)$/i.test(fname)
+            ? 'image'
+            : /\.pdf$/i.test(resUpload.attachment) || /\.pdf$/i.test(fname)
+            ? 'pdf'
+            : 'text'
+        );
+        setAttachmentDetails((prev) => {
+          const filtered = prev.filter((d) => d.name !== resUpload.attachment);
+          return [...filtered, { name: resUpload.attachment, class: detectedClass, size: file.size }];
+        });
         if (resUpload.bundle_sha256) {
           setCurrentHash(resUpload.bundle_sha256);
         }
-        const mdRef = resUpload.markdown || `![](attachments/${resUpload.attachment})`;
+        const isImg = detectedClass === 'image';
+        const mdRef = resUpload.markdown || (isImg ? `![](attachments/${resUpload.attachment})` : `[${resUpload.attachment}](attachments/${resUpload.attachment})`);
         insertMarkdownAtCursor(mdRef);
         onSaved();
       }
@@ -919,14 +991,20 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   // Paste handler on textarea
   const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData?.items;
-    if (!items) return;
-
+    const files = e.clipboardData?.files;
     const filesToUpload: File[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile();
-        if (file) filesToUpload.push(file);
+
+    if (files && files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        filesToUpload.push(files[i]);
+      }
+    } else if (items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file') {
+          const file = item.getAsFile();
+          if (file) filesToUpload.push(file);
+        }
       }
     }
 
@@ -962,10 +1040,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     if (!files || files.length === 0) return;
 
     for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(file.name)) {
-        await handleUploadFile(file);
-      }
+      await handleUploadFile(files[i]);
     }
   };
 
@@ -976,12 +1051,30 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     try {
       const res = await api.deleteInboxAttachment(noteId, attName);
       setAttachments((prev) => prev.filter((a) => a !== attName));
+      setAttachmentDetails((prev) => prev.filter((a) => a.name !== attName));
       if (res.bundle_sha256) {
         setCurrentHash(res.bundle_sha256);
       }
       onSaved();
     } catch (err: any) {
       setInlineError(err?.message || String(err));
+    }
+  };
+
+  const handleDownloadPdf = (attName: string) => {
+    downloadAttachmentBlob(() => api.getInboxAttachment(noteId, attName), attName).catch((err) => {
+      setInlineError(`Failed to download ${attName}: ${err?.message || err}`);
+    });
+  };
+
+  const handleAttachmentClick = (filename: string) => {
+    const info = getAttachmentInfo(filename, attachmentDetails);
+    if (info.class === 'pdf') {
+      handleDownloadPdf(filename);
+    } else if (info.class === 'text') {
+      setViewingTextAttachment({ filename, size: info.size });
+    } else if (info.class === 'image') {
+      handleDownloadPdf(filename);
     }
   };
 
@@ -1048,6 +1141,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
         setBody(res.note.body || '');
         setStatus(res.note.status || 'draft');
         setAttachments(res.note.attachments || []);
+        setAttachmentDetails(res.note.attachment_details || []);
         setCurrentHash(res.note.bundle_sha256);
         lastSavedValues.current = {
           title: res.note.title || '',
@@ -1614,14 +1708,13 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <label style={{ fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8' }}>
-                Body (Markdown, paste or drop images)
+                Body (Markdown, paste or drop files)
               </label>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="image/*"
                   multiple
                   style={{ display: 'none' }}
                   onChange={async (e) => {
@@ -1651,7 +1744,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                   }}
                 >
                   <Paperclip size={13} />
-                  <span>Attach Image</span>
+                  <span>Attach…</span>
                 </button>
 
                 <button
@@ -1691,7 +1784,11 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                 }}
               >
                 {body.trim() ? (
-                  <SafeMarkdown content={body} attachmentBlobUrls={attachmentBlobUrls} />
+                  <SafeMarkdown
+                    content={body}
+                    attachmentBlobUrls={attachmentBlobUrls}
+                    onAttachmentClick={handleAttachmentClick}
+                  />
                 ) : (
                   <span style={{ color: '#64748b', fontStyle: 'italic' }}>No body text</span>
                 )}
@@ -1702,7 +1799,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                 value={body}
                 onChange={(e) => setBody(e.target.value)}
                 onPaste={handlePaste}
-                placeholder="Markdown text... Paste or drop screenshots directly here."
+                placeholder="Markdown text... Paste or drop files directly here."
                 style={{
                   width: '100%',
                   minHeight: '220px',
@@ -1728,17 +1825,24 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8' }}>
                 Attachments ({attachments.length})
               </span>
-              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
                 {attachments.map((name) => (
-                  <AttachmentThumbnail
+                  <AttachmentItem
                     key={name}
-                    noteId={noteId}
                     name={name}
-                    size={64}
+                    context={{ type: 'note', id: noteId }}
+                    details={attachmentDetails}
+                    thumbnailSize={64}
                     canRemove={true}
                     onRemove={() => handleRemoveAttachment(name)}
                     onBlobLoaded={(attName, url) => {
                       setAttachmentBlobUrls((prev) => ({ ...prev, [attName]: url }));
+                    }}
+                    onOpenTextViewer={(attName, sz) => {
+                      setViewingTextAttachment({ filename: attName, size: sz });
+                    }}
+                    onDownloadPdf={(attName) => {
+                      handleDownloadPdf(attName);
                     }}
                   />
                 ))}
@@ -2515,6 +2619,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
             produced: initialNote?.produced || '-',
             body,
             attachments,
+            attachment_details: attachmentDetails,
             bundle_sha256: currentHash,
           }}
           isOpen={showConvertToTask}
@@ -2523,6 +2628,16 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
             setCreatedTasks((prev) => [...prev, taskId]);
             onSaved();
           }}
+        />
+      )}
+
+      {/* Text Viewer Modal */}
+      {viewingTextAttachment && (
+        <TextViewerModal
+          filename={viewingTextAttachment.filename}
+          size={viewingTextAttachment.size}
+          fetchContent={() => api.getInboxAttachment(noteId, viewingTextAttachment.filename)}
+          onClose={() => setViewingTextAttachment(null)}
         />
       )}
 
@@ -2923,6 +3038,7 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
                           name={attName}
                           size={36}
                           canRemove={false}
+                          details={note.attachment_details}
                         />
                       ))}
                     </div>

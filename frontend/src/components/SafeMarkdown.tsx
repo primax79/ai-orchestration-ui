@@ -5,6 +5,7 @@ interface SafeMarkdownProps {
   className?: string;
   style?: React.CSSProperties;
   attachmentBlobUrls?: Record<string, string>;
+  onAttachmentClick?: (filename: string) => void;
 }
 
 /**
@@ -36,7 +37,11 @@ export function isSafeUrl(url: string): boolean {
  * Parse inline Markdown (images, code, bold, italic, links) into React elements.
  * All raw text is emitted as React text children, completely escaping any HTML.
  */
-function renderInline(text: string, attachmentBlobUrls?: Record<string, string>): React.ReactNode[] {
+function renderInline(
+  text: string,
+  attachmentBlobUrls?: Record<string, string>,
+  onAttachmentClick?: (filename: string) => void
+): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
   // Tokenize regex for images (![alt](url)), `code`, **bold**, *italic*, [label](url)
   const regex = /(!\[[^\]]*\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
@@ -55,6 +60,9 @@ function renderInline(text: string, attachmentBlobUrls?: Record<string, string>)
         let resolvedUrl: string | null = null;
         if (url.startsWith('attachments/')) {
           const filename = url.slice('attachments/'.length);
+          resolvedUrl = attachmentBlobUrls?.[filename] || null;
+        } else if (url.startsWith('./attachments/')) {
+          const filename = url.slice('./attachments/'.length);
           resolvedUrl = attachmentBlobUrls?.[filename] || null;
         } else if (isSafeUrl(url) || url.startsWith('blob:') || url.startsWith('data:image/')) {
           resolvedUrl = url;
@@ -126,11 +134,28 @@ function renderInline(text: string, attachmentBlobUrls?: Record<string, string>)
       const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       if (linkMatch) {
         const [, label, url] = linkMatch;
-        if (isSafeUrl(url)) {
+        const cleanUrl = url.trim();
+        if (cleanUrl.startsWith('attachments/') || cleanUrl.startsWith('./attachments/')) {
+          const filename = cleanUrl.replace(/^(\.\/)?attachments\//, '');
           nodes.push(
             <a
               key={match.index}
-              href={url}
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                onAttachmentClick?.(filename);
+              }}
+              style={{ color: '#818cf8', textDecoration: 'underline', cursor: 'pointer' }}
+              title={`Open attachment ${filename}`}
+            >
+              {label}
+            </a>
+          );
+        } else if (isSafeUrl(cleanUrl)) {
+          nodes.push(
+            <a
+              key={match.index}
+              href={cleanUrl}
               target="_blank"
               rel="noopener noreferrer"
               style={{ color: '#818cf8', textDecoration: 'underline' }}
@@ -158,10 +183,15 @@ function renderInline(text: string, attachmentBlobUrls?: Record<string, string>)
   return nodes;
 }
 
-export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style, attachmentBlobUrls }) => {
+export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({
+  content,
+  style,
+  attachmentBlobUrls,
+  onAttachmentClick,
+}) => {
   if (!content) return null;
 
-  const inline = (text: string) => renderInline(text, attachmentBlobUrls);
+  const inline = (text: string) => renderInline(text, attachmentBlobUrls, onAttachmentClick);
 
   const lines = content.split('\n');
   const elements: React.ReactNode[] = [];

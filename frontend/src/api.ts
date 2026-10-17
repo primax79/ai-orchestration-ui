@@ -251,6 +251,112 @@ export const api = {
     return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
   },
 
+  async uploadTaskAttachment(
+    taskId: string,
+    file: File | Blob,
+    filename?: string,
+    expectTaskHash?: string
+  ): Promise<UploadAttachmentResponse> {
+    const fname = filename || (file instanceof File ? file.name : 'attachment.txt');
+    if (isVsCode && vscode) {
+      const base64 = await blobToBase64(file);
+      return sendVsCodeMessage<UploadAttachmentResponse>('uploadTaskAttachment', {
+        id: taskId,
+        filename: fname,
+        data: base64,
+        expect_task_hash: expectTaskHash,
+      });
+    }
+
+    const formData = new FormData();
+    formData.append('file', file, fname);
+    if (expectTaskHash) {
+      formData.append('expect_task_hash', expectTaskHash);
+    }
+    const token = getApiToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['X-AI-Orch-Token'] = token;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, {
+        method: 'POST',
+        headers,
+        body: formData,
+      });
+    } catch {
+      throw new Error('Server not reachable: is ./start.sh still running?');
+    }
+
+    if (!res.ok) {
+      let err = `${res.status} ${res.statusText}`;
+      let data: any = null;
+      try {
+        data = await res.json();
+        if (data && data.error) {
+          err = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+        }
+      } catch {}
+      throw new ApiError(err, res.status, data);
+    }
+
+    return res.json();
+  },
+
+  async getTaskAttachment(taskId: string, name: string): Promise<Blob> {
+    if (isVsCode && vscode) {
+      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getTaskAttachment', { id: taskId, name });
+      const byteCharacters = atob(res.data);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      return new Blob([byteArray], { type: res.contentType || 'application/octet-stream' });
+    }
+
+    const token = getApiToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['X-AI-Orch-Token'] = token;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(name)}`, {
+        headers,
+      });
+    } catch {
+      throw new Error('Server not reachable: is ./start.sh still running?');
+    }
+
+    if (!res.ok) {
+      let err = `${res.status} ${res.statusText}`;
+      let data: any = null;
+      try {
+        data = await res.json();
+        if (data && data.error) {
+          err = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+        }
+      } catch {}
+      throw new ApiError(err, res.status, data);
+    }
+
+    return res.blob();
+  },
+
+  async deleteTaskAttachment(taskId: string, name: string, expectTaskHash?: string): Promise<DeleteAttachmentResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<DeleteAttachmentResponse>('deleteTaskAttachment', { id: taskId, name, expect_task_hash: expectTaskHash });
+    }
+    const q = expectTaskHash ? `?expect_task_hash=${encodeURIComponent(expectTaskHash)}` : '';
+    return apiFetch<DeleteAttachmentResponse>(`/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(name)}${q}`, {
+      method: 'DELETE',
+    });
+  },
+
   async getQuestions(params?: { status?: string; blocks?: string }): Promise<QuestionListResponse> {
     if (isVsCode && vscode) {
       return sendVsCodeMessage<QuestionListResponse>('getQuestions', params);
@@ -803,7 +909,7 @@ export const api = {
         byteNumbers[i] = byteCharacters.charCodeAt(i);
       }
       const byteArray = new Uint8Array(byteNumbers);
-      return new Blob([byteArray], { type: res.contentType || 'image/png' });
+      return new Blob([byteArray], { type: res.contentType || 'application/octet-stream' });
     }
 
     const token = getApiToken();

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   X,
   CheckCircle,
@@ -16,12 +16,19 @@ import {
   Plus,
   Trash2,
   Send,
+  Paperclip,
 } from 'lucide-react';
 import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord } from '../types';
 import { api } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
 import { TaskRunsPanel } from './TaskRunsPanel';
+import {
+  AttachmentItem,
+  getAttachmentInfo,
+  downloadAttachmentBlob,
+} from './AttachmentComponents';
+import { TextViewerModal } from './TextViewerModal';
 
 interface TaskDetailModalProps {
   task: TaskItem;
@@ -112,6 +119,108 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [askOpenAnswer, setAskOpenAnswer] = useState<boolean>(true);
   const [askSubmitting, setAskSubmitting] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
+
+  // Emergent tasks (T###) support attachments; plan tasks (NN.T, INIT-NN) do not.
+  const isEmergentTask =
+    currentTask.kind === 'emergent' ||
+    (/^T\d{3,}$/.test(currentTask.id) &&
+      !currentTask.id.includes('.') &&
+      !currentTask.id.startsWith('INIT-') &&
+      currentTask.kind !== 'initiative_task');
+
+  const [taskBlobUrls, setTaskBlobUrls] = useState<Record<string, string>>({});
+  const [viewingTextAttachment, setViewingTextAttachment] = useState<{ filename: string; size?: number } | null>(null);
+  const [isUploadingAttachment, setIsUploadingAttachment] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [isDraggingOverAttachments, setIsDraggingOverAttachments] = useState(false);
+  const taskFileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!isEmergentTask || !currentTask.attachments || currentTask.attachments.length === 0) {
+      setTaskBlobUrls({});
+      return;
+    }
+
+    let active = true;
+    const urlsToRevoke: string[] = [];
+
+    const loadImages = async () => {
+      const urls: Record<string, string> = {};
+      for (const name of currentTask.attachments || []) {
+        const info = getAttachmentInfo(name, currentTask.attachment_details);
+        if (info.class === 'image') {
+          try {
+            const blob = await api.getTaskAttachment(currentTask.id, name);
+            if (!active) return;
+            const url = URL.createObjectURL(blob);
+            urlsToRevoke.push(url);
+            urls[name] = url;
+          } catch {
+            // non-blocking
+          }
+        }
+      }
+      if (active) {
+        setTaskBlobUrls(urls);
+      }
+    };
+
+    loadImages();
+
+    return () => {
+      active = false;
+      urlsToRevoke.forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, [currentTask.id, currentTask.bundle_sha256, isEmergentTask, currentTask.attachments]);
+
+  const handleUploadTaskFile = async (file: File) => {
+    if (!isEmergentTask) return;
+    try {
+      setIsUploadingAttachment(true);
+      setAttachmentError(null);
+      await api.uploadTaskAttachment(currentTask.id, file, file.name, currentTask.bundle_sha256);
+      await reloadTaskDetailAndState();
+      onActionComplete();
+    } catch (err: any) {
+      setAttachmentError(err?.message || String(err));
+    } finally {
+      setIsUploadingAttachment(false);
+    }
+  };
+
+  const handleRemoveTaskAttachment = async (name: string) => {
+    if (!isEmergentTask) return;
+    if (!window.confirm(`Delete attachment "${name}"?`)) return;
+
+    try {
+      setIsUploadingAttachment(true);
+      setAttachmentError(null);
+      await api.deleteTaskAttachment(currentTask.id, name, currentTask.bundle_sha256);
+      await reloadTaskDetailAndState();
+      onActionComplete();
+    } catch (err: any) {
+      setAttachmentError(err?.message || String(err));
+    } finally {
+      setIsUploadingAttachment(false);
+    }
+  };
+
+  const handleDownloadTaskPdf = (name: string) => {
+    downloadAttachmentBlob(() => api.getTaskAttachment(currentTask.id, name), name).catch((err) => {
+      setAttachmentError(`Failed to download ${name}: ${err?.message || err}`);
+    });
+  };
+
+  const handleTaskAttachmentClick = (filename: string) => {
+    const info = getAttachmentInfo(filename, currentTask.attachment_details);
+    if (info.class === 'pdf') {
+      handleDownloadTaskPdf(filename);
+    } else if (info.class === 'text') {
+      setViewingTextAttachment({ filename, size: info.size });
+    } else if (info.class === 'image') {
+      handleDownloadTaskPdf(filename);
+    }
+  };
 
   const reloadTaskDetailAndState = useCallback(async () => {
     try {
@@ -582,7 +691,11 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                       color: '#cbd5e1',
                       lineHeight: 1.6,
                     }}>
-                      <SafeMarkdown content={body} />
+                      <SafeMarkdown
+                        content={body}
+                        attachmentBlobUrls={taskBlobUrls}
+                        onAttachmentClick={handleTaskAttachmentClick}
+                      />
                     </div>
                   </>
                 )}
@@ -590,6 +703,177 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             );
           })() : (
             <div style={{ color: '#94a3b8', fontSize: '0.85rem' }}>Loading task specification...</div>
+          )}
+
+          {/* Attachments Section for Emergent Tasks (T###) only */}
+          {isEmergentTask && (
+            <div
+              style={{
+                marginTop: '1.25rem',
+                backgroundColor: '#0f172a',
+                border: isDraggingOverAttachments ? '2px dashed #6366f1' : '1px solid #334155',
+                borderRadius: '0.5rem',
+                padding: '1rem 1.25rem',
+                transition: 'border 0.15s, background-color 0.15s',
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDraggingOverAttachments(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDraggingOverAttachments(false);
+              }}
+              onDrop={async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setIsDraggingOverAttachments(false);
+                const files = e.dataTransfer.files;
+                if (!files || files.length === 0) return;
+                for (let i = 0; i < files.length; i++) {
+                  await handleUploadTaskFile(files[i]);
+                }
+              }}
+            >
+              {/* Header */}
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: currentTask.attachments && currentTask.attachments.length > 0 ? '0.75rem' : '0.5rem',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Paperclip size={18} color="#818cf8" />
+                  <h3 style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
+                    Attachments ({currentTask.attachments?.length || 0})
+                  </h3>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <input
+                    ref={taskFileInputRef}
+                    type="file"
+                    multiple
+                    style={{ display: 'none' }}
+                    onChange={async (e) => {
+                      if (e.target.files) {
+                        for (let i = 0; i < e.target.files.length; i++) {
+                          await handleUploadTaskFile(e.target.files[i]);
+                        }
+                        e.target.value = '';
+                      }
+                    }}
+                  />
+                  <button
+                    onClick={() => taskFileInputRef.current?.click()}
+                    disabled={isUploadingAttachment}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.3rem',
+                      padding: '0.35rem 0.75rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #6366f1',
+                      backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                      color: '#a5b4fc',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      cursor: isUploadingAttachment ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    <Plus size={14} />
+                    <span>Attach…</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Error Banner */}
+              {attachmentError && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                    padding: '0.6rem 0.8rem',
+                    backgroundColor: '#451a1a',
+                    border: '1px solid #7f1d1d',
+                    borderRadius: '0.375rem',
+                    color: '#f87171',
+                    fontSize: '0.8rem',
+                    marginBottom: '0.75rem',
+                  }}
+                >
+                  <AlertCircle size={15} style={{ flexShrink: 0 }} />
+                  <span style={{ flex: 1 }}>{attachmentError}</span>
+                  <button
+                    onClick={() => setAttachmentError(null)}
+                    style={{ background: 'none', border: 'none', color: '#fca5a5', cursor: 'pointer', padding: 0 }}
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+
+              {/* Uploading progress indicator */}
+              {isUploadingAttachment && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.4rem',
+                    color: '#818cf8',
+                    fontSize: '0.8rem',
+                    marginBottom: '0.75rem',
+                  }}
+                >
+                  <Loader2 size={16} className="spin" />
+                  <span>Uploading attachment...</span>
+                </div>
+              )}
+
+              {/* Attachments List or Empty Dropzone */}
+              {currentTask.attachments && currentTask.attachments.length > 0 ? (
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                  {currentTask.attachments.map((name) => (
+                    <AttachmentItem
+                      key={name}
+                      name={name}
+                      context={{ type: 'task', id: currentTask.id }}
+                      details={currentTask.attachment_details}
+                      thumbnailSize={64}
+                      canRemove={true}
+                      onRemove={() => handleRemoveTaskAttachment(name)}
+                      onBlobLoaded={(attName, url) => {
+                        setTaskBlobUrls((prev) => ({ ...prev, [attName]: url }));
+                      }}
+                      onOpenTextViewer={(attName, sz) => {
+                        setViewingTextAttachment({ filename: attName, size: sz });
+                      }}
+                      onDownloadPdf={(attName) => {
+                        handleDownloadTaskPdf(attName);
+                      }}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div
+                  style={{
+                    padding: '1.25rem',
+                    textAlign: 'center',
+                    border: '1px dashed #334155',
+                    borderRadius: '0.375rem',
+                    color: '#64748b',
+                    fontSize: '0.8rem',
+                  }}
+                >
+                  No attachments yet. Drop files here or click Attach… to upload.
+                </div>
+              )}
+            </div>
           )}
 
           {/* Questions Section */}
@@ -1365,6 +1649,16 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             setRunsRefreshTrigger((k) => k + 1);
             onActionComplete();
           }}
+        />
+      )}
+
+      {/* Text Viewer Modal */}
+      {viewingTextAttachment && (
+        <TextViewerModal
+          filename={viewingTextAttachment.filename}
+          size={viewingTextAttachment.size}
+          fetchContent={() => api.getTaskAttachment(currentTask.id, viewingTextAttachment.filename)}
+          onClose={() => setViewingTextAttachment(null)}
         />
       )}
     </div>

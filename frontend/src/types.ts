@@ -15,6 +15,12 @@ export type Priority = 'P0' | 'P1' | 'P2' | 'P3';
 export type CognitiveProfile = 'deep-reasoning' | 'orchestration' | 'bulk-execution' | 'exploration';
 export type VerificationMode = 'self' | 'independent-session' | 'cross-agent' | 'panel' | 'owner';
 
+export interface AttachmentDetail {
+  name: string;
+  class: 'image' | 'text' | 'pdf' | string;
+  size: number;
+}
+
 export interface TaskItem {
   kind: 'emergent' | 'initiative_task' | string;
   id: string;
@@ -38,6 +44,8 @@ export interface TaskItem {
   is_done?: boolean;
   bundle_sha256?: string;
   task_bundle_sha256?: string;
+  attachments?: string[];
+  attachment_details?: AttachmentDetail[];
 }
 
 export interface InitiativeItem {
@@ -520,6 +528,7 @@ export interface InboxNoteItem {
   processed_by?: string;
   body: string;
   attachments: string[];
+  attachment_details?: AttachmentDetail[];
   bundle_sha256?: string;
   legacy?: boolean;
   folder_name?: string;
@@ -577,6 +586,7 @@ export interface UploadAttachmentResponse {
   id: string;
   attachment: string;
   markdown: string;
+  class?: 'image' | 'text' | 'pdf' | string;
   path?: string;
   bundle_sha256?: string;
 }
