@@ -1,6 +1,7 @@
 export type TaskState =
   | 'open'
   | 'in progress'
+  | 'paused'
   | 'waiting'
   | 'blocked'
   | 'delivered'

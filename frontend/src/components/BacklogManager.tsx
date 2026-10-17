@@ -39,7 +39,7 @@ const getStoredView = (): BacklogView => {
 
 const TREE_STATES_KEY = 'ai-orch:tree-visible-states';
 const ALL_STATES: TaskState[] = [
-  'open', 'in progress', 'bounced', 'waiting', 'blocked',
+  'open', 'in progress', 'paused', 'bounced', 'waiting', 'blocked',
   'delivered', 'verified', 'done', 'done with a caveat', 'dropped',
 ];
 const CLOSED_STATES: TaskState[] = ['done', 'done with a caveat', 'dropped'];
@@ -245,7 +245,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
 
   const visibleColumns: KanbanColumnDef[] = [
     // Waiting first: tasks blocked on a decision are the ones that need the owner.
-    { id: 'waiting_blocked', title: 'Waiting / Blocked', states: ['waiting', 'blocked'], color: '#f59e0b' },
+    { id: 'waiting_blocked', title: 'Waiting / Paused / Blocked', states: ['waiting', 'paused', 'blocked'], color: '#f59e0b' },
     { id: 'open', title: 'Open', states: ['open'], color: '#94a3b8' },
     { id: 'in_progress', title: 'In Progress', states: ['in progress', 'bounced'], color: '#6366f1' },
     { id: 'delivered_verified', title: 'Delivered / Verified', color: '#0ea5e9', isSplit: true },

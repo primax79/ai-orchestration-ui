@@ -4,6 +4,7 @@ import {
   CheckCircle,
   RotateCcw,
   Play,
+  Pause,
   CheckCheck,
   Copy,
   Check,
@@ -1211,6 +1212,52 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                   <span>Start Task (In Progress)</span>
                 </button>
               )
+            )}
+
+            {/* Pause button when in progress */}
+            {currentTask.state === 'in progress' && (
+              <button
+                onClick={() => handleTransition('paused')}
+                disabled={loading}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.4rem 0.8rem',
+                  borderRadius: '0.375rem',
+                  border: '1px solid #f59e0b',
+                  backgroundColor: 'transparent',
+                  color: '#f59e0b',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                {loading ? <Loader2 size={15} className="spin" /> : <Pause size={15} />}
+                <span>Pause</span>
+              </button>
+            )}
+
+            {/* Resume button when paused */}
+            {currentTask.state === 'paused' && (
+              <button
+                onClick={() => handleTransition('in progress')}
+                disabled={loading}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.4rem 0.8rem',
+                  borderRadius: '0.375rem',
+                  border: 'none',
+                  backgroundColor: '#6366f1',
+                  color: '#fff',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+                <span>Resume Task (In Progress)</span>
+              </button>
             )}
 
             {/* R6: Generic delivered transition is HIDDEN when task has runs */}
