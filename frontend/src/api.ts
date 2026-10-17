@@ -3,6 +3,11 @@ import {
   WorkspaceInfo,
   EnvStatusResponse,
   OrchestrationConfigResponse,
+  QuestionListResponse,
+  QuestionItem,
+  AskQuestionPayload,
+  AnswerQuestionPayload,
+  WithdrawQuestionPayload,
 } from './types';
 
 // Custom ApiError to carry HTTP status and response payload
@@ -191,6 +196,54 @@ export const api = {
       return sendVsCodeMessage('getTaskDetail', { taskId });
     }
     return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+  },
+
+  async getQuestions(params?: { status?: string; blocks?: string }): Promise<QuestionListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<QuestionListResponse>('getQuestions', params);
+    }
+    const searchParams = new URLSearchParams();
+    if (params?.status) searchParams.set('status', params.status);
+    if (params?.blocks) searchParams.set('blocks', params.blocks);
+    const qs = searchParams.toString();
+    return apiFetch<QuestionListResponse>(qs ? `/api/questions?${qs}` : '/api/questions');
+  },
+
+  async getQuestion(id: string): Promise<{ ok: boolean; question: QuestionItem }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean; question: QuestionItem }>('getQuestion', { id });
+    }
+    return apiFetch<{ ok: boolean; question: QuestionItem }>(`/api/questions/${encodeURIComponent(id)}`);
+  },
+
+  async askQuestion(payload: AskQuestionPayload): Promise<{ ok: boolean; id: string; rel_path?: string }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean; id: string; rel_path?: string }>('askQuestion', payload);
+    }
+    return apiFetch<{ ok: boolean; id: string; rel_path?: string }>('/api/questions', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async answerQuestion(id: string, payload: AnswerQuestionPayload): Promise<{ ok: boolean; choice: string; unblocked_tasks?: string[] }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean; choice: string; unblocked_tasks?: string[] }>('answerQuestion', { id, ...payload });
+    }
+    return apiFetch<{ ok: boolean; choice: string; unblocked_tasks?: string[] }>(`/api/questions/${encodeURIComponent(id)}/answer`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async withdrawQuestion(id: string, payload: WithdrawQuestionPayload): Promise<{ ok: boolean }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean }>('withdrawQuestion', { id, ...payload });
+    }
+    return apiFetch<{ ok: boolean }>(`/api/questions/${encodeURIComponent(id)}/withdraw`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
   },
 
   async getEnvStatus(): Promise<EnvStatusResponse> {

@@ -146,3 +146,66 @@ export interface OrchestrationConfigResponse {
     project?: Record<string, any>;
   };
 }
+
+export interface QuestionOption {
+  label: string;
+  title: string;
+  consequence?: string | null;
+  raw?: string;
+}
+
+export interface QuestionAnswer {
+  choice: string;
+  answered_by?: string;
+  answered?: string;
+  text?: string | null;
+}
+
+export interface QuestionItem {
+  id: string;
+  question: string;
+  status: 'open' | 'answered' | 'withdrawn' | string;
+  blocks: string;
+  blocks_parsed?: [string, string][];
+  decider: string;
+  asked_by: string;
+  asked: string;
+  origin_run?: string;
+  open_answer: 'yes' | 'no' | string;
+  recommended: string;
+  title?: string;
+  context?: string;
+  options?: QuestionOption[];
+  answer?: QuestionAnswer;
+  rel_path?: string;
+  filename?: string;
+}
+
+export interface QuestionListResponse {
+  ok: boolean;
+  questions: QuestionItem[];
+}
+
+export interface AskQuestionPayload {
+  question: string;
+  context?: string;
+  options?: Array<{ label: string; title: string; consequence?: string }>;
+  recommended?: string;
+  open_answer?: boolean | 'yes' | 'no';
+  blocks?: string | string[];
+  decider?: string;
+  asked_by?: string;
+  origin_run?: string;
+  from_task?: string;
+}
+
+export interface AnswerQuestionPayload {
+  choice: string;
+  text?: string;
+  by?: string;
+}
+
+export interface WithdrawQuestionPayload {
+  reason: string;
+  by?: string;
+}

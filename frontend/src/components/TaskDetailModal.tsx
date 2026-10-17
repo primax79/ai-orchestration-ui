@@ -1,6 +1,22 @@
 import React, { useState, useEffect } from 'react';
-import { X, CheckCircle, RotateCcw, Play, CheckCheck, Copy, Check, FileText, AlertTriangle, AlertCircle, Loader2 } from 'lucide-react';
-import { TaskItem } from '../types';
+import {
+  X,
+  CheckCircle,
+  RotateCcw,
+  Play,
+  CheckCheck,
+  Copy,
+  Check,
+  FileText,
+  AlertTriangle,
+  AlertCircle,
+  Loader2,
+  HelpCircle,
+  Plus,
+  Trash2,
+  Send,
+} from 'lucide-react';
+import { TaskItem, QuestionItem, AskQuestionPayload } from '../types';
 import { api } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 
@@ -27,9 +43,139 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [transitionError, setTransitionError] = useState<string | null>(null);
   const [indexOutOfSync, setIndexOutOfSync] = useState(false);
 
+  // Questions section state
+  const [taskQuestions, setTaskQuestions] = useState<QuestionItem[]>([]);
+  const [questionsLoading, setQuestionsLoading] = useState(false);
+
+  // Ask question form state
+  const [showAskForm, setShowAskForm] = useState(false);
+  const [askQuestionText, setAskQuestionText] = useState('');
+  const [askContextText, setAskContextText] = useState('');
+  const [askOptions, setAskOptions] = useState<Array<{ title: string; consequence: string }>>([
+    { title: '', consequence: '' },
+    { title: '', consequence: '' },
+  ]);
+  const [askRecommended, setAskRecommended] = useState<string>('-');
+  const [askOpenAnswer, setAskOpenAnswer] = useState<boolean>(true);
+  const [askSubmitting, setAskSubmitting] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+
   useEffect(() => {
     loadDetail();
+    loadQuestions();
   }, [task.id]);
+
+  const loadQuestions = async () => {
+    setQuestionsLoading(true);
+    try {
+      const res = await api.getQuestions({ blocks: task.id });
+      if (res && res.questions) {
+        setTaskQuestions(res.questions);
+      } else {
+        setTaskQuestions([]);
+      }
+    } catch {
+      // Non-blocking
+    } finally {
+      setQuestionsLoading(false);
+    }
+  };
+
+  const handleAddOption = () => {
+    setAskOptions((prev) => [...prev, { title: '', consequence: '' }]);
+  };
+
+  const handleRemoveOption = (index: number) => {
+    setAskOptions((prev) => {
+      const updated = prev.filter((_, idx) => idx !== index);
+      const maxLetter = String.fromCharCode(65 + Math.max(0, updated.length - 1));
+      if (askRecommended !== '-' && askRecommended > maxLetter) {
+        setAskRecommended('-');
+      }
+      return updated;
+    });
+  };
+
+  const handleOptionChange = (index: number, field: 'title' | 'consequence', value: string) => {
+    setAskOptions((prev) =>
+      prev.map((opt, idx) => (idx === index ? { ...opt, [field]: value } : opt))
+    );
+  };
+
+  const handleAskSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAskError(null);
+
+    const qText = askQuestionText.trim();
+    if (!qText) {
+      setAskError('Question text cannot be empty.');
+      return;
+    }
+    if (qText.length > 160) {
+      setAskError('Question cannot exceed 160 characters.');
+      return;
+    }
+    if (!qText.endsWith('?')) {
+      setAskError('Question must end with a question mark (?).');
+      return;
+    }
+
+    if (!askOpenAnswer && askOptions.length < 2) {
+      setAskError('At least 2 options are required when open-answer is disabled.');
+      return;
+    }
+
+    const builtOptions: Array<{ label: string; title: string; consequence?: string }> = [];
+    for (let i = 0; i < askOptions.length; i++) {
+      const opt = askOptions[i];
+      if (opt.title.trim()) {
+        builtOptions.push({
+          label: String.fromCharCode(65 + i),
+          title: opt.title.trim(),
+          consequence: opt.consequence.trim() || undefined,
+        });
+      } else if (!askOpenAnswer) {
+        setAskError(`Option ${String.fromCharCode(65 + i)} must have a title.`);
+        return;
+      }
+    }
+
+    if (builtOptions.length === 0 && askRecommended !== '-') {
+      setAskError('Recommended option must be "-" when no options are provided.');
+      return;
+    }
+
+    setAskSubmitting(true);
+    try {
+      const payload: AskQuestionPayload = {
+        question: qText,
+        context: askContextText.trim() || undefined,
+        options: builtOptions.length > 0 ? builtOptions : undefined,
+        recommended: askRecommended !== '-' ? askRecommended : undefined,
+        open_answer: askOpenAnswer,
+        blocks: [task.id],
+        decider: 'owner',
+        asked_by: 'owner',
+      };
+      await api.askQuestion(payload);
+      setShowAskForm(false);
+      setAskQuestionText('');
+      setAskContextText('');
+      setAskOptions([
+        { title: '', consequence: '' },
+        { title: '', consequence: '' },
+      ]);
+      setAskRecommended('-');
+      setAskOpenAnswer(true);
+      await loadQuestions();
+      await loadDetail();
+      onActionComplete();
+    } catch (err: any) {
+      setAskError(err?.message || String(err));
+    } finally {
+      setAskSubmitting(false);
+    }
+  };
 
   const loadDetail = async () => {
     try {
@@ -260,6 +406,446 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           ) : (
             <div style={{ color: '#94a3b8', fontSize: '0.85rem' }}>Loading task specification...</div>
           )}
+
+          {/* Questions Section */}
+          <div style={{
+            marginTop: '1.5rem',
+            backgroundColor: '#0f172a',
+            border: '1px solid #334155',
+            borderRadius: '0.5rem',
+            padding: '1rem 1.25rem',
+          }}>
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '0.75rem',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <HelpCircle size={18} color="#818cf8" />
+                <h3 style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
+                  Questions ({taskQuestions.length})
+                </h3>
+              </div>
+
+              {!showAskForm && (
+                <button
+                  onClick={() => setShowAskForm(true)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    padding: '0.35rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #6366f1',
+                    backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                    color: '#a5b4fc',
+                    fontSize: '0.8rem',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <Plus size={14} />
+                  <span>Ask a question…</span>
+                </button>
+              )}
+            </div>
+
+            {/* Questions list */}
+            {questionsLoading ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#94a3b8', fontSize: '0.8rem', padding: '0.5rem 0' }}>
+                <Loader2 size={14} className="spin" />
+                <span>Loading questions...</span>
+              </div>
+            ) : taskQuestions.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: showAskForm ? '1rem' : '0' }}>
+                {taskQuestions.map((q) => {
+                  const isAnswered = q.status === 'answered';
+                  const isWithdrawn = q.status === 'withdrawn';
+                  return (
+                    <div
+                      key={q.id}
+                      style={{
+                        padding: '0.6rem 0.75rem',
+                        borderRadius: '0.375rem',
+                        backgroundColor: '#1e293b',
+                        border: '1px solid #334155',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.3rem',
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#818cf8', fontFamily: 'monospace' }}>
+                            {q.id}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: '0.7rem',
+                              fontWeight: 600,
+                              padding: '0.1rem 0.35rem',
+                              borderRadius: '0.25rem',
+                              backgroundColor: isAnswered ? '#064e3b' : isWithdrawn ? '#451a1a' : '#3b2505',
+                              color: isAnswered ? '#34d399' : isWithdrawn ? '#fca5a5' : '#f59e0b',
+                            }}
+                          >
+                            {q.status}
+                          </span>
+                        </div>
+                        <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                          {q.asked}
+                        </span>
+                      </div>
+
+                      <div style={{ fontSize: '0.85rem', color: '#f8fafc', fontWeight: 500 }}>
+                        {q.question}
+                      </div>
+
+                      {isAnswered && q.answer && (
+                        <div style={{ fontSize: '0.75rem', color: '#34d399', display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+                          <Check size={12} />
+                          <span>Choice: <strong>{q.answer.choice}</strong></span>
+                          {q.answer.text && q.answer.text !== '-' && (
+                            <span style={{ color: '#94a3b8' }}>— {q.answer.text.slice(0, 60)}...</span>
+                          )}
+                        </div>
+                      )}
+
+                      {isWithdrawn && q.answer && (
+                        <div style={{ fontSize: '0.75rem', color: '#fca5a5' }}>
+                          Withdrawn: {q.answer.text || 'No reason specified'}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : !showAskForm ? (
+              <div style={{ fontSize: '0.8rem', color: '#64748b', fontStyle: 'italic', padding: '0.25rem 0' }}>
+                No blocking questions on this task.
+              </div>
+            ) : null}
+
+            {/* Ask a question form */}
+            {showAskForm && (
+              <form
+                onSubmit={handleAskSubmit}
+                style={{
+                  marginTop: '0.75rem',
+                  padding: '1rem',
+                  backgroundColor: '#1e293b',
+                  border: '1px solid #4f46e5',
+                  borderRadius: '0.5rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.85rem',
+                }}
+              >
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#a5b4fc' }}>
+                  Ask a Question for {task.id}
+                </div>
+
+                {/* Question Input with Live Validation */}
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+                    <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>
+                      Question (max 160 chars, must end with '?'):
+                    </label>
+                    <span
+                      style={{
+                        fontSize: '0.75rem',
+                        fontWeight: 600,
+                        fontFamily: 'monospace',
+                        color:
+                          askQuestionText.length > 160
+                            ? '#ef4444'
+                            : askQuestionText.length > 0 && !askQuestionText.trim().endsWith('?')
+                            ? '#f59e0b'
+                            : '#94a3b8',
+                      }}
+                    >
+                      {askQuestionText.length}/160
+                    </span>
+                  </div>
+
+                  <input
+                    type="text"
+                    value={askQuestionText}
+                    onChange={(e) => setAskQuestionText(e.target.value)}
+                    placeholder="e.g. Which permission policy should headless Claude runs use by default?"
+                    style={{
+                      width: '100%',
+                      padding: '0.5rem 0.75rem',
+                      backgroundColor: '#0f172a',
+                      border: `1px solid ${
+                        askQuestionText.length > 160
+                          ? '#ef4444'
+                          : askQuestionText.length > 0 && !askQuestionText.trim().endsWith('?')
+                          ? '#f59e0b'
+                          : '#334155'
+                      }`,
+                      borderRadius: '0.375rem',
+                      color: '#f8fafc',
+                      fontSize: '0.85rem',
+                      outline: 'none',
+                    }}
+                  />
+
+                  {/* Live validation hints */}
+                  <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.25rem', fontSize: '0.75rem' }}>
+                    {askQuestionText.length > 160 && (
+                      <span style={{ color: '#ef4444' }}>Exceeds 160 characters limit</span>
+                    )}
+                    {askQuestionText.length > 0 && !askQuestionText.trim().endsWith('?') && (
+                      <span style={{ color: '#f59e0b' }}>Must end with a question mark (?)</span>
+                    )}
+                    {askQuestionText.length > 0 &&
+                      askQuestionText.length <= 160 &&
+                      askQuestionText.trim().endsWith('?') && (
+                        <span style={{ color: '#10b981' }}>✓ Valid question format</span>
+                      )}
+                  </div>
+                </div>
+
+                {/* Context Textarea */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '0.3rem' }}>
+                    Context & Background (Markdown supported):
+                  </label>
+                  <textarea
+                    value={askContextText}
+                    onChange={(e) => setAskContextText(e.target.value)}
+                    placeholder="Explain the background, trade-offs, and consequences for each choice..."
+                    rows={3}
+                    style={{
+                      width: '100%',
+                      padding: '0.5rem 0.75rem',
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #334155',
+                      borderRadius: '0.375rem',
+                      color: '#f8fafc',
+                      fontSize: '0.85rem',
+                      lineHeight: 1.4,
+                      resize: 'vertical',
+                    }}
+                  />
+                </div>
+
+                {/* Dynamic Options */}
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                    <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>
+                      Options ({askOptions.length}):
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleAddOption}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.2rem',
+                        padding: '0.2rem 0.5rem',
+                        borderRadius: '0.25rem',
+                        border: '1px solid #4f46e5',
+                        backgroundColor: 'transparent',
+                        color: '#a5b4fc',
+                        fontSize: '0.75rem',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <Plus size={12} />
+                      <span>Add Option</span>
+                    </button>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {askOptions.map((opt, idx) => {
+                      const letter = String.fromCharCode(65 + idx);
+                      return (
+                        <div
+                          key={idx}
+                          style={{
+                            display: 'flex',
+                            gap: '0.5rem',
+                            alignItems: 'center',
+                            backgroundColor: '#0f172a',
+                            padding: '0.4rem 0.6rem',
+                            borderRadius: '0.375rem',
+                            border: '1px solid #334155',
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, color: '#818cf8', width: '20px', textAlign: 'center', fontFamily: 'monospace' }}>
+                            {letter}
+                          </span>
+                          <input
+                            type="text"
+                            value={opt.title}
+                            onChange={(e) => handleOptionChange(idx, 'title', e.target.value)}
+                            placeholder="Title (e.g. acceptEdits)"
+                            style={{
+                              flex: 1,
+                              padding: '0.35rem 0.5rem',
+                              backgroundColor: '#1e293b',
+                              border: '1px solid #334155',
+                              borderRadius: '0.25rem',
+                              color: '#f8fafc',
+                              fontSize: '0.8rem',
+                            }}
+                          />
+                          <input
+                            type="text"
+                            value={opt.consequence}
+                            onChange={(e) => handleOptionChange(idx, 'consequence', e.target.value)}
+                            placeholder="Consequence / Trade-off (optional)"
+                            style={{
+                              flex: 1.5,
+                              padding: '0.35rem 0.5rem',
+                              backgroundColor: '#1e293b',
+                              border: '1px solid #334155',
+                              borderRadius: '0.25rem',
+                              color: '#cbd5e1',
+                              fontSize: '0.8rem',
+                            }}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveOption(idx)}
+                            title="Remove Option"
+                            style={{
+                              background: 'none',
+                              border: 'none',
+                              color: '#94a3b8',
+                              cursor: 'pointer',
+                              padding: '0.2rem',
+                            }}
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Recommended select & Open Answer toggle */}
+                <div style={{ display: 'flex', gap: '1.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1' }}>
+                      Recommended:
+                    </label>
+                    <select
+                      value={askRecommended}
+                      onChange={(e) => setAskRecommended(e.target.value)}
+                      style={{
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #334155',
+                        borderRadius: '0.25rem',
+                        color: '#cbd5e1',
+                        padding: '0.3rem 0.6rem',
+                        fontSize: '0.8rem',
+                      }}
+                    >
+                      <option value="-">- (None)</option>
+                      {askOptions.map((_, idx) => {
+                        const letter = String.fromCharCode(65 + idx);
+                        return (
+                          <option key={letter} value={letter}>
+                            Option {letter}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', color: '#cbd5e1' }}>
+                    <input
+                      type="checkbox"
+                      checked={askOpenAnswer}
+                      onChange={(e) => setAskOpenAnswer(e.target.checked)}
+                      style={{ cursor: 'pointer' }}
+                    />
+                    <span>Allow free-text answer (open-answer: yes)</span>
+                  </label>
+                </div>
+
+                {/* Form Error Banner */}
+                {askError && (
+                  <div
+                    style={{
+                      padding: '0.5rem 0.75rem',
+                      borderRadius: '0.375rem',
+                      backgroundColor: '#451a1a',
+                      border: '1px solid #ef4444',
+                      color: '#fca5a5',
+                      fontSize: '0.8rem',
+                    }}
+                  >
+                    {askError}
+                  </div>
+                )}
+
+                {/* Form Buttons */}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowAskForm(false);
+                      setAskError(null);
+                    }}
+                    disabled={askSubmitting}
+                    style={{
+                      padding: '0.4rem 0.8rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #475569',
+                      backgroundColor: 'transparent',
+                      color: '#cbd5e1',
+                      fontSize: '0.8rem',
+                      cursor: askSubmitting ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    Cancel
+                  </button>
+
+                  <button
+                    type="submit"
+                    disabled={
+                      askSubmitting ||
+                      !askQuestionText.trim() ||
+                      askQuestionText.length > 160 ||
+                      !askQuestionText.trim().endsWith('?')
+                    }
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      padding: '0.4rem 0.9rem',
+                      borderRadius: '0.375rem',
+                      border: 'none',
+                      backgroundColor: '#4f46e5',
+                      color: '#fff',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      cursor:
+                        askSubmitting ||
+                        !askQuestionText.trim() ||
+                        askQuestionText.length > 160 ||
+                        !askQuestionText.trim().endsWith('?')
+                          ? 'not-allowed'
+                          : 'pointer',
+                    }}
+                  >
+                    {askSubmitting ? (
+                      <Loader2 size={14} className="spin" />
+                    ) : (
+                      <Send size={14} />
+                    )}
+                    <span>Submit Question</span>
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
 
           {/* Bounce input box if active */}
           {showBounceInput && (

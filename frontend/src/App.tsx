@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { BacklogManager } from './components/BacklogManager';
+import { DecisionsTab } from './components/DecisionsTab';
 import { SkillInstaller } from './components/SkillInstaller';
 import { EnvironmentDoctor } from './components/EnvironmentDoctor';
 import { OrchestrationConfigurator } from './components/OrchestrationConfigurator';
@@ -80,13 +81,16 @@ const PanelLoading: React.FC<{ label: string }> = ({ label }) => (
 );
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'backlog' | 'installer' | 'doctor' | 'config'>('backlog');
+  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'installer' | 'doctor' | 'config'>('backlog');
 
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
 
   const [tasksData, setTasksData] = useState<TaskListResponse | null>(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [tasksError, setTasksError] = useState<string | null>(null);
+
+  const [openQuestionsCount, setOpenQuestionsCount] = useState<number>(0);
+  const [questionsRefreshKey, setQuestionsRefreshKey] = useState<number>(0);
 
   const [envStatus, setEnvStatus] = useState<EnvStatusResponse | null>(null);
   const [envLoading, setEnvLoading] = useState(false);
@@ -126,6 +130,17 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  const loadQuestionsCount = useCallback(async () => {
+    try {
+      const res = await api.getQuestions({ status: 'open' });
+      if (res && res.questions) {
+        setOpenQuestionsCount(res.questions.length);
+      }
+    } catch (e: any) {
+      console.error('Failed to load open questions count:', e);
+    }
+  }, []);
+
   const loadEnv = useCallback(async () => {
     setEnvLoading(true);
     setEnvError(null);
@@ -155,9 +170,11 @@ export const App: React.FC = () => {
   const loadAll = useCallback(() => {
     loadWorkspace();
     loadTasks();
+    loadQuestionsCount();
+    setQuestionsRefreshKey((k) => k + 1);
     loadEnv();
     loadConfig();
-  }, [loadWorkspace, loadTasks, loadEnv, loadConfig]);
+  }, [loadWorkspace, loadTasks, loadQuestionsCount, loadEnv, loadConfig]);
 
   // Debounced area reloading (300 ms)
   const pendingAreas = useRef<Set<string>>(new Set());
@@ -180,6 +197,13 @@ export const App: React.FC = () => {
           loadTasks();
         }
       }
+      if (toReload.has('questions')) {
+        const lastAction = ownActionTimestamps.current['questions'] || 0;
+        if (now - lastAction > 800) {
+          loadQuestionsCount();
+          setQuestionsRefreshKey((k) => k + 1);
+        }
+      }
       if (toReload.has('config')) {
         const lastAction = ownActionTimestamps.current['config'] || 0;
         if (now - lastAction > 800) {
@@ -193,7 +217,7 @@ export const App: React.FC = () => {
         }
       }
     }, 300);
-  }, [loadTasks, loadConfig, loadEnv]);
+  }, [loadTasks, loadQuestionsCount, loadConfig, loadEnv]);
 
   useEffect(() => {
     loadAll();
@@ -212,6 +236,12 @@ export const App: React.FC = () => {
           }
         } else if (msg.type === 'task_transitioned' || msg.type === 'index_synced' || msg.type === 'tasks_changed') {
           triggerDebouncedReload(['tasks']);
+        } else if (
+          msg.type === 'question_asked' ||
+          msg.type === 'question_answered' ||
+          msg.type === 'question_withdrawn'
+        ) {
+          triggerDebouncedReload(['questions', 'tasks']);
         } else if (
           msg.type === 'skills_installed' ||
           msg.type === 'skill_removed' ||
@@ -243,6 +273,7 @@ export const App: React.FC = () => {
         workspace={workspace}
         onRefresh={loadAll}
         isWsConnected={isWsConnected}
+        openQuestionsCount={openQuestionsCount}
       />
 
       <main style={{ flex: 1 }}>
@@ -262,10 +293,27 @@ export const App: React.FC = () => {
                 data={tasksData}
                 onRefresh={() => {
                   recordOwnAction('tasks');
+                  recordOwnAction('questions');
                   loadTasks();
+                  loadQuestionsCount();
                 }}
               />
             )}
+          </div>
+        )}
+
+        {activeTab === 'decisions' && (
+          <div>
+            <DecisionsTab
+              key={questionsRefreshKey}
+              tasks={tasksData?.all_tasks || tasksData?.emergent_tasks || []}
+              onRefresh={() => {
+                recordOwnAction('questions');
+                recordOwnAction('tasks');
+                loadQuestionsCount();
+                loadTasks();
+              }}
+            />
           </div>
         )}
 
