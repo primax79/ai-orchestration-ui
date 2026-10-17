@@ -38,8 +38,8 @@ export const Navbar: React.FC<NavbarProps> = ({
     };
   }, []);
 
-  const isShort = width < 1100;
-  const isIconOnly = width < 760;
+  const isShort = width < 1600; // full labels need ~1580 px with the logo and workspace chip
+  const isIconOnly = width < 1200; // short labels need ~1200 px
 
   const tabs = [
     {
@@ -110,7 +110,11 @@ export const Navbar: React.FC<NavbarProps> = ({
     >
       <style>{`
         .nav-tabs-scroll::-webkit-scrollbar {
-          display: none;
+          height: 3px;
+        }
+        .nav-tabs-scroll::-webkit-scrollbar-thumb {
+          background: #475569;
+          border-radius: 2px;
         }
       `}</style>
       <div
@@ -152,8 +156,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             overflowY: 'hidden',
             minWidth: 0,
             flexShrink: 1,
-            scrollbarWidth: 'none',
-            msOverflowStyle: 'none',
+            scrollbarWidth: 'thin',
           }}
         >
           {tabs.map((tab) => {
