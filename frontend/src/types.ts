@@ -674,4 +674,110 @@ export interface ValidationCampaignResult {
   results: any[];
 }
 
+// ============================================================================
+// Task 10.2: Timeline & Task Graph Types
+// ============================================================================
+
+export type TaskSize = 'XS' | 'S' | 'M' | 'L' | 'XL';
+
+export interface TaskGraphNode {
+  id: string;
+  node_type?: string;
+  kind?: string;
+  title: string;
+  group: string;
+  state: TaskState;
+  canonical_state?: string;
+  priority: 'P0' | 'P1' | 'P2' | 'P3';
+  priority_source?: string;
+  size?: TaskSize;
+  size_source?: string;
+  depends_on: string[];
+  expanded_depends_on?: string[];
+  column: number | null;
+  blocked_by: string[];
+  next_up?: string;
+  executor?: string;
+}
+
+export interface TaskGraphEdge {
+  from: string;
+  to: string;
+  source?: string;
+  target?: string;
+}
+
+export interface TaskGraphGroupTotals {
+  id: string;
+  by_size?: Record<string, number>;
+  by_state?: Record<string, number>;
+  total_open: number;
+  total_leaves: number;
+}
+
+export interface TaskGraphTotals {
+  overall?: string;
+  by_state?: Record<string, number>;
+  by_size?: Record<string, number>;
+  by_group?: Record<string, TaskGraphGroupTotals>;
+  total_open?: number;
+  total_leaves?: number;
+  done?: number;
+  delivered?: number;
+  open?: number;
+  verified?: number;
+  'in progress'?: number;
+  [key: string]: any;
+}
+
+export interface TaskGraphResponse {
+  ok: boolean;
+  tasks_dir?: string;
+  nodes: TaskGraphNode[];
+  nodes_by_id?: Record<string, TaskGraphNode>;
+  edges: TaskGraphEdge[];
+  columns: Record<string, number>;
+  ready_queue: string[];
+  longest_chain: string[];
+  heaviest_chain: string[];
+  heaviest_chain_weight: number;
+  totals: TaskGraphTotals;
+}
+
+export interface TaskMutationPreviewResult {
+  ok: boolean;
+  task_id: string;
+  diff?: string;
+  hash?: string;
+  task_hash?: string;
+  base_task_hash?: string;
+  dry_run?: boolean;
+  priority?: string;
+  size?: string;
+  depends_on?: string[];
+  error?: string;
+}
+
+export interface SetPriorityPayload {
+  priority: 'P0' | 'P1' | 'P2' | 'P3';
+  reason?: string;
+  expect_task_hash?: string;
+  expect_hash?: string;
+}
+
+export interface SetSizePayload {
+  size: TaskSize;
+  expect_task_hash?: string;
+  expect_hash?: string;
+}
+
+export interface SetDepsPayload {
+  add?: string[];
+  remove?: string[];
+  to?: string[];
+  deps?: string[];
+  expect_task_hash?: string;
+  expect_hash?: string;
+}
+
 

@@ -252,7 +252,7 @@ async def _cleanup_process_group(proc: asyncio.subprocess.Process) -> None:
 # read-only calls already in flight share one process, and at most MAX_CLI_PROCESSES run.
 MAX_CLI_PROCESSES = 4
 _READ_ONLY_PREFIXES = {
-    ("tasks", "list"), ("tasks", "validate"), ("questions", "list"), ("questions", "show"),
+    ("tasks", "list"), ("tasks", "validate"), ("tasks", "graph"), ("questions", "list"), ("questions", "show"),
     ("inbox", "list"), ("inbox", "show"), ("config", "show"), ("env", "status"),
     ("run", "list"), ("run", "show"), ("run", "logs"), ("run", "options"),
     ("use-cases", "list"), ("use-cases", "show"),
@@ -457,6 +457,7 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "cannot clean up run" in err_str
         or "proposal" in err_str
         or "not-triage-run" in err_str
+        or "cycle" in err_str
         or "run-not-terminal" in err_str
         or "plan tasks do not support attachments" in err_str
         or "plan-task-attachments-unsupported" in err_str
@@ -738,6 +739,247 @@ async def api_validate_tasks(request: Request) -> JSONResponse:
     code, data = await run_ai_orch(["tasks", "validate", "--tasks-dir", str(tasks_dir), "--json"])
     status_code = 504 if code == 504 else (200 if code == 0 else 400)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+TASK_MUTATION_ID_RE = re.compile(r"^(T\d{3,}|\d{2,}\.\d+)$")
+VALID_PRIORITIES = {"P0", "P1", "P2", "P3"}
+VALID_SIZES = {"XS", "S", "M", "L", "XL"}
+
+
+def _extract_dep_ids(val: Any) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, list):
+        items = []
+        for x in val:
+            if isinstance(x, str):
+                items.extend([p.strip() for p in re.split(r"[\s,]+", x.strip()) if p.strip()])
+            elif x is not None:
+                items.append(str(x).strip())
+        return items
+    if isinstance(val, str):
+        return [p.strip() for p in re.split(r"[\s,]+", val.strip()) if p.strip()]
+    return []
+
+
+async def _resolve_current_task_hash(tasks_dir: pathlib.Path, task_id: str) -> str | None:
+    probe_code, probe_data = await run_ai_orch([
+        "tasks", "set-priority", task_id, "P2",
+        "--tasks-dir", str(tasks_dir),
+        "--dry-run",
+        "--expect-task-hash", "__probe_hash__",
+        "--json",
+    ])
+    err_text = ""
+    if isinstance(probe_data, dict):
+        err_text = str(probe_data.get("error") or "")
+    elif isinstance(probe_data, str):
+        err_text = probe_data
+    m = re.search(r"actual\s+([0-9a-fA-F]{64})", err_text)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def api_get_tasks_graph(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    if not tasks_dir.is_dir():
+        return JSONResponse({"ok": True, "nodes": [], "nodes_by_id": {}, "edges": [], "columns": {}, "ready_queue": [], "heaviest_chain": [], "totals": {}}, status_code=200)
+    code, data = await run_ai_orch(["tasks", "graph", "--tasks-dir", str(tasks_dir), "--json"])
+    if code == 504:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=504)
+    if code == 0 and isinstance(data, dict):
+        return JSONResponse(data, status_code=200)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def _handle_set_priority(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not TASK_MUTATION_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    priority = str(body.get("priority") or "").strip().upper()
+    if not priority:
+        return JSONResponse({"error": "priority is required"}, status_code=400)
+    if priority not in VALID_PRIORITIES:
+        return JSONResponse({"error": f"Invalid priority {priority!r}, expected one of {', '.join(sorted(VALID_PRIORITIES))}"}, status_code=400)
+
+    expect_task_hash = (
+        body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_task_hash:
+        return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "set-priority", task_id, priority, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    if body.get("reason"):
+        cmd.extend(["--reason", str(body["reason"])])
+    if expect_task_hash:
+        cmd.extend(["--expect-task-hash", str(expect_task_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                current_hash = expect_task_hash or await _resolve_current_task_hash(tasks_dir, task_id)
+                if current_hash:
+                    data["hash"] = current_hash
+                    data["task_hash"] = current_hash
+                    data["base_task_hash"] = current_hash
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_set_priority(request: Request) -> JSONResponse:
+    return await _handle_set_priority(request, is_preview=True)
+
+
+async def api_set_priority(request: Request) -> JSONResponse:
+    return await _handle_set_priority(request, is_preview=False)
+
+
+async def _handle_set_size(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not TASK_MUTATION_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    size = str(body.get("size") or "").strip().upper()
+    if not size:
+        return JSONResponse({"error": "size is required"}, status_code=400)
+    if size not in VALID_SIZES:
+        return JSONResponse({"error": f"Invalid size {size!r}, expected one of {', '.join(sorted(VALID_SIZES))}"}, status_code=400)
+
+    expect_task_hash = (
+        body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_task_hash:
+        return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "set-size", task_id, size, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    if expect_task_hash:
+        cmd.extend(["--expect-task-hash", str(expect_task_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                current_hash = expect_task_hash or await _resolve_current_task_hash(tasks_dir, task_id)
+                if current_hash:
+                    data["hash"] = current_hash
+                    data["task_hash"] = current_hash
+                    data["base_task_hash"] = current_hash
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_set_size(request: Request) -> JSONResponse:
+    return await _handle_set_size(request, is_preview=True)
+
+
+async def api_set_size(request: Request) -> JSONResponse:
+    return await _handle_set_size(request, is_preview=False)
+
+
+async def _handle_set_deps(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not TASK_MUTATION_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    add_ids = _extract_dep_ids(body.get("add"))
+    remove_ids = _extract_dep_ids(body.get("remove"))
+    to_specified = body.get("to") is not None or body.get("deps") is not None
+    to_ids = _extract_dep_ids(body.get("to") if body.get("to") is not None else body.get("deps"))
+
+    if not add_ids and not remove_ids and not to_specified:
+        return JSONResponse({"error": "at least one of add, remove, or to/deps is required"}, status_code=400)
+
+    for did in add_ids + remove_ids + to_ids:
+        if not TASK_MUTATION_ID_RE.match(did):
+            return JSONResponse({"error": f"Invalid dependency id {did!r}"}, status_code=400)
+
+    expect_task_hash = (
+        body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_task_hash:
+        return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "set-deps", task_id, "--tasks-dir", str(tasks_dir), "--json"]
+    if add_ids:
+        cmd.extend(["--add", *add_ids])
+    if remove_ids:
+        cmd.extend(["--remove", *remove_ids])
+    if to_specified:
+        cmd.extend(["--to", *to_ids])
+    if is_preview:
+        cmd.append("--dry-run")
+    if expect_task_hash:
+        cmd.extend(["--expect-task-hash", str(expect_task_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                current_hash = expect_task_hash or await _resolve_current_task_hash(tasks_dir, task_id)
+                if current_hash:
+                    data["hash"] = current_hash
+                    data["task_hash"] = current_hash
+                    data["base_task_hash"] = current_hash
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_set_deps(request: Request) -> JSONResponse:
+    return await _handle_set_deps(request, is_preview=True)
+
+
+async def api_set_deps(request: Request) -> JSONResponse:
+    return await _handle_set_deps(request, is_preview=False)
 
 
 async def api_transition_task(request: Request) -> JSONResponse:
@@ -2674,6 +2916,13 @@ routes = [
     Route("/api/workspace", api_get_workspace, methods=["GET"]),
     Route("/api/tasks", api_list_tasks, methods=["GET"]),
     Route("/api/tasks/validate", api_validate_tasks, methods=["GET"]),
+    Route("/api/tasks/graph", api_get_tasks_graph, methods=["GET"]),
+    Route("/api/tasks/{id}/priority/preview", api_preview_set_priority, methods=["POST"]),
+    Route("/api/tasks/{id}/priority", api_set_priority, methods=["POST"]),
+    Route("/api/tasks/{id}/size/preview", api_preview_set_size, methods=["POST"]),
+    Route("/api/tasks/{id}/size", api_set_size, methods=["POST"]),
+    Route("/api/tasks/{id}/deps/preview", api_preview_set_deps, methods=["POST"]),
+    Route("/api/tasks/{id}/deps", api_set_deps, methods=["POST"]),
     Route("/api/tasks/transition", api_transition_task, methods=["POST"]),
     Route("/api/tasks/sync-index/preview", api_preview_sync_index, methods=["GET"]),
     Route("/api/tasks/sync-index", api_sync_index, methods=["POST"]),

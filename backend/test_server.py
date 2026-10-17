@@ -2545,3 +2545,145 @@ def test_attachment_writes_broadcast_websocket(monkeypatch, tmp_path):
             assert changed_del.get("areas") == ["inbox"]
     finally:
         state.workspace = old_ws
+
+
+def test_timeline_graph_and_edit_endpoints(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "graph_ws"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+    (tasks_dir / "01-test").mkdir()
+    (tasks_dir / "01-test" / "plan.md").write_text(
+        "# 01 - Test Initiative\n\n"
+        "## Tasks\n\n"
+        "### 01.1 - Root Task\n"
+        "- **Status:** `open`\n"
+        "- **Priority:** P2\n"
+        "- **Size:** M\n"
+        "- **Depends on:** -\n\n"
+        "### 01.2 - Child Task\n"
+        "- **Status:** `open`\n"
+        "- **Priority:** P2\n"
+        "- **Size:** S\n"
+        "- **Depends on:** 01.1\n\n"
+        "### 01.3 - Independent Task\n"
+        "- **Status:** `open`\n"
+        "- **Priority:** P1\n"
+        "- **Size:** L\n"
+        "- **Depends on:** -\n",
+        encoding="utf-8",
+    )
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # 1. GET /api/tasks/graph - unauth
+        res_unauth = client.get("/api/tasks/graph")
+        assert res_unauth.status_code == 401
+
+        # 2. GET /api/tasks/graph - auth
+        res_graph = client.get("/api/tasks/graph", headers=headers)
+        assert res_graph.status_code == 200
+        gdata = res_graph.json()
+        assert gdata.get("ok") is True
+        assert len(gdata.get("nodes", [])) == 3
+        assert gdata["columns"]["01.1"] == 0
+        assert gdata["columns"]["01.2"] == 1
+        assert "01.1" in gdata["ready_queue"]
+        assert "01.3" in gdata["ready_queue"]
+        assert "01.2" not in gdata["ready_queue"]
+
+        # 3. ID Validation
+        res_bad_id = client.post("/api/tasks/invalid_id/priority/preview", headers=headers, json={"priority": "P0"})
+        assert res_bad_id.status_code == 400
+        assert "Invalid task id" in res_bad_id.json().get("error", "")
+
+        # 4. Priority validation & mutations
+        res_bad_prio = client.post("/api/tasks/01.1/priority/preview", headers=headers, json={"priority": "P9"})
+        assert res_bad_prio.status_code == 400
+        assert "Invalid priority" in res_bad_prio.json().get("error", "")
+
+        res_prio_prev = client.post("/api/tasks/01.1/priority/preview", headers=headers, json={"priority": "P0"})
+        assert res_prio_prev.status_code == 200
+        prev_pdata = res_prio_prev.json()
+        assert prev_pdata.get("dry_run") is True
+        assert "diff" in prev_pdata
+        task_hash = prev_pdata.get("task_hash")
+        assert task_hash is not None
+
+        # Apply priority without hash -> 400
+        res_apply_nohash = client.post("/api/tasks/01.1/priority", headers=headers, json={"priority": "P0"})
+        assert res_apply_nohash.status_code == 400
+        assert "expect_task_hash is required" in res_apply_nohash.json().get("error", "")
+
+        # Apply priority with stale hash -> 409
+        res_apply_stale = client.post("/api/tasks/01.1/priority", headers=headers, json={"priority": "P0", "expect_task_hash": "deadbeef" * 8})
+        assert res_apply_stale.status_code == 409
+
+        # Apply priority with correct hash -> 200 and broadcast
+        with client.websocket_connect(f"/ws?token={token}") as sock:
+            init_msg = sock.receive_json()
+            assert init_msg.get("type") == "connected"
+
+            res_apply_ok = client.post("/api/tasks/01.1/priority", headers=headers, json={"priority": "P0", "expect_task_hash": task_hash})
+            assert res_apply_ok.status_code == 200
+
+            ws_msg = sock.receive_json()
+            assert ws_msg.get("type") == "changed"
+            assert ws_msg.get("areas") == ["tasks"]
+
+        # 5. Size validation & mutations
+        res_bad_size = client.post("/api/tasks/01.1/size/preview", headers=headers, json={"size": "HUGE"})
+        assert res_bad_size.status_code == 400
+        assert "Invalid size" in res_bad_size.json().get("error", "")
+
+        res_size_prev = client.post("/api/tasks/01.1/size/preview", headers=headers, json={"size": "L"})
+        assert res_size_prev.status_code == 200
+        prev_sdata = res_size_prev.json()
+        assert prev_sdata.get("dry_run") is True
+        size_hash = prev_sdata.get("task_hash")
+
+        res_size_stale = client.post("/api/tasks/01.1/size", headers=headers, json={"size": "L", "expect_task_hash": "wronghash"})
+        assert res_size_stale.status_code == 409
+
+        res_size_ok = client.post("/api/tasks/01.1/size", headers=headers, json={"size": "L", "expect_task_hash": size_hash})
+        assert res_size_ok.status_code == 200
+
+        # 6. Deps validation & mutations
+        res_empty_deps = client.post("/api/tasks/01.1/deps/preview", headers=headers, json={})
+        assert res_empty_deps.status_code == 400
+
+        res_bad_dep_id = client.post("/api/tasks/01.1/deps/preview", headers=headers, json={"add": ["bad id"]})
+        assert res_bad_dep_id.status_code == 400
+
+        # Cycle refusal: 01.1 adding 01.2 creates cycle (01.2 already depends on 01.1)
+        res_cycle = client.post("/api/tasks/01.1/deps/preview", headers=headers, json={"add": ["01.2"]})
+        assert res_cycle.status_code == 400
+        assert "Cycle detected" in res_cycle.json().get("error", "")
+
+        # Valid dep addition: 01.3 depends on 01.2
+        res_dep_prev = client.post("/api/tasks/01.3/deps/preview", headers=headers, json={"add": ["01.2"]})
+        assert res_dep_prev.status_code == 200
+        dep_data = res_dep_prev.json()
+        assert dep_data.get("dry_run") is True
+        dep_hash = dep_data.get("task_hash")
+
+        res_dep_stale = client.post("/api/tasks/01.3/deps", headers=headers, json={"add": ["01.2"], "expect_task_hash": "stalehash"})
+        assert res_dep_stale.status_code == 409
+
+        res_dep_ok = client.post("/api/tasks/01.3/deps", headers=headers, json={"add": ["01.2"], "expect_task_hash": dep_hash})
+        assert res_dep_ok.status_code == 200
+
+        # Remove dependency: 01.3 remove 01.2
+        res_dep_rem_prev = client.post("/api/tasks/01.3/deps/preview", headers=headers, json={"remove": ["01.2"]})
+        assert res_dep_rem_prev.status_code == 200
+        rem_hash = res_dep_rem_prev.json().get("task_hash")
+        res_dep_rem_ok = client.post("/api/tasks/01.3/deps", headers=headers, json={"remove": ["01.2"], "expect_task_hash": rem_hash})
+        assert res_dep_rem_ok.status_code == 200
+    finally:
+        state.workspace = old_ws
+

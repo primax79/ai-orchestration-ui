@@ -18,6 +18,7 @@ import {
 import { TaskItem, TaskListResponse, TaskState } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
+import { TimelineView } from './TimelineView';
 import { api } from '../api';
 
 export type BacklogView = 'queue' | 'kanban' | 'tree' | 'timeline';
@@ -990,26 +991,10 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
       )}
 
       {viewMode === 'timeline' && (
-        <div style={{
-          backgroundColor: '#1e293b',
-          border: '1px dashed #334155',
-          borderRadius: '0.5rem',
-          padding: '3.5rem 1.5rem',
-          textAlign: 'center',
-          color: '#94a3b8',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: '0.75rem',
-        }}>
-          <GanttChart size={36} color="#64748b" />
-          <div style={{ fontSize: '1rem', fontWeight: 600, color: '#f1f5f9' }}>
-            Timeline View
-          </div>
-          <div style={{ fontSize: '0.85rem', color: '#94a3b8', maxWidth: '480px', lineHeight: 1.4 }}>
-            Interactive timeline, dependency graph, and heaviest-chain Gantt view are coming with task 10.2.
-          </div>
-        </div>
+        <TimelineView
+          onSelectTask={(task) => setSelectedTask(task)}
+          onRefresh={onRefresh}
+        />
       )}
 
       {/* Task Detail Modal */}

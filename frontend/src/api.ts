@@ -1174,3 +1174,96 @@ function ensureBrowserWs() {
   sharedWsDisposed = false;
   initSharedWs();
 }
+
+// ============================================================================
+// Task 10.2: Timeline & Task Graph API Extensions
+// ============================================================================
+
+import type {
+  TaskGraphResponse,
+  SetPriorityPayload,
+  SetSizePayload,
+  SetDepsPayload,
+  TaskMutationPreviewResult,
+} from './types';
+
+export interface TimelineApiExtensions {
+  getTasksGraph(): Promise<TaskGraphResponse>;
+  previewSetPriority(taskId: string, payload: SetPriorityPayload): Promise<TaskMutationPreviewResult>;
+  setPriority(taskId: string, payload: SetPriorityPayload): Promise<any>;
+  previewSetSize(taskId: string, payload: SetSizePayload): Promise<TaskMutationPreviewResult>;
+  setSize(taskId: string, payload: SetSizePayload): Promise<any>;
+  previewSetDeps(taskId: string, payload: SetDepsPayload): Promise<TaskMutationPreviewResult>;
+  setDeps(taskId: string, payload: SetDepsPayload): Promise<any>;
+}
+
+export const timelineApi: TimelineApiExtensions = {
+  async getTasksGraph(): Promise<TaskGraphResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TaskGraphResponse>('getGraph');
+    }
+    return apiFetch<TaskGraphResponse>('/api/tasks/graph');
+  },
+
+  async previewSetPriority(taskId: string, payload: SetPriorityPayload): Promise<TaskMutationPreviewResult> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetPriority', { taskId, ...payload });
+    }
+    return apiFetch<TaskMutationPreviewResult>(`/api/tasks/${encodeURIComponent(taskId)}/priority/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async setPriority(taskId: string, payload: SetPriorityPayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('setPriority', { taskId, ...payload });
+    }
+    return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/priority`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewSetSize(taskId: string, payload: SetSizePayload): Promise<TaskMutationPreviewResult> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetSize', { taskId, ...payload });
+    }
+    return apiFetch<TaskMutationPreviewResult>(`/api/tasks/${encodeURIComponent(taskId)}/size/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async setSize(taskId: string, payload: SetSizePayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('setSize', { taskId, ...payload });
+    }
+    return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/size`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewSetDeps(taskId: string, payload: SetDepsPayload): Promise<TaskMutationPreviewResult> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetDeps', { taskId, ...payload });
+    }
+    return apiFetch<TaskMutationPreviewResult>(`/api/tasks/${encodeURIComponent(taskId)}/deps/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async setDeps(taskId: string, payload: SetDepsPayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('setDeps', { taskId, ...payload });
+    }
+    return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/deps`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+};
+
+Object.assign(api, timelineApi);
