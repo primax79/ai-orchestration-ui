@@ -259,10 +259,15 @@ async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[in
         home = get_ai_orch_home()
         if home and "--home" not in cmd_args:
             cmd_args = ["env", "--home", str(home), *cmd_args[1:]]
-    elif cmd_args and cmd_args[0] == "run":
+    elif cmd_args and cmd_args[0] in ("run", "config", "render-agents-md"):
+        # Every command that reads or writes the global config must honour the override,
+        # otherwise a scratch/test server would edit the real ~/.config/ai-orchestration file.
         global_cfg = os.environ.get("AI_ORCH_GLOBAL_CONFIG", "").strip()
         if global_cfg and "--global-config" not in cmd_args:
-            cmd_args = ["run", "--global-config", global_cfg, *cmd_args[1:]]
+            if cmd_args[0] == "run":
+                cmd_args = ["run", "--global-config", global_cfg, *cmd_args[1:]]
+            else:
+                cmd_args = [*cmd_args, "--global-config", global_cfg]
 
     if os.access(bin_path, os.X_OK):
         cmd = [str(bin_path), *cmd_args]

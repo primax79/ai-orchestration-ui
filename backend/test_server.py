@@ -1688,3 +1688,25 @@ def test_inbox_watcher_broadcasts_on_inbox_change(monkeypatch):
                     assert "tasks" not in areas
         finally:
             state.workspace = old_ws
+
+
+def test_global_config_override_reaches_config_commands(monkeypatch):
+    """AI_ORCH_GLOBAL_CONFIG must be forwarded to config/render commands, not only to runs."""
+    import asyncio
+    import server
+
+    captured = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        raise FileNotFoundError("stop here")
+
+    monkeypatch.setenv("AI_ORCH_GLOBAL_CONFIG", "/tmp/scratch-global.toml")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    for args in (["config", "set-routing", "--orchestrator", "claude", "--diff"], ["render-agents-md", "--diff"]):
+        try:
+            asyncio.run(server.run_ai_orch(args))
+        except Exception:
+            pass
+        assert "--global-config" in captured["cmd"], args
+        assert captured["cmd"][captured["cmd"].index("--global-config") + 1] == "/tmp/scratch-global.toml"
