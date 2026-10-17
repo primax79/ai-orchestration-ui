@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Layers, Kanban, ListFilter, Copy, Check, FileCheck, ArrowRight } from 'lucide-react';
+import { Layers, Kanban, ListFilter, Copy, Check, FileCheck, ArrowRight, AlertTriangle, AlertCircle, Loader2 } from 'lucide-react';
 import { TaskItem, TaskListResponse } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
+import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { api } from '../api';
 
 interface BacklogManagerProps {
@@ -14,6 +15,11 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
   const [selectedTask, setSelectedTask] = useState<TaskItem | null>(null);
   const [syncingIndex, setSyncingIndex] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // Index sync states
+  const [indexOutOfSync, setIndexOutOfSync] = useState(false);
+  const [syncConfirmData, setSyncConfirmData] = useState<(ConfirmDialogPreviewData & { title: string }) | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
   const initiatives = data?.initiatives || [];
@@ -31,16 +37,47 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
 
   const nextUpTasks = tasks.filter((t) => t.next_up === 'yes' && t.state !== 'done');
 
-  const handleSyncIndex = async () => {
+  const handleOpenSyncPreview = async () => {
     setSyncingIndex(true);
+    setSyncError(null);
     try {
-      await api.syncIndex();
-      onRefresh();
+      const res = await api.previewSyncIndex();
+      setSyncConfirmData({
+        title: 'Synchronize 00-INDEX.md',
+        summary: res.in_sync
+          ? '`tasks/00-INDEX.md` is currently in sync with all task headers. Applying will ensure formatting is consistent.'
+          : 'Task headers have changed. Synchronize `tasks/00-INDEX.md` tables with the current task state.',
+        diff: res.diff || undefined,
+        hash: res.hash,
+        warnings: res.in_sync ? undefined : ['Syncing will update the generated sections in tasks/00-INDEX.md.'],
+      });
     } catch (e: any) {
-      alert(`Sync error: ${e.message}`);
+      setSyncError(`Failed to preview index sync: ${e.message}`);
     } finally {
       setSyncingIndex(false);
     }
+  };
+
+  const handleApplySync = async (hash?: string) => {
+    if (!hash) {
+      throw new Error('Hash is required to apply index synchronization');
+    }
+    await api.syncIndex(hash);
+    setSyncConfirmData(null);
+    setIndexOutOfSync(false);
+    onRefresh();
+  };
+
+  const handleRefetchSyncPreview = async () => {
+    const res = await api.previewSyncIndex();
+    return {
+      summary: res.in_sync
+        ? '`tasks/00-INDEX.md` is currently in sync with all task headers.'
+        : 'Task headers have changed. Synchronize `tasks/00-INDEX.md` tables with the current task state.',
+      diff: res.diff || undefined,
+      hash: res.hash,
+      warnings: res.in_sync ? undefined : ['Syncing will update the generated sections in tasks/00-INDEX.md.'],
+    };
   };
 
   const copyHandoff = (e: React.MouseEvent, text?: string, id?: string) => {
@@ -63,6 +100,66 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
 
   return (
     <div style={{ padding: '1.5rem', maxWidth: '1400px', margin: '0 auto' }}>
+      {/* Non-blocking index out of sync notice */}
+      {indexOutOfSync && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '0.6rem 1rem',
+          borderRadius: '0.375rem',
+          backgroundColor: '#3b2505',
+          border: '1px solid #f59e0b',
+          color: '#fef3c7',
+          fontSize: '0.85rem',
+          marginBottom: '1rem',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <AlertTriangle size={16} color="#f59e0b" />
+            <span>Index out of sync — task state has advanced past 00-INDEX.md tables.</span>
+          </div>
+          <button
+            onClick={handleOpenSyncPreview}
+            disabled={syncingIndex}
+            style={{
+              padding: '0.25rem 0.75rem',
+              borderRadius: '0.25rem',
+              border: 'none',
+              backgroundColor: '#f59e0b',
+              color: '#000',
+              fontWeight: 600,
+              fontSize: '0.8rem',
+              cursor: syncingIndex ? 'not-allowed' : 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.3rem',
+            }}
+          >
+            {syncingIndex && <Loader2 size={13} className="spin" />}
+            <span>Sync…</span>
+          </button>
+        </div>
+      )}
+
+      {/* Sync Error Banner */}
+      {syncError && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.5rem',
+          padding: '0.6rem 1rem',
+          borderRadius: '0.375rem',
+          backgroundColor: '#451a1a',
+          border: '1px solid #ef4444',
+          color: '#fca5a5',
+          fontSize: '0.85rem',
+          marginBottom: '1rem',
+        }}>
+          <AlertCircle size={16} color="#ef4444" />
+          <span>{syncError}</span>
+        </div>
+      )}
+
       {/* Top action & stat bar */}
       <div style={{
         display: 'flex',
@@ -120,7 +217,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
           </div>
 
           <button
-            onClick={handleSyncIndex}
+            onClick={handleOpenSyncPreview}
             disabled={syncingIndex}
             style={{
               display: 'flex',
@@ -131,13 +228,13 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
               border: '1px solid #334155',
               borderRadius: '0.375rem',
               color: '#cbd5e1',
-              cursor: 'pointer',
+              cursor: syncingIndex ? 'not-allowed' : 'pointer',
               fontSize: '0.85rem',
               fontWeight: 500,
             }}
           >
-            <FileCheck size={14} color="#818cf8" />
-            <span>{syncingIndex ? 'Syncing...' : 'Sync 00-INDEX.md'}</span>
+            {syncingIndex ? <Loader2 size={14} className="spin" /> : <FileCheck size={14} color="#818cf8" />}
+            <span>{syncingIndex ? 'Inspecting...' : 'Sync 00-INDEX.md'}</span>
           </button>
         </div>
       </div>
@@ -429,6 +526,24 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
           task={selectedTask}
           onClose={() => setSelectedTask(null)}
           onActionComplete={onRefresh}
+          onIndexOutOfSync={() => setIndexOutOfSync(true)}
+          onRequestSyncIndex={handleOpenSyncPreview}
+        />
+      )}
+
+      {/* Confirm Dialog for Sync Index */}
+      {syncConfirmData && (
+        <ConfirmDialog
+          isOpen={true}
+          title={syncConfirmData.title}
+          summary={syncConfirmData.summary}
+          diff={syncConfirmData.diff}
+          hash={syncConfirmData.hash}
+          warnings={syncConfirmData.warnings}
+          applyButtonText="Apply Synchronization"
+          onApply={handleApplySync}
+          onCancel={() => setSyncConfirmData(null)}
+          onRefetchPreview={handleRefetchSyncPreview}
         />
       )}
     </div>

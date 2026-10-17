@@ -1,17 +1,26 @@
 import React, { useState } from 'react';
 import { DownloadCloud, Server, Check, AlertCircle, Loader2 } from 'lucide-react';
 import { api } from '../api';
+import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface SkillInstallerProps {
   onRefresh: () => void;
 }
 
 export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => {
-  const [selectedAssistants, setSelectedAssistants] = useState<string[]>(['kilo', 'claude', 'codex']);
-  const [scope, setScope] = useState<'global' | 'project'>('global');
+  // No assistant preselected; scope radio has no default (must choose)
+  const [selectedAssistants, setSelectedAssistants] = useState<string[]>([]);
+  const [scope, setScope] = useState<'global' | 'project' | null>(null);
   const [useSymlink, setUseSymlink] = useState(false);
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Confirm dialog state
+  const [confirmData, setConfirmData] = useState<(ConfirmDialogPreviewData & {
+    title: string;
+    onApplyAction: (hash?: string) => Promise<void>;
+    onRefetchAction: () => Promise<ConfirmDialogPreviewData>;
+  }) | null>(null);
 
   const toggleAssistant = (a: string) => {
     setSelectedAssistants((prev) =>
@@ -19,43 +28,83 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
     );
   };
 
+  const canAct = selectedAssistants.length > 0 && scope !== null;
+
   const handleInstallSkills = async (repo: string) => {
-    if (selectedAssistants.length === 0) {
-      alert('Please select at least one assistant');
-      return;
-    }
+    if (!canAct || !scope) return;
     setLoadingAction(`skills-${repo}`);
     setStatusMessage(null);
+
     try {
-      const res = await api.installSkills(selectedAssistants, scope, repo, useSymlink);
-      setStatusMessage({
-        type: 'success',
-        text: `Successfully installed ${res.installed_count} skill(s) from ${repo} into ${selectedAssistants.join(', ')} (${scope}).`,
+      const res = await api.previewInstallSkills(selectedAssistants, scope, repo, useSymlink);
+      setConfirmData({
+        title: `Install Skills (${repo})`,
+        summary: `Install skills from **${repo}** into **${selectedAssistants.join(', ')}** (${scope} scope). Mode: ${useSymlink ? 'Symlink (dev)' : 'Copy (standalone)'}.`,
+        plan: res.plan,
+        warnings: res.warnings,
+        hash: res.plan_hash,
+        onApplyAction: async (hash?: string) => {
+          if (!hash) throw new Error('Plan hash is required for installation');
+          const applyRes = await api.installSkills(selectedAssistants, scope, repo, useSymlink, hash);
+          setConfirmData(null);
+          setStatusMessage({
+            type: 'success',
+            text: `Successfully installed ${applyRes.installed_count ?? applyRes.plan?.length ?? ''} skill(s) from ${repo} into ${selectedAssistants.join(', ')} (${scope}).`,
+          });
+          onRefresh();
+        },
+        onRefetchAction: async () => {
+          const r = await api.previewInstallSkills(selectedAssistants, scope, repo, useSymlink);
+          return {
+            summary: `Install skills from **${repo}** into **${selectedAssistants.join(', ')}** (${scope} scope). Mode: ${useSymlink ? 'Symlink (dev)' : 'Copy (standalone)'}.`,
+            plan: r.plan,
+            warnings: r.warnings,
+            hash: r.plan_hash,
+          };
+        },
       });
-      onRefresh();
     } catch (e: any) {
-      setStatusMessage({ type: 'error', text: `Installation failed: ${e.message}` });
+      setStatusMessage({ type: 'error', text: `Failed to generate install preview: ${e.message}` });
     } finally {
       setLoadingAction(null);
     }
   };
 
   const handleRegisterMcp = async (server: string) => {
-    if (selectedAssistants.length === 0) {
-      alert('Please select at least one assistant');
-      return;
-    }
+    if (!canAct || !scope) return;
     setLoadingAction(`mcp-${server}`);
     setStatusMessage(null);
+
     try {
-      const res = await api.registerMcp(server, selectedAssistants, scope, true);
-      setStatusMessage({
-        type: 'success',
-        text: `Successfully registered MCP server '${server}' in ${res.updated_configs.length} assistant config(s).`,
+      const res = await api.previewRegisterMcp(server, selectedAssistants, scope, true);
+      setConfirmData({
+        title: `Register MCP Server (${server})`,
+        summary: `Register MCP server **${server}** in configuration for **${selectedAssistants.join(', ')}** (${scope} scope). Python venv provisioning is enabled.`,
+        plan: res.plan,
+        warnings: res.warnings,
+        hash: res.plan_hash,
+        onApplyAction: async (hash?: string) => {
+          if (!hash) throw new Error('Plan hash is required for MCP registration');
+          const applyRes = await api.registerMcp(server, selectedAssistants, scope, true, hash);
+          setConfirmData(null);
+          setStatusMessage({
+            type: 'success',
+            text: `Successfully registered MCP server '${server}' in ${applyRes.updated_configs?.length ?? 1} assistant config(s).`,
+          });
+          onRefresh();
+        },
+        onRefetchAction: async () => {
+          const r = await api.previewRegisterMcp(server, selectedAssistants, scope, true);
+          return {
+            summary: `Register MCP server **${server}** in configuration for **${selectedAssistants.join(', ')}** (${scope} scope). Python venv provisioning is enabled.`,
+            plan: r.plan,
+            warnings: r.warnings,
+            hash: r.plan_hash,
+          };
+        },
       });
-      onRefresh();
     } catch (e: any) {
-      setStatusMessage({ type: 'error', text: `MCP registration failed: ${e.message}` });
+      setStatusMessage({ type: 'error', text: `Failed to generate MCP preview: ${e.message}` });
     } finally {
       setLoadingAction(null);
     }
@@ -84,7 +133,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
       }}>
         <div>
           <label style={{ fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', display: 'block', marginBottom: '0.4rem' }}>
-            Target Assistants
+            Target Assistants <span style={{ color: selectedAssistants.length === 0 ? '#ef4444' : '#10b981' }}>*</span>
           </label>
           <div style={{ display: 'flex', gap: '0.75rem' }}>
             {['kilo', 'claude', 'codex'].map((a) => (
@@ -102,7 +151,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
 
         <div>
           <label style={{ fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', display: 'block', marginBottom: '0.4rem' }}>
-            Installation Scope
+            Installation Scope <span style={{ color: scope === null ? '#ef4444' : '#10b981' }}>*</span>
           </label>
           <div style={{ display: 'flex', gap: '0.75rem' }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.85rem', color: '#e2e8f0', cursor: 'pointer' }}>
@@ -142,6 +191,21 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
           </label>
         </div>
       </div>
+
+      {/* Helper notice when choices are missing */}
+      {!canAct && (
+        <div style={{
+          padding: '0.6rem 1rem',
+          borderRadius: '0.375rem',
+          marginBottom: '1.5rem',
+          backgroundColor: '#1e293b',
+          border: '1px dashed #475569',
+          color: '#94a3b8',
+          fontSize: '0.8rem',
+        }}>
+          Please select at least one <strong>Target Assistant</strong> and choose an <strong>Installation Scope</strong> (Global or Project) to enable installation and registration actions.
+        </div>
+      )}
 
       {/* Notification banner */}
       {statusMessage && (
@@ -187,7 +251,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
           <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '0.75rem', borderTop: '1px solid #334155' }}>
             <button
               onClick={() => handleInstallSkills('ai-orchestration')}
-              disabled={loadingAction !== null}
+              disabled={!canAct || loadingAction !== null}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -195,11 +259,11 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
                 padding: '0.4rem 0.8rem',
                 borderRadius: '0.375rem',
                 border: 'none',
-                backgroundColor: '#4f46e5',
-                color: '#fff',
+                backgroundColor: canAct ? '#4f46e5' : '#334155',
+                color: canAct ? '#fff' : '#64748b',
                 fontSize: '0.85rem',
                 fontWeight: 600,
-                cursor: 'pointer',
+                cursor: canAct ? 'pointer' : 'not-allowed',
               }}
             >
               {loadingAction === 'skills-ai-orchestration' ? <Loader2 size={15} className="spin" /> : <DownloadCloud size={15} />}
@@ -231,7 +295,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
           <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end', paddingTop: '0.75rem', borderTop: '1px solid #334155' }}>
             <button
               onClick={() => handleInstallSkills('kilo-mcp')}
-              disabled={loadingAction !== null}
+              disabled={!canAct || loadingAction !== null}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -239,11 +303,11 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
                 padding: '0.4rem 0.8rem',
                 borderRadius: '0.375rem',
                 border: '1px solid #334155',
-                backgroundColor: '#0f172a',
-                color: '#e2e8f0',
+                backgroundColor: canAct ? '#0f172a' : '#1e293b',
+                color: canAct ? '#e2e8f0' : '#64748b',
                 fontSize: '0.85rem',
                 fontWeight: 500,
-                cursor: 'pointer',
+                cursor: canAct ? 'pointer' : 'not-allowed',
               }}
             >
               {loadingAction === 'skills-kilo-mcp' ? <Loader2 size={15} className="spin" /> : <DownloadCloud size={15} />}
@@ -252,7 +316,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
 
             <button
               onClick={() => handleRegisterMcp('kilo-mcp')}
-              disabled={loadingAction !== null}
+              disabled={!canAct || loadingAction !== null}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -260,11 +324,11 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
                 padding: '0.4rem 0.8rem',
                 borderRadius: '0.375rem',
                 border: 'none',
-                backgroundColor: '#10b981',
-                color: '#fff',
+                backgroundColor: canAct ? '#10b981' : '#334155',
+                color: canAct ? '#fff' : '#64748b',
                 fontSize: '0.85rem',
                 fontWeight: 600,
-                cursor: 'pointer',
+                cursor: canAct ? 'pointer' : 'not-allowed',
               }}
             >
               {loadingAction === 'mcp-kilo-mcp' ? <Loader2 size={15} className="spin" /> : <Server size={15} />}
@@ -296,7 +360,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
           <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '0.75rem', borderTop: '1px solid #334155' }}>
             <button
               onClick={() => handleRegisterMcp('codex-mcp')}
-              disabled={loadingAction !== null}
+              disabled={!canAct || loadingAction !== null}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -304,11 +368,11 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
                 padding: '0.4rem 0.8rem',
                 borderRadius: '0.375rem',
                 border: 'none',
-                backgroundColor: '#0ea5e9',
-                color: '#fff',
+                backgroundColor: canAct ? '#0ea5e9' : '#334155',
+                color: canAct ? '#fff' : '#64748b',
                 fontSize: '0.85rem',
                 fontWeight: 600,
-                cursor: 'pointer',
+                cursor: canAct ? 'pointer' : 'not-allowed',
               }}
             >
               {loadingAction === 'mcp-codex-mcp' ? <Loader2 size={15} className="spin" /> : <Server size={15} />}
@@ -317,6 +381,23 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
           </div>
         </div>
       </div>
+
+      {/* Confirmation Modal */}
+      {confirmData && (
+        <ConfirmDialog
+          isOpen={true}
+          title={confirmData.title}
+          summary={confirmData.summary}
+          plan={confirmData.plan}
+          diff={confirmData.diff}
+          warnings={confirmData.warnings}
+          hash={confirmData.hash}
+          applyButtonText="Confirm & Apply"
+          onApply={confirmData.onApplyAction}
+          onCancel={() => setConfirmData(null)}
+          onRefetchPreview={confirmData.onRefetchAction}
+        />
+      )}
     </div>
   );
 };

@@ -73,13 +73,43 @@ export interface InstalledSkill {
   source_hash: string | null;
 }
 
+export interface SkillEntry {
+  name: string;
+  origin: string;
+  scope: string;
+  path: string;
+  enabled: boolean;
+  state: string;
+}
+
+export interface StructuredConflict {
+  kind: string;
+  names: string[];
+  entries?: SkillEntry[];
+}
+
+export interface McpServerInfo {
+  name: string;
+  scope: string;
+  provenance: string;
+  overrides?: string[];
+  config?: any;
+  command?: string;
+  args?: string[];
+}
+
 export interface AssistantScopeEnv {
   skills_dir: string;
   installed_count: number;
   skills: Record<string, InstalledSkill>;
+  skill_entries?: SkillEntry[];
+  agents_dir?: string;
+  agents?: Record<string, any>;
   conflicts: string[];
-  mcp_config_path: string;
+  structured_conflicts?: StructuredConflict[];
+  mcp_config_path: string | null;
   registered_mcps: string[];
+  mcp_servers?: Record<string, McpServerInfo>;
 }
 
 export interface EnvStatusResponse {
@@ -87,6 +117,7 @@ export interface EnvStatusResponse {
   source_repos: Record<string, { available: boolean; path: string | null; has_server_py: boolean; has_venv: boolean }>;
   available_catalog_count: number;
   environments: Record<string, Record<string, AssistantScopeEnv>>;
+  stray?: string[];
 }
 
 export interface OrchestrationConfigResponse {

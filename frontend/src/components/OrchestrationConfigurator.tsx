@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Settings, FileCode, Check } from 'lucide-react';
+import { Settings, FileCode, Check, Loader2, AlertCircle } from 'lucide-react';
 import { OrchestrationConfigResponse } from '../types';
 import { api } from '../api';
+import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface OrchestrationConfiguratorProps {
   configData: OrchestrationConfigResponse | null;
@@ -12,9 +13,15 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
   configData,
   onRefresh,
 }) => {
-  const [agentsMdModal, setAgentsMdModal] = useState<string | null>(null);
-  const [applying, setApplying] = useState(false);
-  const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [loadingPreview, setLoadingPreview] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Confirm dialog state
+  const [confirmData, setConfirmData] = useState<(ConfirmDialogPreviewData & {
+    title: string;
+    onApplyAction: (hash?: string) => Promise<void>;
+    onRefetchAction: () => Promise<ConfirmDialogPreviewData>;
+  }) | null>(null);
 
   if (!configData) {
     return <div style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>Loading configuration...</div>;
@@ -27,27 +34,42 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
 
   const isSingleFramework = routing.default_orchestrator === routing.default_executor;
 
-  const handlePreviewAgentsMd = async () => {
-    try {
-      const res = await api.renderAgentsMd();
-      setAgentsMdModal(res.rendered_block || 'No block rendered');
-    } catch (e: any) {
-      alert(`Error rendering AGENTS.md: ${e.message}`);
-    }
-  };
-
-  const handleApplyAgentsMd = async () => {
-    setApplying(true);
+  const handleOpenAgentsMdConfirm = async () => {
+    setLoadingPreview(true);
     setStatusMsg(null);
     try {
-      await api.applyAgentsMd();
-      setStatusMsg('Successfully applied orchestration rules to AGENTS.md!');
-      setAgentsMdModal(null);
-      onRefresh();
+      const res = await api.previewAgentsMd();
+      setConfirmData({
+        title: 'Apply Orchestration Rules to AGENTS.md',
+        summary: 'Synchronize the active model matrix, cognitive profiles, and routing rules with the workspace `AGENTS.md`.',
+        diff: res.diff || undefined,
+        hash: res.hash,
+        onApplyAction: async (hash?: string) => {
+          if (!hash) throw new Error('Hash is required to apply changes to AGENTS.md');
+          await api.applyAgentsMd(hash);
+          setConfirmData(null);
+          setStatusMsg({
+            type: 'success',
+            text: 'Successfully updated and formatted AGENTS.md!',
+          });
+          onRefresh();
+        },
+        onRefetchAction: async () => {
+          const r = await api.previewAgentsMd();
+          return {
+            summary: 'Synchronize the active model matrix, cognitive profiles, and routing rules with the workspace `AGENTS.md`.',
+            diff: r.diff || undefined,
+            hash: r.hash,
+          };
+        },
+      });
     } catch (e: any) {
-      setStatusMsg(`Error applying AGENTS.md: ${e.message}`);
+      setStatusMsg({
+        type: 'error',
+        text: `Failed to generate AGENTS.md preview: ${e.message}`,
+      });
     } finally {
-      setApplying(false);
+      setLoadingPreview(false);
     }
   };
 
@@ -65,7 +87,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
 
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <button
-            onClick={handlePreviewAgentsMd}
+            onClick={handleOpenAgentsMdConfirm}
+            disabled={loadingPreview}
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -76,17 +99,17 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
               borderRadius: '0.375rem',
               color: '#e2e8f0',
               fontSize: '0.85rem',
-              cursor: 'pointer',
+              cursor: loadingPreview ? 'not-allowed' : 'pointer',
               fontWeight: 500,
             }}
           >
-            <FileCode size={15} color="#818cf8" />
-            <span>Preview AGENTS.md</span>
+            {loadingPreview ? <Loader2 size={15} className="spin" /> : <FileCode size={15} color="#818cf8" />}
+            <span>Preview Diff</span>
           </button>
 
           <button
-            onClick={handleApplyAgentsMd}
-            disabled={applying}
+            onClick={handleOpenAgentsMdConfirm}
+            disabled={loadingPreview}
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -97,27 +120,31 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
               borderRadius: '0.375rem',
               color: '#fff',
               fontSize: '0.85rem',
-              cursor: 'pointer',
+              cursor: loadingPreview ? 'not-allowed' : 'pointer',
               fontWeight: 600,
             }}
           >
             <Check size={15} />
-            <span>{applying ? 'Applying...' : 'Apply to AGENTS.md'}</span>
+            <span>Apply to AGENTS.md…</span>
           </button>
         </div>
       </div>
 
       {statusMsg && (
         <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.5rem',
           padding: '0.75rem 1rem',
           borderRadius: '0.375rem',
           marginBottom: '1.5rem',
-          backgroundColor: '#064e3b',
-          border: '1px solid #10b981',
+          backgroundColor: statusMsg.type === 'success' ? '#064e3b' : '#451a1a',
+          border: `1px solid ${statusMsg.type === 'success' ? '#10b981' : '#ef4444'}`,
           color: '#f8fafc',
           fontSize: '0.85rem',
         }}>
-          {statusMsg}
+          {statusMsg.type === 'success' ? <Check size={16} color="#10b981" /> : <AlertCircle size={16} color="#ef4444" />}
+          <span>{statusMsg.text}</span>
         </div>
       )}
 
@@ -147,15 +174,15 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
             </span>
           </div>
           <div style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.4rem' }}>
-            Primary Orchestrator: <strong style={{ color: '#f8fafc' }}>{routing.default_orchestrator}</strong> |
-            Default Executor: <strong style={{ color: '#f8fafc' }}>{routing.default_executor}</strong> |
-            Verification Mode: <strong style={{ color: '#f8fafc' }}>{verification.default_mode}</strong>
+            Primary Orchestrator: <strong style={{ color: '#f8fafc' }}>{routing.default_orchestrator || '—'}</strong> |
+            Default Executor: <strong style={{ color: '#f8fafc' }}>{routing.default_executor || '—'}</strong> |
+            Verification Mode: <strong style={{ color: '#f8fafc' }}>{verification.default_mode || '—'}</strong>
           </div>
         </div>
 
         <div style={{ fontSize: '0.75rem', color: '#64748b', textAlign: 'right' }}>
-          <div>Global: {meta.global_config_exists ? 'Configured' : 'Default'}</div>
-          <div>Project local: {meta.project_config_exists ? 'Override active' : 'Inheriting'}</div>
+          <div>Global: {meta?.global_config_exists ? 'Configured' : 'Default'}</div>
+          <div>Project local: {meta?.project_config_exists ? 'Override active' : 'Inheriting'}</div>
         </div>
       </div>
 
@@ -204,72 +231,19 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         </table>
       </div>
 
-      {/* Preview Modal */}
-      {agentsMdModal && (
-        <div style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          backgroundColor: 'rgba(0, 0, 0, 0.75)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 1000,
-          padding: '2rem',
-        }}>
-          <div style={{
-            backgroundColor: '#1e293b',
-            border: '1px solid #334155',
-            borderRadius: '0.5rem',
-            width: '100%',
-            maxWidth: '900px',
-            maxHeight: '85vh',
-            display: 'flex',
-            flexDirection: 'column',
-            overflow: 'hidden',
-          }}>
-            <div style={{ padding: '1rem', borderBottom: '1px solid #334155', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#f8fafc' }}>Generated AGENTS.md Orchestration Block</h3>
-              <button
-                onClick={() => setAgentsMdModal(null)}
-                style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer' }}
-              >
-                ✕
-              </button>
-            </div>
-            <div style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
-              <pre style={{
-                backgroundColor: '#0f172a',
-                padding: '1rem',
-                borderRadius: '0.375rem',
-                color: '#cbd5e1',
-                fontSize: '0.8rem',
-                fontFamily: 'monospace',
-                whiteSpace: 'pre-wrap',
-                lineHeight: 1.5,
-              }}>
-                {agentsMdModal}
-              </pre>
-            </div>
-            <div style={{ padding: '0.75rem 1rem', borderTop: '1px solid #334155', display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-              <button
-                onClick={() => setAgentsMdModal(null)}
-                style={{ padding: '0.35rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #64748b', backgroundColor: 'transparent', color: '#cbd5e1', cursor: 'pointer' }}
-              >
-                Close
-              </button>
-              <button
-                onClick={handleApplyAgentsMd}
-                disabled={applying}
-                style={{ padding: '0.35rem 0.75rem', borderRadius: '0.375rem', border: 'none', backgroundColor: '#4f46e5', color: '#fff', fontWeight: 600, cursor: 'pointer' }}
-              >
-                Apply to AGENTS.md Now
-              </button>
-            </div>
-          </div>
-        </div>
+      {/* Confirmation Modal */}
+      {confirmData && (
+        <ConfirmDialog
+          isOpen={true}
+          title={confirmData.title}
+          summary={confirmData.summary}
+          diff={confirmData.diff}
+          hash={confirmData.hash}
+          applyButtonText="Apply to AGENTS.md"
+          onApply={confirmData.onApplyAction}
+          onCancel={() => setConfirmData(null)}
+          onRefetchPreview={confirmData.onRefetchAction}
+        />
       )}
     </div>
   );

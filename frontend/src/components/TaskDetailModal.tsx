@@ -1,24 +1,31 @@
 import React, { useState, useEffect } from 'react';
-import { X, CheckCircle, RotateCcw, Play, CheckCheck, Copy, Check, FileText } from 'lucide-react';
+import { X, CheckCircle, RotateCcw, Play, CheckCheck, Copy, Check, FileText, AlertTriangle, AlertCircle, Loader2 } from 'lucide-react';
 import { TaskItem } from '../types';
 import { api } from '../api';
+import { SafeMarkdown } from './SafeMarkdown';
 
 interface TaskDetailModalProps {
   task: TaskItem;
   onClose: () => void;
   onActionComplete: () => void;
+  onIndexOutOfSync?: () => void;
+  onRequestSyncIndex?: () => void;
 }
 
 export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   task,
   onClose,
   onActionComplete,
+  onIndexOutOfSync,
+  onRequestSyncIndex,
 }) => {
   const [loading, setLoading] = useState(false);
   const [detail, setDetail] = useState<any>(null);
   const [bounceReason, setBounceReason] = useState('');
   const [showBounceInput, setShowBounceInput] = useState(false);
   const [copiedHandoff, setCopiedHandoff] = useState(false);
+  const [transitionError, setTransitionError] = useState<string | null>(null);
+  const [indexOutOfSync, setIndexOutOfSync] = useState(false);
 
   useEffect(() => {
     loadDetail();
@@ -28,19 +35,24 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     try {
       const data = await api.getTaskDetail(task.id);
       setDetail(data);
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      setTransitionError(`Failed to load task specification: ${e.message}`);
     }
   };
 
   const handleTransition = async (newState: string, verifier?: string, reason?: string) => {
     setLoading(true);
+    setTransitionError(null);
     try {
-      await api.transitionTask(task.id, newState, 'operator', verifier, reason);
+      const res = await api.transitionTask(task.id, newState, 'operator', verifier, reason);
+      if (res && res.index_in_sync === false) {
+        setIndexOutOfSync(true);
+        onIndexOutOfSync?.();
+      }
       onActionComplete();
       onClose();
     } catch (e: any) {
-      alert(`Transition error: ${e.message}`);
+      setTransitionError(`Transition error: ${e.message}`);
     } finally {
       setLoading(false);
     }
@@ -61,7 +73,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       left: 0,
       right: 0,
       bottom: 0,
-      backgroundColor: 'rgba(0, 0, 0, 0.7)',
+      backgroundColor: 'rgba(0, 0, 0, 0.75)',
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'center',
@@ -120,6 +132,45 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             <X size={20} />
           </button>
         </div>
+
+        {/* Non-blocking index out of sync notice */}
+        {indexOutOfSync && (
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '0.6rem 1.5rem',
+            backgroundColor: '#3b2505',
+            borderBottom: '1px solid #f59e0b',
+            color: '#fef3c7',
+            fontSize: '0.85rem',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              <AlertTriangle size={16} color="#f59e0b" />
+              <span>Index out of sync</span>
+            </div>
+            {onRequestSyncIndex && (
+              <button
+                onClick={() => {
+                  onRequestSyncIndex();
+                  onClose();
+                }}
+                style={{
+                  padding: '0.2rem 0.6rem',
+                  borderRadius: '0.25rem',
+                  border: 'none',
+                  backgroundColor: '#f59e0b',
+                  color: '#000',
+                  fontWeight: 600,
+                  fontSize: '0.75rem',
+                  cursor: 'pointer',
+                }}
+              >
+                Sync…
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Content */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '1.5rem' }}>
@@ -194,20 +245,17 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 <FileText size={14} />
                 <span>{detail.relative_path}</span>
               </div>
-              <pre style={{
+              <div style={{
                 backgroundColor: '#0f172a',
                 border: '1px solid #334155',
                 borderRadius: '0.5rem',
                 padding: '1rem',
                 fontSize: '0.85rem',
                 color: '#cbd5e1',
-                fontFamily: 'monospace',
-                whiteSpace: 'pre-wrap',
-                overflowX: 'auto',
                 lineHeight: 1.6,
               }}>
-                {detail.content}
-              </pre>
+                <SafeMarkdown content={detail.content} />
+              </div>
             </div>
           ) : (
             <div style={{ color: '#94a3b8', fontSize: '0.85rem' }}>Loading task specification...</div>
@@ -273,6 +321,25 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               </div>
             </div>
           )}
+
+          {/* Inline Transition Error */}
+          {transitionError && (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              marginTop: '1rem',
+              padding: '0.75rem 1rem',
+              borderRadius: '0.375rem',
+              backgroundColor: '#451a1a',
+              border: '1px solid #ef4444',
+              color: '#fca5a5',
+              fontSize: '0.85rem',
+            }}>
+              <AlertCircle size={16} color="#ef4444" />
+              <span>{transitionError}</span>
+            </div>
+          )}
         </div>
 
         {/* Action Footer */}
@@ -306,7 +373,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                   cursor: 'pointer',
                 }}
               >
-                <Play size={15} />
+                {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
                 <span>Start Task (In Progress)</span>
               </button>
             )}
@@ -328,7 +395,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                   cursor: 'pointer',
                 }}
               >
-                <CheckCircle size={15} />
+                {loading ? <Loader2 size={15} className="spin" /> : <CheckCircle size={15} />}
                 <span>Mark Delivered (Needs Verification)</span>
               </button>
             )}
@@ -371,7 +438,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                     cursor: 'pointer',
                   }}
                 >
-                  <CheckCheck size={15} />
+                  {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
                   <span>Approve (Verified)</span>
                 </button>
               </>
@@ -394,7 +461,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                   cursor: 'pointer',
                 }}
               >
-                <CheckCheck size={15} />
+                {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
                 <span>Close Task (Done)</span>
               </button>
             )}

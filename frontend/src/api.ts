@@ -5,6 +5,19 @@ import {
   OrchestrationConfigResponse,
 } from './types';
 
+// Custom ApiError to carry HTTP status and response payload
+export class ApiError extends Error {
+  status: number;
+  data: any;
+
+  constructor(message: string, status: number, data?: any) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.data = data;
+  }
+}
+
 // Detect whether running inside VS Code Webview or standalone browser
 declare global {
   interface Window {
@@ -25,24 +38,27 @@ let globalWsListener: ((msg: any) => void) | null = null;
 
 if (typeof window !== 'undefined') {
   window.addEventListener('message', (event) => {
-    const { id, data, error, ok, type } = event.data || {};
+    const { id, data, error, status, ok, type } = event.data || {};
     if (id && pendingRequests.has(id)) {
       const { resolve, reject } = pendingRequests.get(id)!;
       pendingRequests.delete(id);
       if (ok) {
         resolve(data);
       } else {
-        reject(new Error(error || 'VS Code message failed'));
+        const errStatus = status || (typeof error === 'string' && error.includes('409') ? 409 : 500);
+        reject(new ApiError(error || 'VS Code message failed', errStatus, data));
       }
     } else if (type === 'tasks_changed' && globalWsListener) {
       globalWsListener({ type: 'tasks_changed' });
+    } else if (type === 'changed' && globalWsListener) {
+      globalWsListener(event.data);
     }
   });
 }
 
 function sendVsCodeMessage<T>(type: string, payload?: any): Promise<T> {
   return new Promise((resolve, reject) => {
-    if (!vscode) return reject(new Error('VS Code API not available'));
+    if (!vscode) return reject(new ApiError('VS Code API not available', 500));
     const id = `req_${++messageSeq}_${Date.now()}`;
     pendingRequests.set(id, { resolve, reject });
     vscode.postMessage({ id, type, payload });
@@ -83,11 +99,14 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> 
       }
     }
     let err = `${res.status} ${res.statusText}`;
+    let data: any = null;
     try {
-      const data = await res.json();
-      if (data.error) err = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+      data = await res.json();
+      if (data && data.error) {
+        err = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+      }
     } catch {}
-    throw new Error(err);
+    throw new ApiError(err, res.status, data);
   }
 
   if (typeof window !== 'undefined' && typeof window.sessionStorage !== 'undefined') {
@@ -109,7 +128,7 @@ export const api = {
     if (isVsCode && vscode) {
       return sendVsCodeMessage<{ ok: boolean }>('switchWorkspace', { workspacePath });
     }
-    throw new Error('Workspace switching is not supported in standalone browser mode. Start another server with the desired workspace.');
+    throw new ApiError('Workspace switching is not supported in standalone browser mode. Start another server with the desired workspace.', 400);
   },
 
   async getTasks(): Promise<TaskListResponse> {
@@ -131,10 +150,11 @@ export const api = {
     newState: string,
     actor = 'operator',
     verifier?: string,
-    reason?: string
+    reason?: string,
+    expectTaskHash?: string
   ): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('transitionTask', { taskId, newState, actor, verifier, reason });
+      return sendVsCodeMessage('transitionTask', { taskId, newState, actor, verifier, reason, expectTaskHash });
     }
     return apiFetch('/api/tasks/transition', {
       method: 'POST',
@@ -144,15 +164,26 @@ export const api = {
         actor,
         verifier,
         reason,
+        expect_task_hash: expectTaskHash,
       }),
     });
   },
 
-  async syncIndex(): Promise<any> {
+  async previewSyncIndex(): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('syncIndex');
+      return sendVsCodeMessage('previewSyncIndex');
     }
-    return apiFetch('/api/tasks/sync-index', { method: 'POST' });
+    return apiFetch('/api/tasks/sync-index/preview');
+  },
+
+  async syncIndex(expectHash: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('syncIndex', { expectHash });
+    }
+    return apiFetch('/api/tasks/sync-index', {
+      method: 'POST',
+      body: JSON.stringify({ expect_hash: expectHash }),
+    });
   },
 
   async getTaskDetail(taskId: string): Promise<any> {
@@ -169,31 +200,59 @@ export const api = {
     return apiFetch<EnvStatusResponse>('/api/env/status');
   },
 
+  async previewInstallSkills(
+    assistants: string[],
+    scope: 'global' | 'project',
+    repo = 'ai-orchestration',
+    link = false,
+    plugins?: string[],
+    overwrite?: string[]
+  ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('previewInstallSkills', { assistants, scope, repo, link, plugins, overwrite });
+    }
+    return apiFetch('/api/env/install-skills/preview', {
+      method: 'POST',
+      body: JSON.stringify({ assistants, scope, repo, link, plugins, overwrite }),
+    });
+  },
+
   async installSkills(
     assistants: string[],
     scope: 'global' | 'project',
     repo = 'ai-orchestration',
-    link = false
+    link = false,
+    expectPlanHash?: string,
+    plugins?: string[],
+    overwrite?: string[]
   ): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('installSkills', { assistants, scope, repo, link });
+      return sendVsCodeMessage('installSkills', { assistants, scope, repo, link, expectPlanHash, plugins, overwrite });
     }
     return apiFetch('/api/env/install-skills', {
       method: 'POST',
-      body: JSON.stringify({ assistants, scope, repo, link }),
+      body: JSON.stringify({
+        assistants,
+        scope,
+        repo,
+        link,
+        expect_plan_hash: expectPlanHash,
+        plugins,
+        overwrite,
+      }),
     });
   },
 
-  async registerMcp(
+  async previewRegisterMcp(
     server: string,
     assistants: string[],
     scope: 'global' | 'project',
     provisionVenv = false
   ): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('registerMcp', { server, assistants, scope, provisionVenv });
+      return sendVsCodeMessage('previewRegisterMcp', { server, assistants, scope, provisionVenv });
     }
-    return apiFetch('/api/env/register-mcp', {
+    return apiFetch('/api/env/register-mcp/preview', {
       method: 'POST',
       body: JSON.stringify({
         server,
@@ -204,25 +263,92 @@ export const api = {
     });
   },
 
-  async removeSkill(
+  async registerMcp(
+    server: string,
+    assistants: string[],
+    scope: 'global' | 'project',
+    provisionVenv = false,
+    expectPlanHash?: string
+  ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('registerMcp', { server, assistants, scope, provisionVenv, expectPlanHash });
+    }
+    return apiFetch('/api/env/register-mcp', {
+      method: 'POST',
+      body: JSON.stringify({
+        server,
+        assistants,
+        scope,
+        provision_venv: provisionVenv,
+        expect_plan_hash: expectPlanHash,
+      }),
+    });
+  },
+
+  async previewRemoveSkill(
     skill: string,
     assistant: string,
     scope: 'global' | 'project' = 'global'
   ): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('removeSkill', { skill, assistant, scope });
+      return sendVsCodeMessage('previewRemoveSkill', { skill, assistant, scope });
     }
-    return apiFetch('/api/env/remove-skill', {
+    return apiFetch('/api/env/remove-skill/preview', {
       method: 'POST',
       body: JSON.stringify({ skill, assistant, scope }),
     });
   },
 
-  async resolveConflicts(): Promise<any> {
+  async removeSkill(
+    skill: string,
+    assistant: string,
+    scope: 'global' | 'project' = 'global',
+    expectPlanHash?: string
+  ): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('resolveConflicts');
+      return sendVsCodeMessage('removeSkill', { skill, assistant, scope, expectPlanHash });
     }
-    return apiFetch('/api/env/resolve-conflicts', { method: 'POST' });
+    return apiFetch('/api/env/remove-skill', {
+      method: 'POST',
+      body: JSON.stringify({ skill, assistant, scope, expect_plan_hash: expectPlanHash }),
+    });
+  },
+
+  async previewResolveConflicts(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('previewResolveConflicts');
+    }
+    return apiFetch('/api/env/resolve-conflicts/preview', { method: 'POST' });
+  },
+
+  async resolveConflicts(expectPlanHash?: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('resolveConflicts', { expectPlanHash });
+    }
+    return apiFetch('/api/env/resolve-conflicts', {
+      method: 'POST',
+      body: JSON.stringify({ expect_plan_hash: expectPlanHash }),
+    });
+  },
+
+  async previewFetchRepos(repos?: string[]): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('previewFetchRepos', { repos });
+    }
+    return apiFetch('/api/env/fetch-repos/preview', {
+      method: 'POST',
+      body: JSON.stringify({ repos }),
+    });
+  },
+
+  async fetchRepos(expectPlanHash: string, repos?: string[]): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('fetchRepos', { expectPlanHash, repos });
+    }
+    return apiFetch('/api/env/fetch-repos', {
+      method: 'POST',
+      body: JSON.stringify({ expect_plan_hash: expectPlanHash, repos }),
+    });
   },
 
   async getConfig(): Promise<OrchestrationConfigResponse> {
@@ -232,20 +358,86 @@ export const api = {
     return apiFetch<OrchestrationConfigResponse>('/api/config/show');
   },
 
-  async setProfile(
+  async previewSetProfile(
     tool: string,
     profile: string,
     model: string,
     variant?: string,
     effort?: string,
+    basis?: string,
     scope: 'global' | 'project' = 'global'
   ): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('setProfile', { tool, profile, model, variant, effort, scope });
+      return sendVsCodeMessage('previewSetProfile', { tool, profile, model, variant, effort, basis, scope });
+    }
+    return apiFetch('/api/config/set-profile/preview', {
+      method: 'POST',
+      body: JSON.stringify({ tool, profile, model, variant, effort, basis, scope }),
+    });
+  },
+
+  async setProfile(
+    tool: string,
+    profile: string,
+    model: string,
+    expectHash: string,
+    variant?: string,
+    effort?: string,
+    basis?: string,
+    scope: 'global' | 'project' = 'global'
+  ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('setProfile', { tool, profile, model, expectHash, variant, effort, basis, scope });
     }
     return apiFetch('/api/config/set-profile', {
       method: 'POST',
-      body: JSON.stringify({ tool, profile, model, variant, effort, scope }),
+      body: JSON.stringify({ tool, profile, model, expect_hash: expectHash, variant, effort, basis, scope }),
+    });
+  },
+
+  async previewSetRouting(
+    scope: 'global' | 'project' = 'global',
+    orchestrator?: string,
+    executor?: string,
+    defaultProfile?: string,
+    verificationMode?: string
+  ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('previewSetRouting', { scope, orchestrator, executor, defaultProfile, verificationMode });
+    }
+    return apiFetch('/api/config/set-routing/preview', {
+      method: 'POST',
+      body: JSON.stringify({
+        scope,
+        orchestrator,
+        executor,
+        default_profile: defaultProfile,
+        verification_mode: verificationMode,
+      }),
+    });
+  },
+
+  async setRouting(
+    expectHash: string,
+    scope: 'global' | 'project' = 'global',
+    orchestrator?: string,
+    executor?: string,
+    defaultProfile?: string,
+    verificationMode?: string
+  ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('setRouting', { expectHash, scope, orchestrator, executor, defaultProfile, verificationMode });
+    }
+    return apiFetch('/api/config/set-routing', {
+      method: 'POST',
+      body: JSON.stringify({
+        expect_hash: expectHash,
+        scope,
+        orchestrator,
+        executor,
+        default_profile: defaultProfile,
+        verification_mode: verificationMode,
+      }),
     });
   },
 
@@ -256,20 +448,41 @@ export const api = {
     return apiFetch('/api/config/render-agents-md');
   },
 
-  async applyAgentsMd(): Promise<any> {
+  async previewAgentsMd(): Promise<any> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('applyAgentsMd');
+      return sendVsCodeMessage('previewAgentsMd');
     }
-    return apiFetch('/api/config/render-agents-md/apply', { method: 'POST' });
+    return apiFetch('/api/config/render-agents-md/preview');
   },
 
-  connectWebSocket(onMessage: (msg: any) => void): () => void {
+  async applyAgentsMd(expectHash: string, allowGlobalRouting = false): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('applyAgentsMd', { expectHash, allowGlobalRouting });
+    }
+    return apiFetch('/api/config/render-agents-md/apply', {
+      method: 'POST',
+      body: JSON.stringify({ expect_hash: expectHash, allow_global_routing: allowGlobalRouting }),
+    });
+  },
+
+  connectWebSocket(
+    onMessage: (msg: any) => void,
+    onStatusChange?: (status: 'connected' | 'disconnected') => void
+  ): () => void {
     if (isVsCode) {
       globalWsListener = onMessage;
+      onStatusChange?.('connected');
       return () => {
         globalWsListener = null;
       };
     }
+
+    let ws: WebSocket | null = null;
+    let pingInterval: any = null;
+    let reconnectTimeout: any = null;
+    let isDisposed = false;
+    let backoffMs = 1000;
+    let hasConnectedOnce = false;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host || 'localhost:8780';
@@ -277,24 +490,76 @@ export const api = {
     const wsUrl = token
       ? `${protocol}//${host}/ws?token=${encodeURIComponent(token)}`
       : `${protocol}//${host}/ws`;
-    const ws = new WebSocket(wsUrl);
 
-    ws.onmessage = (event) => {
+    function scheduleReconnect() {
+      if (isDisposed || reconnectTimeout) return;
+      onStatusChange?.('disconnected');
+      const delay = backoffMs;
+      backoffMs = Math.min(30000, Math.round(backoffMs * 1.5));
+      reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null;
+        connect();
+      }, delay);
+    }
+
+    function connect() {
+      if (isDisposed) return;
       try {
-        const data = JSON.parse(event.data);
-        onMessage(data);
-      } catch {}
-    };
+        ws = new WebSocket(wsUrl);
 
-    const interval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send('ping');
+        ws.onopen = () => {
+          backoffMs = 1000;
+          onStatusChange?.('connected');
+          if (hasConnectedOnce) {
+            // Signal a reconnection so the app can reload state
+            onMessage({ type: 'reconnected' });
+          }
+          hasConnectedOnce = true;
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'connected') {
+              onStatusChange?.('connected');
+            }
+            onMessage(data);
+          } catch {}
+        };
+
+        ws.onerror = () => {
+          scheduleReconnect();
+        };
+
+        ws.onclose = () => {
+          scheduleReconnect();
+        };
+      } catch {
+        scheduleReconnect();
+      }
+    }
+
+    connect();
+
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send('ping');
+        } catch {}
       }
     }, 15000);
 
     return () => {
-      clearInterval(interval);
-      ws.close();
+      isDisposed = true;
+      if (pingInterval) clearInterval(pingInterval);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        ws.close();
+      }
     };
   },
 };

@@ -128,15 +128,21 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
         )}
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: isWsConnected ? '#10b981' : '#f59e0b' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
           <span style={{
             width: '8px',
             height: '8px',
             borderRadius: '50%',
-            backgroundColor: isWsConnected ? '#10b981' : '#f59e0b',
+            backgroundColor: isWsConnected ? '#10b981' : '#ef4444',
             display: 'inline-block',
           }} />
-          <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>{isWsConnected ? 'Live' : 'Connecting'}</span>
+          <span style={{
+            fontSize: '0.75rem',
+            color: isWsConnected ? '#94a3b8' : '#fca5a5',
+            fontWeight: isWsConnected ? 400 : 600,
+          }}>
+            {isWsConnected ? 'Live' : 'Disconnected'}
+          </span>
         </div>
 
         <button

@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Activity, CheckCircle2, AlertTriangle, XCircle, Terminal, HardDrive, Trash2, Wrench, Loader2 } from 'lucide-react';
-import { EnvStatusResponse } from '../types';
+import { Activity, CheckCircle2, AlertTriangle, XCircle, Terminal, HardDrive, Trash2, Wrench, Loader2, Info, FileCode } from 'lucide-react';
+import { EnvStatusResponse, SkillEntry } from '../types';
 import { api } from '../api';
+import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface EnvironmentDoctorProps {
   status: EnvStatusResponse | null;
@@ -10,40 +11,98 @@ interface EnvironmentDoctorProps {
 
 export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, onRefresh }) => {
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Confirm dialog state
+  const [confirmData, setConfirmData] = useState<(ConfirmDialogPreviewData & {
+    title: string;
+    onApplyAction: (hash?: string) => Promise<void>;
+    onRefetchAction: () => Promise<ConfirmDialogPreviewData>;
+  }) | null>(null);
 
   if (!status) {
     return <div style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>Loading environment status...</div>;
   }
 
-  const { clis, source_repos, environments } = status;
+  const { clis, source_repos, environments, stray } = status;
 
-  // Check if any environment has conflicts
-  const hasConflicts = Object.values(environments).some((scopes) =>
-    Object.values(scopes).some((sinfo) => sinfo.conflicts.length > 0)
+  // Check if any environment has resolvable conflicts
+  const hasResolvableConflicts = Object.values(environments).some((scopes) =>
+    Object.values(scopes).some((sinfo) => {
+      if (sinfo.structured_conflicts && sinfo.structured_conflicts.length > 0) {
+        return sinfo.structured_conflicts.some((sc) => {
+          // A conflict is resolvable if any entry is standalone (non-plugin)
+          const entries = sc.entries || [];
+          return entries.some((e) => !e.origin?.startsWith('plugin:'));
+        });
+      }
+      return sinfo.conflicts.length > 0;
+    })
   );
 
-  const handleResolveConflicts = async () => {
+  const handleResolveConflictsPreview = async () => {
     setLoadingAction('resolve-conflicts');
+    setErrorMessage(null);
     try {
-      await api.resolveConflicts();
-      onRefresh();
+      const res = await api.previewResolveConflicts();
+      setConfirmData({
+        title: 'Auto-Resolve Trigger Conflicts',
+        summary: 'Resolve trigger and duplicate skill name conflicts across assistant scopes.',
+        plan: res.plan,
+        warnings: res.warnings,
+        hash: res.plan_hash,
+        onApplyAction: async (hash?: string) => {
+          if (!hash) throw new Error('Plan hash is required to apply conflict resolution');
+          await api.resolveConflicts(hash);
+          setConfirmData(null);
+          onRefresh();
+        },
+        onRefetchAction: async () => {
+          const r = await api.previewResolveConflicts();
+          return {
+            summary: 'Resolve trigger and duplicate skill name conflicts across assistant scopes.',
+            plan: r.plan,
+            warnings: r.warnings,
+            hash: r.plan_hash,
+          };
+        },
+      });
     } catch (e: any) {
-      alert(`Error resolving conflicts: ${e.message}`);
+      setErrorMessage(`Failed to preview conflict resolution: ${e.message}`);
     } finally {
       setLoadingAction(null);
     }
   };
 
-  const handleRemoveSkill = async (assistant: string, scope: string, skill: string) => {
-    if (!confirm(`Remove skill '${skill}' from ${assistant} (${scope})?`)) {
-      return;
-    }
+  const handleRemoveSkillPreview = async (assistant: string, scope: string, skill: string) => {
     setLoadingAction(`remove-${assistant}-${scope}-${skill}`);
+    setErrorMessage(null);
     try {
-      await api.removeSkill(skill, assistant, scope as any);
-      onRefresh();
+      const res = await api.previewRemoveSkill(skill, assistant, scope as any);
+      setConfirmData({
+        title: `Remove Skill '${skill}'`,
+        summary: `Remove skill **${skill}** from **${assistant}** (${scope} scope).`,
+        plan: res.plan,
+        warnings: res.warnings,
+        hash: res.plan_hash,
+        onApplyAction: async (hash?: string) => {
+          if (!hash) throw new Error('Plan hash is required to remove skill');
+          await api.removeSkill(skill, assistant, scope as any, hash);
+          setConfirmData(null);
+          onRefresh();
+        },
+        onRefetchAction: async () => {
+          const r = await api.previewRemoveSkill(skill, assistant, scope as any);
+          return {
+            summary: `Remove skill **${skill}** from **${assistant}** (${scope} scope).`,
+            plan: r.plan,
+            warnings: r.warnings,
+            hash: r.plan_hash,
+          };
+        },
+      });
     } catch (e: any) {
-      alert(`Error removing skill: ${e.message}`);
+      setErrorMessage(`Failed to preview skill removal: ${e.message}`);
     } finally {
       setLoadingAction(null);
     }
@@ -55,13 +114,13 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
         <div>
           <h1 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#f8fafc' }}>Environment Health & Drift Doctor</h1>
           <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem' }}>
-            Real-time diagnostic of CLI binaries, skill installations, drift detection, and registered MCP servers across Kilo, Claude, and Codex.
+            Real-time diagnostic of CLI binaries, skill installations, drift detection, origins, and registered MCP servers across Kilo, Claude, and Codex.
           </p>
         </div>
 
-        {hasConflicts && (
+        {hasResolvableConflicts && (
           <button
-            onClick={handleResolveConflicts}
+            onClick={handleResolveConflictsPreview}
             disabled={loadingAction !== null}
             style={{
               display: 'flex',
@@ -79,10 +138,53 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
             }}
           >
             {loadingAction === 'resolve-conflicts' ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
-            <span>Auto-Resolve All Trigger Conflicts</span>
+            <span>Auto-Resolve Conflicts…</span>
           </button>
         )}
       </div>
+
+      {/* Error message banner */}
+      {errorMessage && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.5rem',
+          padding: '0.75rem 1rem',
+          borderRadius: '0.375rem',
+          marginBottom: '1.5rem',
+          backgroundColor: '#451a1a',
+          border: '1px solid #ef4444',
+          color: '#fca5a5',
+          fontSize: '0.85rem',
+        }}>
+          <AlertTriangle size={16} color="#ef4444" />
+          <span>{errorMessage}</span>
+        </div>
+      )}
+
+      {/* Stray Config Files Warning */}
+      {stray && stray.length > 0 && (
+        <div style={{
+          backgroundColor: '#3b2505',
+          border: '1px solid #f59e0b',
+          borderRadius: '0.5rem',
+          padding: '1rem',
+          marginBottom: '1.5rem',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#fef3c7', fontWeight: 600, fontSize: '0.85rem', marginBottom: '0.4rem' }}>
+            <AlertTriangle size={17} color="#f59e0b" />
+            <span>Stray Configuration Files Detected</span>
+          </div>
+          <p style={{ fontSize: '0.8rem', color: '#fde68a', margin: '0 0 0.5rem 0', lineHeight: 1.4 }}>
+            These configuration files are located in assistant directories but are ignored by the assistant's runtime. They may lead to misleading status reports:
+          </p>
+          <ul style={{ margin: 0, paddingLeft: '1.25rem', fontFamily: 'monospace', fontSize: '0.78rem', color: '#fef3c7' }}>
+            {stray.map((s, idx) => (
+              <li key={idx}>{s}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* CLIs & Repos Bar */}
       <div style={{
@@ -153,121 +255,335 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
             </div>
 
             <div style={{ padding: '1rem' }}>
-              {Object.entries(scopes).map(([scope, sinfo]) => (
-                <div key={scope} style={{ marginBottom: '1.25rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                      <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', textTransform: 'uppercase' }}>Scope: {scope}</span>
-                      <span style={{ fontSize: '0.75rem', color: '#64748b' }}>({sinfo.installed_count} skill(s))</span>
-                    </div>
-                    {sinfo.registered_mcps.length > 0 && (
-                      <span style={{ fontSize: '0.75rem', color: '#10b981' }}>
-                        MCP Servers: <strong>{sinfo.registered_mcps.join(', ')}</strong>
-                      </span>
-                    )}
-                  </div>
+              {Object.entries(scopes).map(([scope, sinfo]) => {
+                // Collect skill entries
+                const entries: SkillEntry[] = sinfo.skill_entries || Object.entries(sinfo.skills).map(([sname, sdata]) => ({
+                  name: sname,
+                  origin: 'standalone',
+                  scope,
+                  path: `${sinfo.skills_dir}/${sname}`,
+                  enabled: true,
+                  state: sdata.state,
+                }));
 
-                  {/* Conflict Banners */}
-                  {sinfo.conflicts.map((c, i) => (
-                    <div key={i} style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      gap: '0.5rem',
-                      padding: '0.6rem 0.8rem',
-                      borderRadius: '0.375rem',
-                      backgroundColor: '#451a1a',
-                      border: '1px solid #ef4444',
-                      color: '#fca5a5',
-                      fontSize: '0.8rem',
-                      marginBottom: '0.75rem',
-                    }}>
+                const structuredConflicts = sinfo.structured_conflicts || [];
+
+                return (
+                  <div key={scope} style={{ marginBottom: '1.5rem', borderBottom: '1px solid #334155', paddingBottom: '1.25rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                        <AlertTriangle size={15} color="#ef4444" />
-                        <span>{c}</span>
+                        <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#f1f5f9', textTransform: 'uppercase' }}>Scope: {scope}</span>
+                        <span style={{ fontSize: '0.75rem', color: '#64748b' }}>({entries.length} skill entry/entries)</span>
                       </div>
-                      <button
-                        onClick={handleResolveConflicts}
-                        disabled={loadingAction !== null}
-                        style={{
-                          padding: '0.2rem 0.6rem',
-                          borderRadius: '0.25rem',
-                          border: 'none',
-                          backgroundColor: '#ef4444',
-                          color: '#fff',
-                          fontWeight: 600,
-                          fontSize: '0.75rem',
-                          cursor: 'pointer',
-                          whiteSpace: 'nowrap',
-                        }}
-                      >
-                        Resolve
-                      </button>
                     </div>
-                  ))}
 
-                  {/* Skills Grid */}
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '0.4rem' }}>
-                    {Object.entries(sinfo.skills).map(([sname, sdata]) => {
-                      const isRemoving = loadingAction === `remove-${assistant}-${scope}-${sname}`;
-                      return (
+                    {/* Conflict & Advice Banners */}
+                    {structuredConflicts.length > 0 ? (
+                      structuredConflicts.map((sc, idx) => {
+                        const conflictEntries = sc.entries || [];
+                        const isAllPlugin = conflictEntries.length > 0 && conflictEntries.every((e) => e.origin?.startsWith('plugin:'));
+
+                        if (isAllPlugin) {
+                          // Render advise entries as advice (NOT as buttons)
+                          return (
+                            <div
+                              key={idx}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'flex-start',
+                                gap: '0.6rem',
+                                padding: '0.65rem 0.9rem',
+                                borderRadius: '0.375rem',
+                                backgroundColor: '#1e3a8a',
+                                border: '1px solid #3b82f6',
+                                color: '#dbeafe',
+                                fontSize: '0.8rem',
+                                marginBottom: '0.75rem',
+                              }}
+                            >
+                              <Info size={16} color="#60a5fa" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
+                              <div>
+                                <div style={{ fontWeight: 600, marginBottom: '0.2rem' }}>
+                                  Plugin Advice: {sc.kind} ({sc.names.join(', ')})
+                                </div>
+                                <div style={{ fontSize: '0.75rem', color: '#bfdbfe' }}>
+                                  Duplicate skills installed via plugins cannot be removed by the CLI. Disable the duplicate plugin in assistant settings or uninstall it.
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        // Resolvable conflict
+                        return (
+                          <div
+                            key={idx}
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center',
+                              gap: '0.5rem',
+                              padding: '0.6rem 0.8rem',
+                              borderRadius: '0.375rem',
+                              backgroundColor: '#451a1a',
+                              border: '1px solid #ef4444',
+                              color: '#fca5a5',
+                              fontSize: '0.8rem',
+                              marginBottom: '0.75rem',
+                            }}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                              <AlertTriangle size={15} color="#ef4444" />
+                              <span>
+                                <strong>{sc.kind}:</strong> {sc.names.join(', ')} conflict across origins
+                              </span>
+                            </div>
+                            <button
+                              onClick={handleResolveConflictsPreview}
+                              disabled={loadingAction !== null}
+                              style={{
+                                padding: '0.2rem 0.6rem',
+                                borderRadius: '0.25rem',
+                                border: 'none',
+                                backgroundColor: '#ef4444',
+                                color: '#fff',
+                                fontWeight: 600,
+                                fontSize: '0.75rem',
+                                cursor: 'pointer',
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              Resolve…
+                            </button>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      /* Legacy text conflicts fallback */
+                      sinfo.conflicts.map((c, idx) => (
                         <div
-                          key={sname}
+                          key={idx}
                           style={{
-                            backgroundColor: '#0f172a',
-                            border: '1px solid #334155',
-                            borderRadius: '0.25rem',
-                            padding: '0.4rem 0.6rem',
                             display: 'flex',
                             justifyContent: 'space-between',
                             alignItems: 'center',
-                            fontSize: '0.75rem',
+                            gap: '0.5rem',
+                            padding: '0.6rem 0.8rem',
+                            borderRadius: '0.375rem',
+                            backgroundColor: '#451a1a',
+                            border: '1px solid #ef4444',
+                            color: '#fca5a5',
+                            fontSize: '0.8rem',
+                            marginBottom: '0.75rem',
                           }}
                         >
-                          <span style={{ color: '#e2e8f0', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '140px' }} title={sname}>
-                            {sname}
-                          </span>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                            <span style={{
-                              fontSize: '0.65rem',
-                              fontWeight: 600,
-                              padding: '0.1rem 0.3rem',
-                              borderRadius: '0.2rem',
-                              backgroundColor: sdata.state === 'up-to-date' ? '#064e3b' : sdata.state.startsWith('obsolete') ? '#7f1d1d' : '#451a03',
-                              color: sdata.state === 'up-to-date' ? '#34d399' : sdata.state.startsWith('obsolete') ? '#fca5a5' : '#fbbf24',
-                              whiteSpace: 'nowrap',
-                            }}>
-                              {sdata.state}
-                            </span>
-                            <button
-                              onClick={() => handleRemoveSkill(assistant, scope, sname)}
-                              disabled={loadingAction !== null}
-                              title={`Remove ${sname} from ${assistant}`}
-                              style={{
-                                background: 'none',
-                                border: 'none',
-                                color: '#64748b',
-                                cursor: 'pointer',
-                                display: 'flex',
-                                alignItems: 'center',
-                                padding: '0.1rem',
-                              }}
-                              onMouseEnter={(e) => (e.currentTarget.style.color = '#ef4444')}
-                              onMouseLeave={(e) => (e.currentTarget.style.color = '#64748b')}
-                            >
-                              {isRemoving ? <Loader2 size={13} className="spin" /> : <Trash2 size={13} />}
-                            </button>
+                            <AlertTriangle size={15} color="#ef4444" />
+                            <span>{c}</span>
                           </div>
+                          <button
+                            onClick={handleResolveConflictsPreview}
+                            disabled={loadingAction !== null}
+                            style={{
+                              padding: '0.2rem 0.6rem',
+                              borderRadius: '0.25rem',
+                              border: 'none',
+                              backgroundColor: '#ef4444',
+                              color: '#fff',
+                              fontWeight: 600,
+                              fontSize: '0.75rem',
+                              cursor: 'pointer',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            Resolve…
+                          </button>
                         </div>
-                      );
-                    })}
+                      ))
+                    )}
+
+                    {/* Skills Table with Origin, Enabled, State */}
+                    <div style={{ border: '1px solid #334155', borderRadius: '0.375rem', overflow: 'hidden', marginBottom: '1rem' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.78rem' }}>
+                        <thead>
+                          <tr style={{ backgroundColor: '#0f172a', color: '#94a3b8', borderBottom: '1px solid #334155' }}>
+                            <th style={{ padding: '0.45rem 0.75rem' }}>Skill Name</th>
+                            <th style={{ padding: '0.45rem 0.75rem' }}>Origin</th>
+                            <th style={{ padding: '0.45rem 0.75rem', width: '90px' }}>Enabled</th>
+                            <th style={{ padding: '0.45rem 0.75rem', width: '130px' }}>State</th>
+                            <th style={{ padding: '0.45rem 0.75rem', width: '60px', textAlign: 'center' }}>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {entries.map((entry, idx) => {
+                            const isPlugin = entry.origin.startsWith('plugin:');
+                            const isRemoving = loadingAction === `remove-${assistant}-${scope}-${entry.name}`;
+
+                            return (
+                              <tr
+                                key={idx}
+                                style={{
+                                  borderBottom: idx === entries.length - 1 ? 'none' : '1px solid #334155',
+                                  backgroundColor: idx % 2 === 0 ? '#1e293b' : '#182234',
+                                }}
+                              >
+                                <td style={{ padding: '0.45rem 0.75rem', fontWeight: 600, color: '#f1f5f9' }}>
+                                  {entry.name}
+                                </td>
+                                <td style={{ padding: '0.45rem 0.75rem', fontFamily: 'monospace', color: '#a5b4fc', fontSize: '0.75rem' }}>
+                                  {entry.origin}
+                                </td>
+                                <td style={{ padding: '0.45rem 0.75rem' }}>
+                                  <span style={{
+                                    fontSize: '0.65rem',
+                                    fontWeight: 700,
+                                    padding: '0.1rem 0.35rem',
+                                    borderRadius: '0.2rem',
+                                    backgroundColor: entry.enabled ? '#064e3b' : '#334155',
+                                    color: entry.enabled ? '#34d399' : '#94a3b8',
+                                    textTransform: 'uppercase',
+                                  }}>
+                                    {entry.enabled ? 'Enabled' : 'Disabled'}
+                                  </span>
+                                </td>
+                                <td style={{ padding: '0.45rem 0.75rem' }}>
+                                  <span style={{
+                                    fontSize: '0.65rem',
+                                    fontWeight: 600,
+                                    padding: '0.1rem 0.35rem',
+                                    borderRadius: '0.2rem',
+                                    backgroundColor:
+                                      entry.state === 'up-to-date'
+                                        ? '#064e3b'
+                                        : entry.state === 'plugin'
+                                        ? '#1e3a8a'
+                                        : entry.state.startsWith('obsolete')
+                                        ? '#7f1d1d'
+                                        : '#451a03',
+                                    color:
+                                      entry.state === 'up-to-date'
+                                        ? '#34d399'
+                                        : entry.state === 'plugin'
+                                        ? '#93c5fd'
+                                        : entry.state.startsWith('obsolete')
+                                        ? '#fca5a5'
+                                        : '#fbbf24',
+                                  }}>
+                                    {entry.state}
+                                  </span>
+                                </td>
+                                <td style={{ padding: '0.45rem 0.75rem', textAlign: 'center' }}>
+                                  {!isPlugin ? (
+                                    <button
+                                      onClick={() => handleRemoveSkillPreview(assistant, scope, entry.name)}
+                                      disabled={loadingAction !== null}
+                                      title={`Remove ${entry.name} from ${assistant}`}
+                                      style={{
+                                        background: 'none',
+                                        border: 'none',
+                                        color: '#94a3b8',
+                                        cursor: 'pointer',
+                                        padding: '0.15rem',
+                                      }}
+                                      onMouseEnter={(e) => (e.currentTarget.style.color = '#ef4444')}
+                                      onMouseLeave={(e) => (e.currentTarget.style.color = '#94a3b8')}
+                                    >
+                                      {isRemoving ? <Loader2 size={14} className="spin" /> : <Trash2 size={14} />}
+                                    </button>
+                                  ) : (
+                                    <span title="Installed via plugin; managed in settings.json" style={{ color: '#475569', fontSize: '0.7rem' }}>
+                                      plugin
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          {entries.length === 0 && (
+                            <tr>
+                              <td colSpan={5} style={{ padding: '0.75rem', textAlign: 'center', color: '#64748b' }}>
+                                No skills installed in this scope.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* MCP Servers with Provenance */}
+                    <div>
+                      <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '0.4rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                        <FileCode size={14} color="#10b981" />
+                        <span>Registered MCP Servers & Provenance</span>
+                      </div>
+
+                      {sinfo.mcp_servers && Object.keys(sinfo.mcp_servers).length > 0 ? (
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '0.5rem' }}>
+                          {Object.entries(sinfo.mcp_servers).map(([sname, sinfoObj]) => (
+                            <div
+                              key={sname}
+                              style={{
+                                backgroundColor: '#0f172a',
+                                border: '1px solid #334155',
+                                borderRadius: '0.375rem',
+                                padding: '0.5rem 0.75rem',
+                                fontSize: '0.75rem',
+                              }}
+                            >
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.2rem' }}>
+                                <span style={{ fontWeight: 600, color: '#f8fafc' }}>{sname}</span>
+                                <span style={{ fontSize: '0.65rem', color: '#10b981', fontWeight: 600, textTransform: 'uppercase' }}>Active</span>
+                              </div>
+                              <div style={{ color: '#94a3b8', fontSize: '0.7rem', wordBreak: 'break-all' }}>
+                                Provenance: <span style={{ fontFamily: 'monospace', color: '#cbd5e1' }}>{sinfoObj.provenance}</span>
+                              </div>
+                              {sinfoObj.overrides && sinfoObj.overrides.length > 0 && (
+                                <div style={{ color: '#f59e0b', fontSize: '0.68rem', marginTop: '0.15rem' }}>
+                                  Overrides: {sinfoObj.overrides.join(', ')}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ) : sinfo.registered_mcps && sinfo.registered_mcps.length > 0 ? (
+                        <div style={{ fontSize: '0.75rem', color: '#cbd5e1' }}>
+                          {sinfo.registered_mcps.join(', ')}
+                          {sinfo.mcp_config_path && (
+                            <span style={{ color: '#64748b', marginLeft: '0.5rem' }}>
+                              (Config: {sinfo.mcp_config_path})
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                          No MCP servers registered in this scope.
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         ))}
       </div>
+
+      {/* Confirmation Modal */}
+      {confirmData && (
+        <ConfirmDialog
+          isOpen={true}
+          title={confirmData.title}
+          summary={confirmData.summary}
+          plan={confirmData.plan}
+          diff={confirmData.diff}
+          warnings={confirmData.warnings}
+          hash={confirmData.hash}
+          applyButtonText="Confirm & Apply"
+          onApply={confirmData.onApplyAction}
+          onCancel={() => setConfirmData(null)}
+          onRefetchPreview={confirmData.onRefetchAction}
+        />
+      )}
     </div>
   );
 };
