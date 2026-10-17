@@ -93,6 +93,37 @@ The control plane implements strict local isolation and defense against cross-si
 
 ---
 
+## REST API & Control Plane Endpoints
+
+All mutating actions enforce a **preview → apply** pattern with cryptographic hash preconditions to prevent race conditions and lost edits across concurrent sessions. Stale preconditions return `HTTP 409 Conflict`, validation errors return `HTTP 400 Bad Request`, and subprocess timeouts return `HTTP 504 Gateway Timeout`.
+
+### 1. Task Backlog & Index
+- `GET /api/tasks` — List emergent tasks and initiatives (`bundle_sha256` included).
+- `GET /api/tasks/validate` — Validate task header schema, DAG acyclicity, and required sections.
+- `POST /api/tasks/transition` — Transition task state (`task_id`, `new_state`, optional `expect_task_hash`, `actor`, `verifier`, `reason`). **Transitions no longer write `00-INDEX.md`**; the response returns `index_in_sync` (via `sync-index --check`). Stale task hash returns `HTTP 409`.
+- `GET /api/tasks/sync-index/preview` — Preview index changes without modifying disk, returning `{diff, hash, in_sync}`.
+- `POST /api/tasks/sync-index` — Apply deterministic index updates, requiring `{expect_hash}`. Stale hash returns `HTTP 409`.
+- `GET /api/tasks/{task_id}` — Retrieve markdown content and progress for a task.
+
+### 2. Environment Doctor & Skills Management
+For all mutating environment commands, the API provides preview/apply endpoint pairs. The apply endpoint strictly requires `expect_plan_hash` (missing hash returns `HTTP 400`, stale hash returns `HTTP 409`):
+- `GET /api/env/status` — CLI readiness (`kilo`, `claude`, `codex`), skill entries, MCP provenance, and conflict diagnostics.
+- `POST /api/env/install-skills/preview` & `POST /api/env/install-skills` — Preview installation plan (`{plan, plan_hash}`) and apply with `{expect_plan_hash}`.
+- `POST /api/env/remove-skill/preview` & `POST /api/env/remove-skill` — Preview removal plan and apply with `{expect_plan_hash}`.
+- `POST /api/env/resolve-conflicts/preview` & `POST /api/env/resolve-conflicts` — Preview conflict resolution plan and apply with `{expect_plan_hash}`.
+- `POST /api/env/register-mcp/preview` & `POST /api/env/register-mcp` — Preview MCP registration and apply with `{expect_plan_hash}` (`provision_venv` supported).
+- `POST /api/env/fetch-repos/preview` & `POST /api/env/fetch-repos` — Preview repository fetch plan and apply with `{expect_plan_hash}`.
+
+### 3. Orchestrator Configuration & AGENTS.md
+- `GET /api/config/show` — Inspect merged global and project `orchestration.toml`.
+- `POST /api/config/set-profile/preview` & `POST /api/config/set-profile` — Preview configuration diff (`{diff, hash}`) and apply with required `{expect_hash}`.
+- `POST /api/config/set-routing/preview` & `POST /api/config/set-routing` — Preview routing diff (`{diff, hash}`) and apply with required `{expect_hash}`.
+- `GET /api/config/render-agents-md` — Return rendered markdown block.
+- `GET /api/config/render-agents-md/preview` — Preview unified diff of `AGENTS.md` (`{diff, hash, warnings}`).
+- `POST /api/config/render-agents-md/apply` — Apply `AGENTS.md` updates, requiring `{expect_hash, allow_global_routing?: bool}`. Stale hash or missing project config without `allow_global_routing` returns `HTTP 409`.
+
+---
+
 ## Development
 
 ### Running the Backend Tests

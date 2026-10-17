@@ -49,7 +49,15 @@ def get_ai_orch_bin() -> pathlib.Path:
 def get_config_dir() -> pathlib.Path:
     if "AI_ORCH_CONFIG_DIR" in os.environ and os.environ["AI_ORCH_CONFIG_DIR"].strip():
         return pathlib.Path(os.environ["AI_ORCH_CONFIG_DIR"]).expanduser().resolve()
+    if "AI_ORCH_HOME" in os.environ and os.environ["AI_ORCH_HOME"].strip():
+        return (pathlib.Path(os.environ["AI_ORCH_HOME"]).expanduser() / ".config" / "ai-orchestration").resolve()
     return pathlib.Path.home() / ".config" / "ai-orchestration"
+
+
+def get_ai_orch_home() -> pathlib.Path | None:
+    if "AI_ORCH_HOME" in os.environ and os.environ["AI_ORCH_HOME"].strip():
+        return pathlib.Path(os.environ["AI_ORCH_HOME"]).expanduser().resolve()
+    return None
 
 
 def get_initial_workspace() -> pathlib.Path:
@@ -238,16 +246,26 @@ async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[in
     if not bin_path.is_file():
         return 1, f"ai-orch CLI not found at {bin_path}"
 
+    cmd_args = list(args)
+    if cmd_args and cmd_args[0] == "env":
+        home = get_ai_orch_home()
+        if home and "--home" not in cmd_args:
+            cmd_args = ["env", "--home", str(home), *cmd_args[1:]]
+
     if os.access(bin_path, os.X_OK):
-        cmd = [str(bin_path), *args]
+        cmd = [str(bin_path), *cmd_args]
     else:
-        cmd = [sys.executable, str(bin_path), *args]
+        cmd = [sys.executable, str(bin_path), *cmd_args]
 
     if timeout is None:
-        if any(action in args for action in ("install-skills", "register-mcp")):
+        if any(action in cmd_args for action in ("install-skills", "register-mcp")):
             timeout = 600.0
         else:
             timeout = 60.0
+
+    env = dict(os.environ)
+    if "AI_ORCHESTRATION_CONFIG" not in env:
+        env["AI_ORCHESTRATION_CONFIG"] = str(get_config_dir() / "orchestration.toml")
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -255,6 +273,7 @@ async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[in
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            env=env,
         )
     except Exception as exc:
         return 1, f"Failed to execute CLI command: {exc}"
@@ -275,6 +294,47 @@ async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[in
         return proc.returncode, parsed
     except Exception:
         return proc.returncode, out or err
+
+
+def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int:
+    """Map CLI exit codes and output errors to HTTP status codes."""
+    if code == 0:
+        return 200
+    if code == 504:
+        return 504
+
+    err_str = ""
+    if isinstance(data, dict):
+        if data.get("error") == "stale-task":
+            return 409
+        err_val = data.get("error") or data.get("message") or ""
+        err_str = str(err_val).lower()
+    elif isinstance(data, str):
+        err_str = data.lower()
+
+    if (
+        "hash mismatch" in err_str
+        or "plan hash mismatch" in err_str
+        or "stale" in err_str
+        or "refusing to apply" in err_str
+        or "workspace has no project config" in err_str
+        or "no project config" in err_str
+    ):
+        return 409
+
+    if (
+        "required" in err_str
+        or "invalid" in err_str
+        or "unknown" in err_str
+        or "unrecognized" in err_str
+        or "not found" in err_str
+        or "validation" in err_str
+        or "illegal transition" in err_str
+        or "cannot transition" in err_str
+    ):
+        return 400
+
+    return default_error_status
 
 
 # ---------------------------------------------------------------------------
@@ -498,34 +558,70 @@ async def api_validate_tasks(request: Request) -> JSONResponse:
 
 
 async def api_transition_task(request: Request) -> JSONResponse:
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     task_id = body.get("task_id")
     new_state = body.get("new_state")
     if not task_id or not new_state:
         return JSONResponse({"error": "task_id and new_state are required"}, status_code=400)
 
-    cmd = ["tasks", "transition", str(task_id), str(new_state), "--tasks-dir", str(state.workspace / "tasks"), "--json"]
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "transition", str(task_id), str(new_state), "--tasks-dir", str(tasks_dir), "--json"]
     if body.get("actor"):
         cmd.extend(["--actor", str(body["actor"])])
     if body.get("verifier"):
         cmd.extend(["--verifier", str(body["verifier"])])
     if body.get("reason"):
         cmd.extend(["--reason", str(body["reason"])])
+    if body.get("expect_task_hash"):
+        cmd.extend(["--expect-task-hash", str(body["expect_task_hash"])])
 
     code, data = await run_ai_orch(cmd)
     if code == 0:
-        await run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(state.workspace / "tasks"), "--apply", "--json"])
+        # Check index in_sync status without modifying index
+        check_code, check_data = await run_ai_orch(
+            ["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--check", "--json"]
+        )
+        in_sync = check_data.get("in_sync", False) if isinstance(check_data, dict) else False
+        if isinstance(data, dict):
+            data["index_in_sync"] = in_sync
+
         await state.broadcast({"type": "task_transitioned", "task_id": task_id, "new_state": new_state})
-    status_code = 504 if code == 504 else (200 if code == 0 else 400)
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True, "index_in_sync": in_sync}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_sync_index(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    code, data = await run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--check", "--json"])
+    if code == 504:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=504)
+    if isinstance(data, dict) and "in_sync" in data:
+        return JSONResponse(data, status_code=200)
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_sync_index(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_hash = body.get("expect_hash")
+    if not expect_hash:
+        return JSONResponse({"error": "expect_hash is required"}, status_code=400)
+
     tasks_dir = state.workspace / "tasks"
-    code, data = await run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--apply", "--json"])
+    cmd = ["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--apply", "--expect-hash", str(expect_hash), "--json"]
+    code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "index_synced"})
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+        return JSONResponse(data if isinstance(data, dict) else {"applied": True}, status_code=200)
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
@@ -566,33 +662,112 @@ async def api_env_status(request: Request) -> JSONResponse:
     return JSONResponse(data)
 
 
-async def api_install_skills(request: Request) -> JSONResponse:
-    body = await request.json()
+async def api_preview_install_skills(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     assistants = body.get("assistants", ["all"])
     scope = body.get("scope", "global")
     repo = body.get("repo", "ai-orchestration")
     link = body.get("link", False)
+    plugins = body.get("plugins")
+    overwrite = body.get("overwrite")
 
-    cmd = ["env", "install-skills", "--scope", scope, "--repo", repo, "--workspace", str(state.workspace), "--json"]
+    cmd = ["env", "install-skills", "--scope", scope, "--repo", repo, "--workspace", str(state.workspace), "--dry-run", "--json"]
     cmd.extend(["--assistants", *assistants])
     if link:
         cmd.append("--link")
+    if plugins:
+        cmd.extend(["--plugins", *plugins])
+    if overwrite:
+        cmd.extend(["--overwrite", *overwrite])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_install_skills(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_plan_hash = body.get("expect_plan_hash")
+    if not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    assistants = body.get("assistants", ["all"])
+    scope = body.get("scope", "global")
+    repo = body.get("repo", "ai-orchestration")
+    link = body.get("link", False)
+    plugins = body.get("plugins")
+    overwrite = body.get("overwrite")
+
+    cmd = [
+        "env", "install-skills",
+        "--scope", scope,
+        "--repo", repo,
+        "--workspace", str(state.workspace),
+        "--expect-plan-hash", str(expect_plan_hash),
+        "--json",
+    ]
+    cmd.extend(["--assistants", *assistants])
+    if link:
+        cmd.append("--link")
+    if plugins:
+        cmd.extend(["--plugins", *plugins])
+    if overwrite:
+        cmd.extend(["--overwrite", *overwrite])
 
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "skills_installed", "repo": repo, "scope": scope})
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
-async def api_register_mcp(request: Request) -> JSONResponse:
-    body = await request.json()
+async def api_preview_register_mcp(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     server = body.get("server", "kilo-mcp")
     assistants = body.get("assistants", ["claude", "codex"])
     scope = body.get("scope", "global")
     provision_venv = body.get("provision_venv", False)
 
-    cmd = ["env", "register-mcp", server, "--scope", scope, "--workspace", str(state.workspace), "--json"]
+    cmd = ["env", "register-mcp", server, "--scope", scope, "--workspace", str(state.workspace), "--dry-run", "--json"]
+    cmd.extend(["--assistants", *assistants])
+    if provision_venv:
+        cmd.append("--provision-venv")
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_register_mcp(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_plan_hash = body.get("expect_plan_hash")
+    if not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    server = body.get("server", "kilo-mcp")
+    assistants = body.get("assistants", ["claude", "codex"])
+    scope = body.get("scope", "global")
+    provision_venv = body.get("provision_venv", False)
+
+    cmd = [
+        "env", "register-mcp", server,
+        "--scope", scope,
+        "--workspace", str(state.workspace),
+        "--expect-plan-hash", str(expect_plan_hash),
+        "--json",
+    ]
     cmd.extend(["--assistants", *assistants])
     if provision_venv:
         cmd.append("--provision-venv")
@@ -600,32 +775,110 @@ async def api_register_mcp(request: Request) -> JSONResponse:
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "mcp_registered", "server": server})
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
-async def api_remove_skill(request: Request) -> JSONResponse:
-    body = await request.json()
+async def api_preview_remove_skill(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     skill = body.get("skill")
     assistant = body.get("assistant")
     scope = body.get("scope", "global")
     if not skill or not assistant:
         return JSONResponse({"error": "skill and assistant are required"}, status_code=400)
 
-    cmd = ["env", "remove-skill", str(skill), "--assistant", str(assistant), "--scope", scope, "--workspace", str(state.workspace), "--json"]
+    cmd = ["env", "remove-skill", str(skill), "--assistant", str(assistant), "--scope", scope, "--workspace", str(state.workspace), "--dry-run", "--json"]
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_remove_skill(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_plan_hash = body.get("expect_plan_hash")
+    if not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    skill = body.get("skill")
+    assistant = body.get("assistant")
+    scope = body.get("scope", "global")
+    if not skill or not assistant:
+        return JSONResponse({"error": "skill and assistant are required"}, status_code=400)
+
+    cmd = [
+        "env", "remove-skill", str(skill),
+        "--assistant", str(assistant),
+        "--scope", scope,
+        "--workspace", str(state.workspace),
+        "--expect-plan-hash", str(expect_plan_hash),
+        "--json",
+    ]
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "skill_removed", "skill": skill, "assistant": assistant})
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_resolve_conflicts(request: Request) -> JSONResponse:
+    cmd = ["env", "resolve-conflicts", "--workspace", str(state.workspace), "--dry-run", "--json"]
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_resolve_conflicts(request: Request) -> JSONResponse:
-    cmd = ["env", "resolve-conflicts", "--workspace", str(state.workspace), "--json"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_plan_hash = body.get("expect_plan_hash")
+    if not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    cmd = ["env", "resolve-conflicts", "--workspace", str(state.workspace), "--expect-plan-hash", str(expect_plan_hash), "--json"]
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "conflicts_resolved"})
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_fetch_repos(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = ["env", "fetch-repos", "--dry-run", "--json"]
+    if body.get("repos"):
+        cmd.extend(["--repos", *body["repos"]])
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_fetch_repos(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_plan_hash = body.get("expect_plan_hash")
+    if not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    cmd = ["env", "fetch-repos", "--expect-plan-hash", str(expect_plan_hash), "--json"]
+    if body.get("repos"):
+        cmd.extend(["--repos", *body["repos"]])
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "repos_fetched"})
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
@@ -640,15 +893,50 @@ async def api_config_show(request: Request) -> JSONResponse:
     return JSONResponse(data)
 
 
-async def api_config_set_profile(request: Request) -> JSONResponse:
-    body = await request.json()
+async def api_preview_config_set_profile(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     tool = body.get("tool")
     profile = body.get("profile")
     model = body.get("model")
     if not tool or not profile or not model:
         return JSONResponse({"error": "tool, profile, and model are required"}, status_code=400)
 
-    cmd = ["config", "set-profile", tool, profile, "--model", model, "--json"]
+    cmd = ["config", "set-profile", tool, profile, "--model", model, "--diff", "--json"]
+    if body.get("variant"):
+        cmd.extend(["--variant", str(body["variant"])])
+    if body.get("effort"):
+        cmd.extend(["--effort", str(body["effort"])])
+    if body.get("basis"):
+        cmd.extend(["--basis", str(body["basis"])])
+    if body.get("scope"):
+        cmd.extend(["--scope", str(body["scope"])])
+    if body.get("scope") == "project":
+        cmd.extend(["--workspace", str(state.workspace)])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_config_set_profile(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_hash = body.get("expect_hash")
+    if not expect_hash:
+        return JSONResponse({"error": "expect_hash is required"}, status_code=400)
+
+    tool = body.get("tool")
+    profile = body.get("profile")
+    model = body.get("model")
+    if not tool or not profile or not model:
+        return JSONResponse({"error": "tool, profile, and model are required"}, status_code=400)
+
+    cmd = ["config", "set-profile", tool, profile, "--model", model, "--expect-hash", str(expect_hash), "--json"]
     if body.get("variant"):
         cmd.extend(["--variant", str(body["variant"])])
     if body.get("effort"):
@@ -663,21 +951,97 @@ async def api_config_set_profile(request: Request) -> JSONResponse:
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "config_updated"})
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_config_set_routing(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    scope = body.get("scope", "global")
+    cmd = ["config", "set-routing", "--scope", scope, "--diff", "--json"]
+    if scope == "project":
+        cmd.extend(["--workspace", str(state.workspace)])
+    if body.get("orchestrator"):
+        cmd.extend(["--orchestrator", str(body["orchestrator"])])
+    if body.get("executor"):
+        cmd.extend(["--executor", str(body["executor"])])
+    if body.get("default_profile"):
+        cmd.extend(["--default-profile", str(body["default_profile"])])
+    if body.get("verification_mode"):
+        cmd.extend(["--verification-mode", str(body["verification_mode"])])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_config_set_routing(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_hash = body.get("expect_hash")
+    if not expect_hash:
+        return JSONResponse({"error": "expect_hash is required"}, status_code=400)
+
+    scope = body.get("scope", "global")
+    cmd = ["config", "set-routing", "--scope", scope, "--expect-hash", str(expect_hash), "--json"]
+    if scope == "project":
+        cmd.extend(["--workspace", str(state.workspace)])
+    if body.get("orchestrator"):
+        cmd.extend(["--orchestrator", str(body["orchestrator"])])
+    if body.get("executor"):
+        cmd.extend(["--executor", str(body["executor"])])
+    if body.get("default_profile"):
+        cmd.extend(["--default-profile", str(body["default_profile"])])
+    if body.get("verification_mode"):
+        cmd.extend(["--verification-mode", str(body["verification_mode"])])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "config_updated"})
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_render_agents_md(request: Request) -> JSONResponse:
     code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--json"])
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_agents_md(request: Request) -> JSONResponse:
+    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--diff", "--json"])
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_apply_agents_md(request: Request) -> JSONResponse:
-    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--apply", "--json"])
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_hash = body.get("expect_hash")
+    if not expect_hash:
+        return JSONResponse({"error": "expect_hash is required"}, status_code=400)
+
+    cmd = [
+        "render-agents-md",
+        "--workspace", str(state.workspace),
+        "--apply",
+        "--expect-hash", str(expect_hash),
+        "--json",
+    ]
+    if body.get("allow_global_routing"):
+        cmd.append("--allow-global-routing")
+
+    code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "agents_md_applied"})
-    status_code = 504 if code == 504 else (200 if code == 0 else 500)
+    status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
@@ -709,16 +1073,27 @@ routes = [
     Route("/api/tasks", api_list_tasks, methods=["GET"]),
     Route("/api/tasks/validate", api_validate_tasks, methods=["GET"]),
     Route("/api/tasks/transition", api_transition_task, methods=["POST"]),
+    Route("/api/tasks/sync-index/preview", api_preview_sync_index, methods=["GET"]),
     Route("/api/tasks/sync-index", api_sync_index, methods=["POST"]),
     Route("/api/tasks/{task_id}", api_get_task_detail, methods=["GET"]),
     Route("/api/env/status", api_env_status, methods=["GET"]),
+    Route("/api/env/install-skills/preview", api_preview_install_skills, methods=["POST"]),
     Route("/api/env/install-skills", api_install_skills, methods=["POST"]),
+    Route("/api/env/register-mcp/preview", api_preview_register_mcp, methods=["POST"]),
     Route("/api/env/register-mcp", api_register_mcp, methods=["POST"]),
+    Route("/api/env/remove-skill/preview", api_preview_remove_skill, methods=["POST"]),
     Route("/api/env/remove-skill", api_remove_skill, methods=["POST"]),
+    Route("/api/env/resolve-conflicts/preview", api_preview_resolve_conflicts, methods=["POST"]),
     Route("/api/env/resolve-conflicts", api_resolve_conflicts, methods=["POST"]),
+    Route("/api/env/fetch-repos/preview", api_preview_fetch_repos, methods=["POST"]),
+    Route("/api/env/fetch-repos", api_fetch_repos, methods=["POST"]),
     Route("/api/config/show", api_config_show, methods=["GET"]),
+    Route("/api/config/set-profile/preview", api_preview_config_set_profile, methods=["POST"]),
     Route("/api/config/set-profile", api_config_set_profile, methods=["POST"]),
+    Route("/api/config/set-routing/preview", api_preview_config_set_routing, methods=["POST"]),
+    Route("/api/config/set-routing", api_config_set_routing, methods=["POST"]),
     Route("/api/config/render-agents-md", api_render_agents_md, methods=["GET"]),
+    Route("/api/config/render-agents-md/preview", api_preview_agents_md, methods=["GET"]),
     Route("/api/config/render-agents-md/apply", api_apply_agents_md, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ]

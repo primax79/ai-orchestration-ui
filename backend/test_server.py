@@ -368,3 +368,374 @@ async def test_process_group_cleanup_on_cancellation(monkeypatch, tmp_path):
 
     with pytest.raises(ProcessLookupError):
         os.kill(grandchild_pid, 0)
+
+
+def test_task_transition_leaves_index_identical_and_reports_in_sync(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    fixture_src = pathlib.Path("/Users/Alfredo/works/ai-coding-tools/ai-orchestration/plugins/architect-side/skills/task-pipeline/scripts/fixtures/index-regression")
+    import shutil
+    tasks_dir = tmp_path / "tasks"
+    shutil.copytree(fixture_src, tasks_dir)
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        index_file = tasks_dir / "00-INDEX.md"
+        initial_index_bytes = index_file.read_bytes()
+
+        # 1. Successful transition: does NOT run sync-index --apply, leaves 00-INDEX.md byte-identical
+        res = client.post(
+            "/api/tasks/transition",
+            headers={"X-AI-Orch-Token": token},
+            json={"task_id": "T012", "new_state": "in progress"},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("ok") is True
+        assert data.get("new_state") == "in progress"
+        assert "index_in_sync" in data
+        assert data["index_in_sync"] is False
+
+        # Verify index was not updated on disk
+        assert index_file.read_bytes() == initial_index_bytes
+
+        # 2. Stale task hash refusal -> 409 with CLI error body
+        res_stale = client.post(
+            "/api/tasks/transition",
+            headers={"X-AI-Orch-Token": token},
+            json={"task_id": "T012", "new_state": "open", "expect_task_hash": "badhash123"},
+        )
+        assert res_stale.status_code == 409
+        stale_data = res_stale.json()
+        assert stale_data.get("ok") is False
+        assert stale_data.get("error") == "stale-task"
+        assert stale_data.get("expected") == "badhash123"
+        assert "actual" in stale_data
+
+        # Index still unmodified
+        assert index_file.read_bytes() == initial_index_bytes
+    finally:
+        state.workspace = old_ws
+
+
+def test_sync_index_preview_and_apply_roundtrip(monkeypatch, tmp_path):
+    fixture_src = pathlib.Path("/Users/Alfredo/works/ai-coding-tools/ai-orchestration/plugins/architect-side/skills/task-pipeline/scripts/fixtures/index-regression")
+    import shutil
+    tasks_dir = tmp_path / "tasks"
+    shutil.copytree(fixture_src, tasks_dir)
+
+    bin_path = os.environ.get("AI_ORCH_BIN", "/Users/Alfredo/works/ai-coding-tools/ai-orchestration/bin/ai-orch")
+    import subprocess
+    p1 = subprocess.run([bin_path, "tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--adopt", "--json"], capture_output=True, text=True)
+    import json
+    h = json.loads(p1.stdout)["hash"]
+    subprocess.run([bin_path, "tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--adopt", "--apply", "--expect-hash", h, "--json"], capture_output=True, text=True)
+
+    token = get_or_create_token()
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # First transition T012 to 'in progress' so index is out of sync
+        client.post(
+            "/api/tasks/transition",
+            headers={"X-AI-Orch-Token": token},
+            json={"task_id": "T012", "new_state": "in progress"},
+        )
+
+        # 1. Preview sync-index
+        prev_res = client.get(
+            "/api/tasks/sync-index/preview",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert prev_res.status_code == 200
+        prev_data = prev_res.json()
+        assert "diff" in prev_data
+        assert "hash" in prev_data
+        assert "in_sync" in prev_data
+        assert prev_data["in_sync"] is False
+        assert prev_data["diff"] != ""
+        current_hash = prev_data["hash"]
+
+        # 2. Apply without expect_hash -> 400
+        bad_apply = client.post(
+            "/api/tasks/sync-index",
+            headers={"X-AI-Orch-Token": token},
+            json={},
+        )
+        assert bad_apply.status_code == 400
+        assert "expect_hash is required" in bad_apply.json().get("error", "")
+
+        # 3. Apply with stale/mismatched hash -> 409
+        stale_apply = client.post(
+            "/api/tasks/sync-index",
+            headers={"X-AI-Orch-Token": token},
+            json={"expect_hash": "deadbeef" * 8},
+        )
+        assert stale_apply.status_code == 409
+        assert "hash mismatch" in stale_apply.json().get("error", "").lower()
+
+        # 4. Apply with correct hash -> 200
+        ok_apply = client.post(
+            "/api/tasks/sync-index",
+            headers={"X-AI-Orch-Token": token},
+            json={"expect_hash": current_hash},
+        )
+        assert ok_apply.status_code == 200
+        assert ok_apply.json().get("applied") is True
+
+        # 5. Subsequent preview shows in_sync = True
+        post_prev = client.get(
+            "/api/tasks/sync-index/preview",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert post_prev.status_code == 200
+        assert post_prev.json().get("in_sync") is True
+    finally:
+        state.workspace = old_ws
+
+
+def test_install_skills_preview_and_apply_in_fake_home(monkeypatch, tmp_path):
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    fake_config = tmp_path / "fake_config"
+    fake_config.mkdir()
+
+    monkeypatch.setenv("AI_ORCH_HOME", str(fake_home))
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(fake_config))
+    token = get_or_create_token()
+
+    # 1. Missing expect_plan_hash on apply -> 400
+    res_no_hash = client.post(
+        "/api/env/install-skills",
+        headers={"X-AI-Orch-Token": token},
+        json={"assistants": ["kilo"], "scope": "global"},
+    )
+    assert res_no_hash.status_code == 400
+    assert "expect_plan_hash is required" in res_no_hash.json().get("error", "")
+
+    # 2. Preview install-skills -> 200 with plan and plan_hash
+    res_prev = client.post(
+        "/api/env/install-skills/preview",
+        headers={"X-AI-Orch-Token": token},
+        json={"assistants": ["kilo"], "scope": "global", "repo": "ai-orchestration"},
+    )
+    assert res_prev.status_code == 200
+    prev_data = res_prev.json()
+    assert prev_data.get("ok") is True
+    assert "plan" in prev_data
+    assert "plan_hash" in prev_data
+    plan_hash = prev_data["plan_hash"]
+
+    # Nothing installed yet
+    assert not (fake_home / ".kilo" / "skills" / "orchestration-workflow").exists()
+
+    # 3. Apply with stale expect_plan_hash -> 409
+    res_stale = client.post(
+        "/api/env/install-skills",
+        headers={"X-AI-Orch-Token": token},
+        json={"assistants": ["kilo"], "scope": "global", "repo": "ai-orchestration", "expect_plan_hash": "badhash123"},
+    )
+    assert res_stale.status_code == 409
+    assert "plan hash mismatch" in res_stale.json().get("error", "").lower()
+
+    # 4. Apply with matching plan_hash -> 200
+    res_apply = client.post(
+        "/api/env/install-skills",
+        headers={"X-AI-Orch-Token": token},
+        json={"assistants": ["kilo"], "scope": "global", "repo": "ai-orchestration", "expect_plan_hash": plan_hash},
+    )
+    assert res_apply.status_code == 200
+    apply_data = res_apply.json()
+    assert apply_data.get("ok") is True
+    assert (fake_home / ".kilo" / "skills" / "orchestration-workflow").exists()
+
+
+def test_env_mutating_commands_missing_and_stale_plan_hash(monkeypatch, tmp_path):
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    fake_config = tmp_path / "fake_config"
+    fake_config.mkdir()
+
+    monkeypatch.setenv("AI_ORCH_HOME", str(fake_home))
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(fake_config))
+    token = get_or_create_token()
+
+    # All mutating env endpoints reject missing expect_plan_hash with 400
+    for endpoint, payload in [
+        ("/api/env/remove-skill", {"skill": "foo", "assistant": "kilo"}),
+        ("/api/env/resolve-conflicts", {}),
+        ("/api/env/register-mcp", {"server": "kilo-mcp"}),
+        ("/api/env/fetch-repos", {}),
+    ]:
+        res = client.post(endpoint, headers={"X-AI-Orch-Token": token}, json=payload)
+        assert res.status_code == 400
+        assert "expect_plan_hash is required" in res.json().get("error", "")
+
+    # Preview and stale hash on resolve-conflicts
+    res_prev = client.post(
+        "/api/env/resolve-conflicts/preview",
+        headers={"X-AI-Orch-Token": token},
+        json={},
+    )
+    assert res_prev.status_code == 200
+    assert "plan_hash" in res_prev.json()
+
+    res_stale = client.post(
+        "/api/env/resolve-conflicts",
+        headers={"X-AI-Orch-Token": token},
+        json={"expect_plan_hash": "deadbeef" * 8},
+    )
+    assert res_stale.status_code == 409
+
+
+def test_config_set_routing_preview_and_apply(monkeypatch, tmp_path):
+    fake_config = tmp_path / "fake_config"
+    fake_config.mkdir()
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(fake_config))
+    token = get_or_create_token()
+
+    # 1. Preview set-routing
+    res_prev = client.post(
+        "/api/config/set-routing/preview",
+        headers={"X-AI-Orch-Token": token},
+        json={"scope": "global", "orchestrator": "kilo"},
+    )
+    assert res_prev.status_code == 200
+    prev_data = res_prev.json()
+    assert "diff" in prev_data
+    assert "hash" in prev_data
+    target_hash = prev_data["hash"]
+
+    # 2. Apply without expect_hash -> 400
+    res_no_hash = client.post(
+        "/api/config/set-routing",
+        headers={"X-AI-Orch-Token": token},
+        json={"scope": "global", "orchestrator": "kilo"},
+    )
+    assert res_no_hash.status_code == 400
+    assert "expect_hash is required" in res_no_hash.json().get("error", "")
+
+    # 3. Apply with stale expect_hash -> 409
+    res_stale = client.post(
+        "/api/config/set-routing",
+        headers={"X-AI-Orch-Token": token},
+        json={"scope": "global", "orchestrator": "kilo", "expect_hash": "badhash123"},
+    )
+    assert res_stale.status_code == 409
+    assert "hash mismatch" in res_stale.json().get("error", "").lower()
+
+    # 4. Apply with valid hash -> 200
+    res_ok = client.post(
+        "/api/config/set-routing",
+        headers={"X-AI-Orch-Token": token},
+        json={"scope": "global", "orchestrator": "kilo", "expect_hash": target_hash},
+    )
+    assert res_ok.status_code == 200
+    assert res_ok.json().get("ok") is True
+
+
+def test_config_set_profile_preview_and_apply(monkeypatch, tmp_path):
+    fake_config = tmp_path / "fake_config"
+    fake_config.mkdir()
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(fake_config))
+    token = get_or_create_token()
+
+    # 1. Preview set-profile
+    res_prev = client.post(
+        "/api/config/set-profile/preview",
+        headers={"X-AI-Orch-Token": token},
+        json={"tool": "kilo", "profile": "deep-reasoning", "model": "google/gemini-4-argon", "scope": "global"},
+    )
+    assert res_prev.status_code == 200
+    prev_data = res_prev.json()
+    assert "diff" in prev_data
+    assert "hash" in prev_data
+    target_hash = prev_data["hash"]
+
+    # 2. Apply without expect_hash -> 400
+    res_no_hash = client.post(
+        "/api/config/set-profile",
+        headers={"X-AI-Orch-Token": token},
+        json={"tool": "kilo", "profile": "deep-reasoning", "model": "google/gemini-4-argon", "scope": "global"},
+    )
+    assert res_no_hash.status_code == 400
+    assert "expect_hash is required" in res_no_hash.json().get("error", "")
+
+    # 3. Apply with stale expect_hash -> 409
+    res_stale = client.post(
+        "/api/config/set-profile",
+        headers={"X-AI-Orch-Token": token},
+        json={"tool": "kilo", "profile": "deep-reasoning", "model": "google/gemini-4-argon", "scope": "global", "expect_hash": "badhash123"},
+    )
+    assert res_stale.status_code == 409
+    assert "hash mismatch" in res_stale.json().get("error", "").lower()
+
+    # 4. Apply with valid hash -> 200
+    res_ok = client.post(
+        "/api/config/set-profile",
+        headers={"X-AI-Orch-Token": token},
+        json={"tool": "kilo", "profile": "deep-reasoning", "model": "google/gemini-4-argon", "scope": "global", "expect_hash": target_hash},
+    )
+    assert res_ok.status_code == 200
+    assert res_ok.json().get("ok") is True
+
+
+def test_render_agents_md_preview_and_apply(monkeypatch, tmp_path):
+    fake_config = tmp_path / "fake_config"
+    fake_config.mkdir()
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(fake_config))
+    token = get_or_create_token()
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # 1. Preview render-agents-md
+        res_prev = client.get(
+            "/api/config/render-agents-md/preview",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert res_prev.status_code == 200
+        prev_data = res_prev.json()
+        assert "diff" in prev_data
+        assert "hash" in prev_data
+        assert "warnings" in prev_data
+        initial_hash = prev_data["hash"]
+
+        # 2. Apply without expect_hash -> 400
+        res_no_hash = client.post(
+            "/api/config/render-agents-md/apply",
+            headers={"X-AI-Orch-Token": token},
+            json={},
+        )
+        assert res_no_hash.status_code == 400
+        assert "expect_hash is required" in res_no_hash.json().get("error", "")
+
+        # 3. Apply with stale expect_hash -> 409
+        res_stale = client.post(
+            "/api/config/render-agents-md/apply",
+            headers={"X-AI-Orch-Token": token},
+            json={"expect_hash": "badhash123"},
+        )
+        assert res_stale.status_code == 409
+        assert "hash mismatch" in res_stale.json().get("error", "").lower()
+
+        # 4. Apply without allow_global_routing on workspace without project config -> 409 refusal
+        res_refusal = client.post(
+            "/api/config/render-agents-md/apply",
+            headers={"X-AI-Orch-Token": token},
+            json={"expect_hash": initial_hash},
+        )
+        assert res_refusal.status_code == 409
+        assert "no project config" in res_refusal.json().get("error", "").lower()
+
+        # 5. Apply with allow_global_routing = True -> 200
+        res_ok = client.post(
+            "/api/config/render-agents-md/apply",
+            headers={"X-AI-Orch-Token": token},
+            json={"expect_hash": initial_hash, "allow_global_routing": True},
+        )
+        assert res_ok.status_code == 200
+        assert res_ok.json().get("ok") is True
+        assert (tmp_path / "AGENTS.md").is_file()
+    finally:
+        state.workspace = old_ws
