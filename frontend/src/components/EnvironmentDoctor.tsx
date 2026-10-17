@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Activity, CheckCircle2, AlertTriangle, XCircle, Terminal, HardDrive, Trash2, Wrench, Loader2, Info, FileCode } from 'lucide-react';
-import { EnvStatusResponse, SkillEntry } from '../types';
+import { EnvStatusResponse, SkillEntry, StructuredConflict } from '../types';
 import { api } from '../api';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
@@ -8,6 +8,18 @@ interface EnvironmentDoctorProps {
   status: EnvStatusResponse | null;
   onRefresh: () => void;
 }
+
+const isFindingFixable = (sc: StructuredConflict): boolean => {
+  if (sc.fixable !== undefined) {
+    return sc.fixable;
+  }
+  // Missing fixable (older engine): treat as fixable (current behaviour)
+  const entries = sc.entries || [];
+  if (entries.length > 0) {
+    return entries.some((e) => !e.origin?.startsWith('plugin:'));
+  }
+  return true;
+};
 
 export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, onRefresh }) => {
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
@@ -26,28 +38,43 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
 
   const { clis, source_repos, environments, stray } = status;
 
-  // Check if any environment has resolvable conflicts
-  const hasResolvableConflicts = Object.values(environments).some((scopes) =>
-    Object.values(scopes).some((sinfo) => {
+  // Count fixable findings and advice findings
+  let toFixCount = 0;
+  let adviceCount = 0;
+
+  Object.values(environments).forEach((scopes) => {
+    Object.values(scopes).forEach((sinfo) => {
       if (sinfo.structured_conflicts && sinfo.structured_conflicts.length > 0) {
-        return sinfo.structured_conflicts.some((sc) => {
-          // A conflict is resolvable if any entry is standalone (non-plugin)
-          const entries = sc.entries || [];
-          return entries.some((e) => !e.origin?.startsWith('plugin:'));
+        sinfo.structured_conflicts.forEach((sc) => {
+          if (isFindingFixable(sc)) {
+            toFixCount++;
+          } else {
+            adviceCount++;
+          }
         });
+      } else if (sinfo.conflicts && sinfo.conflicts.length > 0) {
+        toFixCount += sinfo.conflicts.length;
       }
-      return sinfo.conflicts.length > 0;
-    })
-  );
+    });
+  });
+
+  // Check if any environment has resolvable conflicts
+  const hasResolvableConflicts = toFixCount > 0;
 
   const handleResolveConflictsPreview = async () => {
     setLoadingAction('resolve-conflicts');
     setErrorMessage(null);
     try {
       const res = await api.previewResolveConflicts();
+      const planItems = res.plan || [];
+      const hasExecutableActions = planItems.some(
+        (item: any) => item.action && item.action.toLowerCase() !== 'advise'
+      );
       setConfirmData({
-        title: 'Auto-Resolve Trigger Conflicts',
-        summary: 'Resolve trigger and duplicate skill name conflicts across assistant scopes.',
+        title: hasExecutableActions ? 'Auto-Resolve Trigger Conflicts' : 'Conflict Resolution Plan (Advice Only)',
+        summary: hasExecutableActions
+          ? 'Resolve trigger and duplicate skill name conflicts across assistant scopes.'
+          : 'Preview conflict resolution plan across assistant scopes. All items are advice-only; no automated modifications will be applied.',
         plan: res.plan,
         warnings: res.warnings,
         hash: res.plan_hash,
@@ -59,8 +86,20 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
         },
         onRefetchAction: async () => {
           const r = await api.previewResolveConflicts();
+          setConfirmData((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  plan: r.plan,
+                  warnings: r.warnings,
+                  hash: r.plan_hash,
+                }
+              : null
+          );
           return {
-            summary: 'Resolve trigger and duplicate skill name conflicts across assistant scopes.',
+            summary: hasExecutableActions
+              ? 'Resolve trigger and duplicate skill name conflicts across assistant scopes.'
+              : 'Preview conflict resolution plan across assistant scopes. All items are advice-only; no automated modifications will be applied.',
             plan: r.plan,
             warnings: r.warnings,
             hash: r.plan_hash,
@@ -110,37 +149,99 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
 
   return (
     <div style={{ padding: '1.5rem', maxWidth: '1200px', margin: '0 auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
         <div>
           <h1 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#f8fafc' }}>Environment Health & Drift Doctor</h1>
           <p style={{ fontSize: '0.85rem', color: '#94a3b8', marginTop: '0.25rem' }}>
             Real-time diagnostic of CLI binaries, skill installations, drift detection, origins, and registered MCP servers across Kilo, Claude, and Codex.
           </p>
+
+          {/* Summary counters: split into "to fix" (fixable) and "advice" */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginTop: '0.6rem' }}>
+            <span style={{ fontSize: '0.78rem', color: '#94a3b8', fontWeight: 600 }}>Findings:</span>
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                fontSize: '0.75rem',
+                fontWeight: 600,
+                padding: '0.15rem 0.55rem',
+                borderRadius: '0.25rem',
+                backgroundColor: toFixCount > 0 ? '#451a1a' : '#1e293b',
+                color: toFixCount > 0 ? '#fca5a5' : '#94a3b8',
+                border: `1px solid ${toFixCount > 0 ? '#ef4444' : '#334155'}`,
+              }}
+            >
+              {toFixCount > 0 ? <AlertTriangle size={13} color="#ef4444" /> : <CheckCircle2 size={13} color="#10b981" />}
+              <span>{toFixCount} to fix</span>
+            </span>
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                fontSize: '0.75rem',
+                fontWeight: 600,
+                padding: '0.15rem 0.55rem',
+                borderRadius: '0.25rem',
+                backgroundColor: adviceCount > 0 ? '#2d2006' : '#1e293b',
+                color: adviceCount > 0 ? '#fde68a' : '#94a3b8',
+                border: `1px solid ${adviceCount > 0 ? '#d97706' : '#334155'}`,
+              }}
+            >
+              <Info size={13} color={adviceCount > 0 ? '#f59e0b' : '#64748b'} />
+              <span>{adviceCount} advice</span>
+            </span>
+          </div>
         </div>
 
-        {hasResolvableConflicts && (
-          <button
-            onClick={handleResolveConflictsPreview}
-            disabled={loadingAction !== null}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.4rem',
-              padding: '0.45rem 0.9rem',
-              borderRadius: '0.375rem',
-              border: 'none',
-              backgroundColor: '#ef4444',
-              color: '#fff',
-              fontSize: '0.85rem',
-              fontWeight: 600,
-              cursor: 'pointer',
-              boxShadow: '0 4px 6px -1px rgba(239, 68, 68, 0.3)',
-            }}
-          >
-            {loadingAction === 'resolve-conflicts' ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
-            <span>Auto-Resolve Conflicts…</span>
-          </button>
-        )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          {hasResolvableConflicts ? (
+            <button
+              onClick={handleResolveConflictsPreview}
+              disabled={loadingAction !== null}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                padding: '0.45rem 0.9rem',
+                borderRadius: '0.375rem',
+                border: 'none',
+                backgroundColor: '#ef4444',
+                color: '#fff',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+                cursor: 'pointer',
+                boxShadow: '0 4px 6px -1px rgba(239, 68, 68, 0.3)',
+              }}
+            >
+              {loadingAction === 'resolve-conflicts' ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
+              <span>Auto-Resolve Conflicts…</span>
+            </button>
+          ) : adviceCount > 0 ? (
+            <button
+              onClick={handleResolveConflictsPreview}
+              disabled={loadingAction !== null}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                padding: '0.45rem 0.9rem',
+                borderRadius: '0.375rem',
+                border: '1px solid #d97706',
+                backgroundColor: '#2d2006',
+                color: '#fde68a',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              {loadingAction === 'resolve-conflicts' ? <Loader2 size={16} className="spin" /> : <Info size={16} color="#f59e0b" />}
+              <span>View Resolution Plan…</span>
+            </button>
+          ) : null}
+        </div>
       </div>
 
       {/* Error message banner */}
@@ -280,35 +381,80 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
                     {/* Conflict & Advice Banners */}
                     {structuredConflicts.length > 0 ? (
                       structuredConflicts.map((sc, idx) => {
-                        const conflictEntries = sc.entries || [];
-                        const isAllPlugin = conflictEntries.length > 0 && conflictEntries.every((e) => e.origin?.startsWith('plugin:'));
+                        const isFixable = isFindingFixable(sc);
 
-                        if (isAllPlugin) {
-                          // Render advise entries as advice (NOT as buttons)
+                        if (!isFixable) {
+                          const adviceList =
+                            sc.advice && sc.advice.length > 0
+                              ? sc.advice
+                              : [`${sc.kind}: ${sc.names.join(', ')} conflict across origins`];
+
                           return (
                             <div
                               key={idx}
                               style={{
                                 display: 'flex',
-                                alignItems: 'flex-start',
-                                gap: '0.6rem',
+                                flexDirection: 'column',
+                                gap: '0.4rem',
                                 padding: '0.65rem 0.9rem',
                                 borderRadius: '0.375rem',
-                                backgroundColor: '#1e3a8a',
-                                border: '1px solid #3b82f6',
-                                color: '#dbeafe',
+                                backgroundColor: '#2d2006',
+                                border: '1px solid #d97706',
+                                color: '#fef3c7',
                                 fontSize: '0.8rem',
                                 marginBottom: '0.75rem',
                               }}
                             >
-                              <Info size={16} color="#60a5fa" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
-                              <div>
-                                <div style={{ fontWeight: 600, marginBottom: '0.2rem' }}>
-                                  Plugin Advice: {sc.kind} ({sc.names.join(', ')})
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  gap: '0.5rem',
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                                  <Info size={15} color="#f59e0b" style={{ flexShrink: 0 }} />
+                                  <span
+                                    style={{
+                                      fontSize: '0.65rem',
+                                      fontWeight: 700,
+                                      padding: '0.1rem 0.35rem',
+                                      borderRadius: '0.2rem',
+                                      backgroundColor: '#78350f',
+                                      color: '#fde68a',
+                                      textTransform: 'uppercase',
+                                      letterSpacing: '0.03em',
+                                    }}
+                                  >
+                                    Advice
+                                  </span>
+                                  <span style={{ fontWeight: 600, color: '#fef3c7' }}>
+                                    <strong>{sc.kind}:</strong> {sc.names.join(', ')}
+                                  </span>
                                 </div>
-                                <div style={{ fontSize: '0.75rem', color: '#bfdbfe' }}>
-                                  Duplicate skills installed via plugins cannot be removed by the CLI. Disable the duplicate plugin in assistant settings or uninstall it.
-                                </div>
+                                <button
+                                  onClick={handleResolveConflictsPreview}
+                                  disabled={loadingAction !== null}
+                                  style={{
+                                    background: 'none',
+                                    border: 'none',
+                                    color: '#fbbf24',
+                                    textDecoration: 'underline',
+                                    fontSize: '0.75rem',
+                                    cursor: 'pointer',
+                                    padding: 0,
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                >
+                                  Show plan
+                                </button>
+                              </div>
+
+                              <div style={{ fontSize: '0.75rem', color: '#fde68a', lineHeight: 1.4, paddingLeft: '1.4rem' }}>
+                                {adviceList.map((adv, aIdx) => (
+                                  <div key={aIdx}>{adv}</div>
+                                ))}
                               </div>
                             </div>
                           );
@@ -569,21 +715,33 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
       </div>
 
       {/* Confirmation Modal */}
-      {confirmData && (
-        <ConfirmDialog
-          isOpen={true}
-          title={confirmData.title}
-          summary={confirmData.summary}
-          plan={confirmData.plan}
-          diff={confirmData.diff}
-          warnings={confirmData.warnings}
-          hash={confirmData.hash}
-          applyButtonText="Confirm & Apply"
-          onApply={confirmData.onApplyAction}
-          onCancel={() => setConfirmData(null)}
-          onRefetchPreview={confirmData.onRefetchAction}
-        />
-      )}
+      {confirmData && (() => {
+        const planItems = confirmData.plan || [];
+        const hasExecutableActions = planItems.some(
+          (item) => item.action && item.action.toLowerCase() !== 'advise'
+        );
+        const isApplyDisabled = !hasExecutableActions;
+        const applyButtonText = isApplyDisabled
+          ? 'Nothing to apply: advice only'
+          : 'Confirm & Apply';
+
+        return (
+          <ConfirmDialog
+            isOpen={true}
+            title={confirmData.title}
+            summary={confirmData.summary}
+            plan={confirmData.plan}
+            diff={confirmData.diff}
+            warnings={confirmData.warnings}
+            hash={confirmData.hash}
+            applyButtonText={applyButtonText}
+            isApplyDisabled={isApplyDisabled}
+            onApply={confirmData.onApplyAction}
+            onCancel={() => setConfirmData(null)}
+            onRefetchPreview={confirmData.onRefetchAction}
+          />
+        );
+      })()}
     </div>
   );
 };

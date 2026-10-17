@@ -89,6 +89,12 @@ export interface StructuredConflict {
   kind: string;
   names: string[];
   entries?: SkillEntry[];
+  scope?: string;
+  fixable?: boolean;
+  actionable?: boolean;
+  actions?: any[];
+  advice?: string[];
+  message?: string;
 }
 
 export interface McpServerInfo {
