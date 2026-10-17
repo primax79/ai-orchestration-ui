@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   Kanban,
+  Layers,
   ListOrdered,
   FolderTree,
   GanttChart,
@@ -63,6 +64,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
   const [syncError, setSyncError] = useState<string | null>(null);
 
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
+  const initiatives = data?.initiatives || [];
 
   useEffect(() => {
     if (selectedTask && data?.all_tasks) {
@@ -556,24 +558,6 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                     </span>
                   )}
 
-                  {/* Kind chip if present */}
-                  {t.kind && (
-                    <span
-                      style={{
-                        fontSize: '0.7rem',
-                        fontWeight: 500,
-                        padding: '0.1rem 0.35rem',
-                        borderRadius: '0.2rem',
-                        backgroundColor: '#0f172a',
-                        border: '1px solid #334155',
-                        color: '#94a3b8',
-                        flexShrink: 0,
-                      }}
-                    >
-                      {t.kind}
-                    </span>
-                  )}
-
                   {/* Executor */}
                   <span
                     style={{
@@ -826,25 +810,89 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
         </div>
       )}
 
+      {/* Tree: initiatives and full task list until the N-level tree (initiative 11) lands */}
       {viewMode === 'tree' && (
-        <div style={{
-          backgroundColor: '#1e293b',
-          border: '1px dashed #334155',
-          borderRadius: '0.5rem',
-          padding: '3.5rem 1.5rem',
-          textAlign: 'center',
-          color: '#94a3b8',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: '0.75rem',
-        }}>
-          <FolderTree size={36} color="#64748b" />
-          <div style={{ fontSize: '1rem', fontWeight: 600, color: '#f1f5f9' }}>
-            Tree View
-          </div>
-          <div style={{ fontSize: '0.85rem', color: '#94a3b8', maxWidth: '480px', lineHeight: 1.4 }}>
-            Hierarchical breakdown of initiatives, subtasks, and recursive task trees is coming with initiative 11.
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          {/* Initiatives Table */}
+          {initiatives.length > 0 && (
+            <div style={{ backgroundColor: '#1e293b', borderRadius: '0.5rem', border: '1px solid #334155', padding: '1rem' }}>
+              <h2 style={{ fontSize: '1rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                <Layers size={16} color="#818cf8" />
+                <span>Planned Initiatives</span>
+              </h2>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '0.75rem' }}>
+                {initiatives.map((init) => (
+                  <div key={init.id} style={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '0.375rem', padding: '0.75rem' }}>
+                    <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#818cf8' }}>Initiative #{init.id}</div>
+                    <div style={{ fontSize: '0.9rem', fontWeight: 600, color: '#f1f5f9', marginTop: '0.2rem' }}>{init.title}</div>
+                    <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: '0.4rem' }}>{init.tasks_count} subtask(s) defined</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* All Tasks Table */}
+          <div style={{ backgroundColor: '#1e293b', borderRadius: '0.5rem', border: '1px solid #334155', overflow: 'hidden' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
+              <thead>
+                <tr style={{ backgroundColor: '#0f172a', color: '#94a3b8', borderBottom: '1px solid #334155' }}>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>Priority</th>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>ID</th>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>Title</th>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>Category</th>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>State</th>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>Executor</th>
+                  <th style={{ padding: '0.6rem 0.8rem' }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tasks.map((t) => (
+                  <tr
+                    key={t.id}
+                    onClick={() => setSelectedTask(t)}
+                    style={{ borderBottom: '1px solid #334155', cursor: 'pointer' }}
+                    onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#243046')}
+                    onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                  >
+                    <td style={{ padding: '0.6rem 0.8rem' }}>
+                      <span style={{
+                        fontSize: '0.7rem',
+                        fontWeight: 700,
+                        padding: '0.1rem 0.3rem',
+                        borderRadius: '0.2rem',
+                        backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
+                        color: '#fff',
+                      }}>
+                        {t.priority}
+                      </span>
+                    </td>
+                    <td style={{ padding: '0.6rem 0.8rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</td>
+                    <td style={{ padding: '0.6rem 0.8rem', color: '#f1f5f9', fontWeight: 500 }}>{t.title}</td>
+                    <td style={{ padding: '0.6rem 0.8rem', color: '#94a3b8' }}>{t.category}</td>
+                    <td style={{ padding: '0.6rem 0.8rem' }}>
+                      <span style={{ fontSize: '0.75rem', padding: '0.1rem 0.4rem', borderRadius: '1rem', backgroundColor: '#334155', color: '#cbd5e1' }}>
+                        {t.state}
+                      </span>
+                    </td>
+                    <td style={{ padding: '0.6rem 0.8rem', color: '#cbd5e1' }}>{t.executor || 'self'}</td>
+                    <td style={{ padding: '0.6rem 0.8rem' }}>
+                      <button
+                        onClick={(e) => copyHandoff(e, t.handoff, t.id, t.title)}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: copiedId === t.id ? '#10b981' : '#94a3b8',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {copiedId === t.id ? <Check size={14} /> : <Copy size={14} />}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
