@@ -372,8 +372,9 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
     if isinstance(data, dict):
         reason = str(data.get("reason") or "").lower()
         err_val = f"{data.get('error', '')} {data.get('message', '')}".lower()
-        if data.get("error") in ("stale-task", "lock-timeout", "stale-note") or reason in (
+        if data.get("error") in ("stale-task", "stale-task-hash", "lock-timeout", "stale-note") or reason in (
             "stale-task",
+            "stale-task-hash",
             "stale-note",
             "stale-note-hash",
             "note-hash-mismatch",
@@ -387,7 +388,17 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
             "active-chain-run",
         ):
             return 409
-        if data.get("error") == "invalid-image-type" or reason == "invalid-image-type":
+        if data.get("error") in (
+            "invalid-image-type",
+            "invalid-pdf-type",
+            "invalid-text-type",
+            "invalid-attachment-type",
+        ) or reason in (
+            "invalid-image-type",
+            "invalid-pdf-type",
+            "invalid-text-type",
+            "invalid-attachment-type",
+        ):
             return 415
         if data.get("error") == "size-limit-exceeded" or reason == "size-limit-exceeded":
             return 413
@@ -400,6 +411,7 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "plan hash mismatch" in err_str
         or "stale" in err_str
         or "stale-note" in err_str
+        or "stale-task-hash" in err_str
         or "lock-timeout" in err_str
         or "task-write lock" in err_str
         or "timed out waiting for task-write lock" in err_str
@@ -415,7 +427,14 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
     ):
         return 409
 
-    if "invalid-image-type" in err_str or "magic bytes do not match" in err_str:
+    if (
+        "invalid-image-type" in err_str
+        or "invalid-pdf-type" in err_str
+        or "invalid-text-type" in err_str
+        or "invalid-attachment-type" in err_str
+        or "magic bytes do not match" in err_str
+        or "unsupported attachment type" in err_str
+    ):
         return 415
 
     if "size-limit-exceeded" in err_str:
@@ -439,6 +458,9 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "proposal" in err_str
         or "not-triage-run" in err_str
         or "run-not-terminal" in err_str
+        or "plan tasks do not support attachments" in err_str
+        or "plan-task-attachments-unsupported" in err_str
+        or "attachment-limit-reached" in err_str
     ):
         return 400
 
@@ -864,6 +886,274 @@ async def api_get_task_detail(request: Request) -> JSONResponse:
         "content": content,
         "progress_content": progress_content,
     })
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints: Task Attachments (09.8) & Attachment Classification
+# ---------------------------------------------------------------------------
+
+TASK_ATTACHMENT_ID_RE = re.compile(r"^T\d{3,}$")
+ATTACHMENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def validate_task_attachment_id(task_id: str) -> JSONResponse | None:
+    if not TASK_ATTACHMENT_ID_RE.match(task_id):
+        if "." in task_id or (task_id and task_id[0].isdigit()) or "plan" in task_id.lower() or task_id.startswith("INIT-"):
+            return JSONResponse({"error": "plan tasks take no attachments"}, status_code=400)
+        return JSONResponse({"error": f"Invalid task ID {task_id!r}, must match ^T\\d{{3,}}$"}, status_code=400)
+    return None
+
+
+def sniff_image_media_type(data: bytes) -> str | None:
+    """Sniff media type from magic bytes (png, jpeg, gif, webp only)."""
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(data) >= 6 and (data[:6] == b"GIF87a" or data[:6] == b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def classify_attachment_bytes(data: bytes) -> tuple[str, str] | None:
+    """Classify attachment bytes into (class_name, media_type).
+    Returns None if content is not a supported image, pdf, or utf-8 text without NUL.
+    """
+    img_type = sniff_image_media_type(data)
+    if img_type:
+        return ("image", img_type)
+
+    if data.startswith(b"%PDF-"):
+        return ("pdf", "application/pdf")
+
+    if b"\x00" not in data[:65536]:
+        try:
+            data.decode("utf-8")
+            return ("text", "text/plain; charset=utf-8")
+        except UnicodeDecodeError:
+            pass
+
+    return None
+
+
+def classify_and_serve_attachment(file_bytes: bytes, filename: str) -> Response:
+    classification = classify_attachment_bytes(file_bytes)
+    if not classification:
+        return JSONResponse({"error": "Unsupported attachment format"}, status_code=415)
+
+    att_class, media_type = classification
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": CSP_HEADER,
+        "Cache-Control": "private, max-age=60",
+    }
+    if att_class == "pdf":
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+    return Response(file_bytes, media_type=media_type, headers=headers)
+
+
+async def api_upload_task_attachment(request: Request) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    err_resp = validate_task_attachment_id(task_id)
+    if err_resp:
+        return err_resp
+
+    content_type = request.headers.get("content-type", "")
+    if not content_type.startswith("multipart/form-data"):
+        return JSONResponse({"error": "Content-Type must be multipart/form-data"}, status_code=400)
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_ATTACHMENT_SIZE + 512 * 1024:
+                return JSONResponse({"error": "Attachment exceeds 10 MB limit"}, status_code=413)
+        except ValueError:
+            pass
+
+    try:
+        form = await request.form()
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid multipart form: {exc}"}, status_code=400)
+
+    upload_file = form.get("file")
+    if not upload_file or not hasattr(upload_file, "read"):
+        return JSONResponse({"error": "file field is required in multipart form"}, status_code=400)
+
+    temp_path: pathlib.Path | None = None
+    suffix = pathlib.Path(upload_file.filename).suffix if getattr(upload_file, "filename", None) else ".tmp"
+    try:
+        with tempfile.NamedTemporaryFile("wb", delete=False, suffix=suffix) as temp_f:
+            temp_path = pathlib.Path(temp_f.name)
+            total_read = 0
+            while True:
+                chunk = await upload_file.read(65536)
+                if not chunk:
+                    break
+                total_read += len(chunk)
+                if total_read > MAX_ATTACHMENT_SIZE:
+                    temp_f.close()
+                    temp_path.unlink(missing_ok=True)
+                    temp_path = None
+                    return JSONResponse({"error": "Attachment exceeds 10 MB limit"}, status_code=413)
+                temp_f.write(chunk)
+
+        tasks_dir = state.workspace / "tasks"
+        cmd = ["tasks", "attach", task_id, "--file", str(temp_path), "--tasks-dir", str(tasks_dir), "--json"]
+
+        name = form.get("name")
+        if name and str(name).strip():
+            cmd.extend(["--name", str(name).strip()])
+        elif getattr(upload_file, "filename", None):
+            stem = pathlib.Path(upload_file.filename).stem
+            if stem:
+                cmd.extend(["--name", stem])
+
+        expect_task_hash = (
+            form.get("expect_task_hash")
+            or form.get("expect_hash")
+            or request.query_params.get("expect_task_hash")
+            or request.query_params.get("expect_hash")
+            or request.headers.get("x-expect-task-hash")
+        )
+        if expect_task_hash:
+            cmd.extend(["--expect-task-hash", str(expect_task_hash)])
+
+        code, data = await run_ai_orch(cmd)
+        if code == 0:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+            return JSONResponse(data, status_code=200)
+
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    finally:
+        if temp_path:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def api_get_task_attachment(request: Request) -> Response:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    err_resp = validate_task_attachment_id(task_id)
+    if err_resp:
+        return err_resp
+
+    name = request.path_params["name"]
+    if not ATTACHMENT_NAME_RE.match(name):
+        return JSONResponse({"error": f"Invalid attachment name {name!r}"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    code, data = await run_ai_orch(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"])
+    if code != 0 or not isinstance(data, dict):
+        return JSONResponse({"error": f"Task {task_id} not found"}, status_code=404)
+
+    task_entry = None
+    for t in data.get("emergent_tasks", []):
+        if isinstance(t, dict) and t.get("id") == task_id:
+            task_entry = t
+            break
+    if not task_entry:
+        for t in data.get("all_tasks", []):
+            if isinstance(t, dict) and t.get("id") == task_id:
+                task_entry = t
+                break
+    if not task_entry:
+        tree = data.get("tree", {})
+        if isinstance(tree, dict) and task_id in tree:
+            task_entry = tree[task_id]
+
+    if not task_entry:
+        return JSONResponse({"error": f"Task {task_id} not found"}, status_code=404)
+
+    if not task_entry.get("is_folder", False):
+        return JSONResponse({"error": f"Task {task_id} has no attachments"}, status_code=404)
+
+    folder_path_str = task_entry.get("task_root")
+    if not folder_path_str:
+        fp = task_entry.get("file_path")
+        if fp:
+            folder_path_str = str(pathlib.Path(fp).parent)
+
+    if not folder_path_str:
+        return JSONResponse({"error": f"Task {task_id} has no attachments"}, status_code=404)
+
+    folder_path = pathlib.Path(folder_path_str)
+    if not folder_path.is_absolute():
+        folder_path = (state.workspace / folder_path).resolve()
+    else:
+        folder_path = folder_path.resolve()
+
+    attachments_dir = (folder_path / "attachments").resolve()
+    target_file = (attachments_dir / name).resolve()
+
+    try:
+        target_file.relative_to(attachments_dir)
+    except ValueError:
+        return JSONResponse({"error": "Path traversal detected"}, status_code=400)
+
+    if not target_file.is_file():
+        return JSONResponse({"error": f"Attachment {name!r} not found"}, status_code=404)
+
+    file_bytes = target_file.read_bytes()
+    return classify_and_serve_attachment(file_bytes, name)
+
+
+async def api_delete_task_attachment(request: Request) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    err_resp = validate_task_attachment_id(task_id)
+    if err_resp:
+        return err_resp
+
+    name = request.path_params["name"]
+    if not ATTACHMENT_NAME_RE.match(name):
+        return JSONResponse({"error": f"Invalid attachment name {name!r}"}, status_code=400)
+
+    expect_task_hash = (
+        request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not expect_task_hash:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                expect_task_hash = body.get("expect_task_hash") or body.get("expect_hash")
+        except Exception:
+            pass
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "detach", task_id, "--name", name, "--tasks-dir", str(tasks_dir), "--json"]
+    if expect_task_hash:
+        cmd.extend(["--expect-task-hash", str(expect_task_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        return JSONResponse(data, status_code=200)
+
+    err_str = ""
+    if isinstance(data, dict):
+        err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+    elif isinstance(data, str):
+        err_str = data.lower()
+    if "not found" in err_str or "not-found" in err_str or "no-attachments" in err_str:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -1831,21 +2121,6 @@ async def api_accept_triage_run(request: Request) -> JSONResponse:
 # REST Endpoints: Inbox Notes & Attachments (09.2)
 # ---------------------------------------------------------------------------
 
-ATTACHMENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
-MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
-
-
-def sniff_image_media_type(data: bytes) -> str | None:
-    """Sniff media type from magic bytes (png, jpeg, gif, webp only)."""
-    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if len(data) >= 6 and (data[:6] == b"GIF87a" or data[:6] == b"GIF89a"):
-        return "image/gif"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
 
 
 async def api_list_inbox_notes(request: Request) -> JSONResponse:
@@ -2035,9 +2310,19 @@ async def api_upload_inbox_attachment(request: Request) -> JSONResponse:
             if stem:
                 cmd.extend(["--name", stem])
 
+        expect_hash = (
+            form.get("expect_hash")
+            or form.get("expect_note_hash")
+            or request.query_params.get("expect_hash")
+            or request.headers.get("x-expect-hash")
+        )
+        if expect_hash:
+            cmd.extend(["--expect-hash", str(expect_hash)])
+
         code, data = await run_ai_orch(cmd)
         if code == 0:
             await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+            await state.broadcast({"type": "changed", "areas": ["inbox"]})
             return JSONResponse(data, status_code=200)
 
         err_str = ""
@@ -2069,9 +2354,25 @@ async def api_delete_inbox_attachment(request: Request) -> JSONResponse:
 
     tasks_dir = state.workspace / "tasks"
     cmd = ["inbox", "detach", note_id, "--name", name, "--tasks-dir", str(tasks_dir), "--json"]
+    expect_hash = (
+        request.query_params.get("expect_hash")
+        or request.query_params.get("expect_note_hash")
+        or request.headers.get("x-expect-hash")
+    )
+    if not expect_hash:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                expect_hash = body.get("expect_hash") or body.get("expect_note_hash")
+        except Exception:
+            pass
+    if expect_hash:
+        cmd.extend(["--expect-hash", str(expect_hash)])
+
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+        await state.broadcast({"type": "changed", "areas": ["inbox"]})
         return JSONResponse(data, status_code=200)
 
     err_str = ""
@@ -2117,15 +2418,7 @@ async def api_get_inbox_attachment(request: Request) -> Response:
         return JSONResponse({"error": f"Attachment {name!r} not found"}, status_code=404)
 
     file_bytes = target_file.read_bytes()
-    media_type = sniff_image_media_type(file_bytes)
-    if not media_type:
-        return JSONResponse({"error": "Unsupported image format"}, status_code=415)
-
-    headers = {
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "private, max-age=60",
-    }
-    return Response(file_bytes, media_type=media_type, headers=headers)
+    return classify_and_serve_attachment(file_bytes, name)
 
 
 async def api_resolve_inbox_note(request: Request) -> JSONResponse:
@@ -2384,6 +2677,9 @@ routes = [
     Route("/api/tasks/transition", api_transition_task, methods=["POST"]),
     Route("/api/tasks/sync-index/preview", api_preview_sync_index, methods=["GET"]),
     Route("/api/tasks/sync-index", api_sync_index, methods=["POST"]),
+    Route("/api/tasks/{id}/attachments", api_upload_task_attachment, methods=["POST"]),
+    Route("/api/tasks/{id}/attachments/{name:path}", api_get_task_attachment, methods=["GET"]),
+    Route("/api/tasks/{id}/attachments/{name:path}", api_delete_task_attachment, methods=["DELETE"]),
     Route("/api/tasks/{task_id}", api_get_task_detail, methods=["GET"]),
     Route("/api/questions", api_list_questions, methods=["GET"]),
     Route("/api/questions", api_ask_question, methods=["POST"]),

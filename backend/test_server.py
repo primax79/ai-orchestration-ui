@@ -2183,3 +2183,365 @@ def test_runs_accept_triage_endpoint_and_broadcast(monkeypatch, tmp_path):
     finally:
         state.workspace = old_ws
 
+
+
+
+def make_test_pdf() -> bytes:
+    return b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
+
+
+def test_task_attachments_auth_enforced():
+    # Endpoints without token -> 401
+    assert client.post("/api/tasks/T001/attachments").status_code == 401
+    assert client.get("/api/tasks/T001/attachments/01-test.png").status_code == 401
+    assert client.delete("/api/tasks/T001/attachments/01-test.png").status_code == 401
+
+    # Endpoints with bad token -> 401
+    bad_headers = {"X-AI-Orch-Token": "bad-token"}
+    assert client.post("/api/tasks/T001/attachments", headers=bad_headers).status_code == 401
+    assert client.get("/api/tasks/T001/attachments/01-test.png", headers=bad_headers).status_code == 401
+    assert client.delete("/api/tasks/T001/attachments/01-test.png", headers=bad_headers).status_code == 401
+
+
+def test_task_attachments_plan_and_bad_ids_refused():
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    # Plan tasks (NN.T, NN.N, INIT-NN) must be refused with 400 "plan tasks take no attachments"
+    for plan_id in ["01.1", "08.T1", "NN.T", "INIT-01", "09.8", "01"]:
+        res_post = client.post(f"/api/tasks/{plan_id}/attachments", headers=headers)
+        assert res_post.status_code == 400
+        assert "plan tasks" in res_post.json().get("error", "").lower()
+
+        res_get = client.get(f"/api/tasks/{plan_id}/attachments/01-test.png", headers=headers)
+        assert res_get.status_code == 400
+        assert "plan tasks" in res_get.json().get("error", "").lower()
+
+        res_del = client.delete(f"/api/tasks/{plan_id}/attachments/01-test.png", headers=headers)
+        assert res_del.status_code == 400
+        assert "plan tasks" in res_del.json().get("error", "").lower()
+
+    # Invalid ID formats must be 400
+    for bad_id in ["invalid_id", "T1", "T12", "t001", "T-001"]:
+        assert client.post(f"/api/tasks/{bad_id}/attachments", headers=headers).status_code == 400
+        assert client.get(f"/api/tasks/{bad_id}/attachments/01-test.png", headers=headers).status_code == 400
+        assert client.delete(f"/api/tasks/{bad_id}/attachments/01-test.png", headers=headers).status_code == 400
+
+
+def test_task_attachments_crud_flow_and_classes(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # Create an emergent task
+        res_new = client.post(
+            "/api/inbox",
+            headers=headers,
+            json={"title": "Seed note", "status": "ready"},
+        )
+        note_id = res_new.json()["id"]
+        res_totask = client.post(
+            f"/api/inbox/{note_id}/to-task",
+            headers=headers,
+            json={"category": "feature", "title": "Implement task attachments"},
+        )
+        assert res_totask.status_code == 200
+        task_id = res_totask.json()["id"]
+        assert task_id.startswith("T")
+
+        # 1. Non-existent task -> 404
+        assert client.post(f"/api/tasks/T999/attachments", headers=headers, files={"file": ("test.png", make_test_png(), "image/png")}).status_code == 404
+        assert client.get(f"/api/tasks/T999/attachments/01-test.png", headers=headers).status_code == 404
+        assert client.delete(f"/api/tasks/T999/attachments/01-test.png", headers=headers).status_code == 404
+
+        # 2. Traversal names -> 400
+        for bad_name in ["..%2F..%2Fetc", "a/b", ".hidden"]:
+            assert client.get(f"/api/tasks/{task_id}/attachments/{bad_name}", headers=headers).status_code in (400, 404)
+            assert client.delete(f"/api/tasks/{task_id}/attachments/{bad_name}", headers=headers).status_code in (400, 404)
+
+        # 3. Upload & Serve Image (PNG) -> inline, sniffed image Content-Type, nosniff, CSP
+        png_data = make_test_png(4, 4)
+        res_img = client.post(
+            f"/api/tasks/{task_id}/attachments",
+            headers=headers,
+            files={"file": ("screen.png", png_data, "image/png")},
+        )
+        assert res_img.status_code == 200
+        img_json = res_img.json()
+        assert img_json["ok"] is True
+        assert img_json["class"] == "image"
+        img_name = img_json["attachment"]
+        current_hash = img_json["bundle_sha256"]
+
+        res_get_img = client.get(f"/api/tasks/{task_id}/attachments/{img_name}", headers=headers)
+        assert res_get_img.status_code == 200
+        assert res_get_img.content == png_data
+        assert res_get_img.headers["content-type"].startswith("image/png")
+        assert res_get_img.headers["x-content-type-options"] == "nosniff"
+        assert res_get_img.headers["content-security-policy"] == CSP_HEADER
+        assert "content-disposition" not in res_get_img.headers
+
+        # 4. Upload & Serve Text (.log) -> inline, text/plain; charset=utf-8, nosniff, CSP
+        log_data = b"2026-10-17 12:00:00 [INFO] test log output\n"
+        res_txt = client.post(
+            f"/api/tasks/{task_id}/attachments",
+            headers=headers,
+            files={"file": ("server.log", log_data, "text/plain")},
+        )
+        assert res_txt.status_code == 200
+        txt_json = res_txt.json()
+        assert txt_json["ok"] is True
+        assert txt_json["class"] == "text"
+        txt_name = txt_json["attachment"]
+        current_hash = txt_json["bundle_sha256"]
+
+        res_get_txt = client.get(f"/api/tasks/{task_id}/attachments/{txt_name}", headers=headers)
+        assert res_get_txt.status_code == 200
+        assert res_get_txt.content == log_data
+        assert res_get_txt.headers["content-type"] == "text/plain; charset=utf-8"
+        assert res_get_txt.headers["x-content-type-options"] == "nosniff"
+        assert res_get_txt.headers["content-security-policy"] == CSP_HEADER
+        assert "content-disposition" not in res_get_txt.headers
+
+        # 5. Upload & Serve PDF (.pdf) -> application/pdf, Content-Disposition: attachment, nosniff, CSP
+        pdf_data = make_test_pdf()
+        res_pdf = client.post(
+            f"/api/tasks/{task_id}/attachments",
+            headers=headers,
+            files={"file": ("report.pdf", pdf_data, "application/pdf")},
+        )
+        assert res_pdf.status_code == 200
+        pdf_json = res_pdf.json()
+        assert pdf_json["ok"] is True
+        assert pdf_json["class"] == "pdf"
+        pdf_name = pdf_json["attachment"]
+        current_hash = pdf_json["bundle_sha256"]
+
+        res_get_pdf = client.get(f"/api/tasks/{task_id}/attachments/{pdf_name}", headers=headers)
+        assert res_get_pdf.status_code == 200
+        assert res_get_pdf.content == pdf_data
+        assert res_get_pdf.headers["content-type"] == "application/pdf"
+        assert res_get_pdf.headers["x-content-type-options"] == "nosniff"
+        assert res_get_pdf.headers["content-security-policy"] == CSP_HEADER
+        assert res_get_pdf.headers["content-disposition"] == f'attachment; filename="{pdf_name}"'
+
+        # 6. Upload with stale expect_task_hash -> 409
+        res_stale = client.post(
+            f"/api/tasks/{task_id}/attachments",
+            headers=headers,
+            data={"expect_task_hash": "stalehash123"},
+            files={"file": ("another.log", b"log text", "text/plain")},
+        )
+        assert res_stale.status_code == 409
+
+        # 7. Upload binary junk -> refused (415)
+        res_junk = client.post(
+            f"/api/tasks/{task_id}/attachments",
+            headers=headers,
+            files={"file": ("junk.bin", b"\x00\x01\x02\x03\xff", "application/octet-stream")},
+        )
+        assert res_junk.status_code in (415, 400)
+
+        # 8. Upload oversized file (>10MB) -> 413
+        big_data = b"X" * (11 * 1024 * 1024)
+        res_big = client.post(
+            f"/api/tasks/{task_id}/attachments",
+            headers=headers,
+            files={"file": ("huge.log", big_data, "text/plain")},
+        )
+        assert res_big.status_code == 413
+
+        # 9. Delete with stale expect_task_hash -> 409
+        res_del_stale = client.delete(
+            f"/api/tasks/{task_id}/attachments/{txt_name}?expect_task_hash=badhash",
+            headers=headers,
+        )
+        assert res_del_stale.status_code == 409
+
+        # 10. Delete attachment with valid/no hash -> 200
+        res_del = client.delete(f"/api/tasks/{task_id}/attachments/{txt_name}", headers=headers)
+        assert res_del.status_code == 200
+        assert res_del.json()["ok"] is True
+        assert res_del.json()["detached"] == txt_name
+
+        # Subsequent GET -> 404
+        assert client.get(f"/api/tasks/{task_id}/attachments/{txt_name}", headers=headers).status_code == 404
+
+        # Delete non-existent attachment -> 404
+        assert client.delete(f"/api/tasks/{task_id}/attachments/notfound.log", headers=headers).status_code == 404
+    finally:
+        state.workspace = old_ws
+
+
+def test_inbox_per_class_serving_and_junk_refusal(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "ws_inbox"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # Create inbox note
+        res_note = client.post(
+            "/api/inbox",
+            headers=headers,
+            json={"title": "Note for class serving", "status": "ready"},
+        )
+        assert res_note.status_code == 200
+        note_id = res_note.json()["id"]
+
+        # 1. Upload .log file (plain text) -> accepted (200), class "text"
+        log_bytes = b"2026-10-17 12:00:00 app log test\n"
+        res_log = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("app.log", log_bytes, "text/plain")},
+        )
+        assert res_log.status_code == 200
+        log_name = res_log.json()["attachment"]
+        assert res_log.json()["class"] == "text"
+
+        # Serve .log -> inline, text/plain; charset=utf-8, nosniff, CSP
+        res_get_log = client.get(f"/api/inbox/{note_id}/attachments/{log_name}", headers=headers)
+        assert res_get_log.status_code == 200
+        assert res_get_log.content == log_bytes
+        assert res_get_log.headers["content-type"] == "text/plain; charset=utf-8"
+        assert res_get_log.headers["x-content-type-options"] == "nosniff"
+        assert res_get_log.headers["content-security-policy"] == CSP_HEADER
+        assert "content-disposition" not in res_get_log.headers
+
+        # 2. Upload .pdf file -> accepted (200), class "pdf"
+        pdf_bytes = make_test_pdf()
+        res_pdf = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("doc.pdf", pdf_bytes, "application/pdf")},
+        )
+        assert res_pdf.status_code == 200
+        pdf_name = res_pdf.json()["attachment"]
+        assert res_pdf.json()["class"] == "pdf"
+
+        # Serve .pdf -> application/pdf, Content-Disposition: attachment, nosniff, CSP
+        res_get_pdf = client.get(f"/api/inbox/{note_id}/attachments/{pdf_name}", headers=headers)
+        assert res_get_pdf.status_code == 200
+        assert res_get_pdf.content == pdf_bytes
+        assert res_get_pdf.headers["content-type"] == "application/pdf"
+        assert res_get_pdf.headers["x-content-type-options"] == "nosniff"
+        assert res_get_pdf.headers["content-security-policy"] == CSP_HEADER
+        assert res_get_pdf.headers["content-disposition"] == f'attachment; filename="{pdf_name}"'
+
+        # 3. Upload binary junk -> refused with 415 or 400
+        junk_bytes = b"\x00\x01\x02\x03junk"
+        res_junk = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("junk.bin", junk_bytes, "application/octet-stream")},
+        )
+        assert res_junk.status_code in (415, 400)
+
+        # 4. Upload binary junk disguised as .log (has NUL byte) -> refused
+        bad_log_bytes = b"text before null\x00text after"
+        res_bad_log = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("bad.log", bad_log_bytes, "text/plain")},
+        )
+        assert res_bad_log.status_code in (415, 400)
+    finally:
+        state.workspace = old_ws
+
+
+def test_attachment_writes_broadcast_websocket(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "ws_broadcast"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # Create a task and a note
+        res_note = client.post("/api/inbox", headers=headers, json={"title": "WS note", "status": "ready"})
+        note_id = res_note.json()["id"]
+
+        res_totask = client.post(
+            f"/api/inbox/{note_id}/to-task",
+            headers=headers,
+            json={"category": "feature", "title": "WS task"},
+        )
+        task_id = res_totask.json()["id"]
+
+        with client.websocket_connect(f"/ws?token={token}") as sock:
+            init_msg = sock.receive_json()
+            assert init_msg.get("type") == "connected"
+
+            # 1. Task attach broadcast
+            log_data = b"task log data\n"
+            res_up_task = client.post(
+                f"/api/tasks/{task_id}/attachments",
+                headers=headers,
+                files={"file": ("test.log", log_data, "text/plain")},
+            )
+            assert res_up_task.status_code == 200
+            task_att_name = res_up_task.json()["attachment"]
+
+            msg_task_attach = sock.receive_json()
+            assert msg_task_attach.get("type") == "changed"
+            assert msg_task_attach.get("areas") == ["tasks"]
+
+            # 2. Task detach broadcast
+            res_del_task = client.delete(
+                f"/api/tasks/{task_id}/attachments/{task_att_name}",
+                headers=headers,
+            )
+            assert res_del_task.status_code == 200
+
+            msg_task_detach = sock.receive_json()
+            assert msg_task_detach.get("type") == "changed"
+            assert msg_task_detach.get("areas") == ["tasks"]
+
+            # 3. Inbox attach broadcast
+            res_up_note = client.post(
+                f"/api/inbox/{note_id}/attachments",
+                headers=headers,
+                files={"file": ("note.log", log_data, "text/plain")},
+            )
+            assert res_up_note.status_code == 200
+            note_att_name = res_up_note.json()["attachment"]
+
+            # Receives inbox_updated and changed
+            msgs = [sock.receive_json(), sock.receive_json()]
+            changed_msg = next((m for m in msgs if m.get("type") == "changed"), None)
+            assert changed_msg is not None
+            assert changed_msg.get("areas") == ["inbox"]
+
+            # 4. Inbox detach broadcast
+            res_del_note = client.delete(
+                f"/api/inbox/{note_id}/attachments/{note_att_name}",
+                headers=headers,
+            )
+            assert res_del_note.status_code == 200
+
+            msgs_del = [sock.receive_json(), sock.receive_json()]
+            changed_del = next((m for m in msgs_del if m.get("type") == "changed"), None)
+            assert changed_del is not None
+            assert changed_del.get("areas") == ["inbox"]
+    finally:
+        state.workspace = old_ws
