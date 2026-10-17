@@ -1,9 +1,37 @@
 import React, { useState, useEffect } from 'react';
-import { Layers, Kanban, ListFilter, Copy, Check, FileCheck, ArrowRight, AlertTriangle, AlertCircle, Loader2 } from 'lucide-react';
+import {
+  Kanban,
+  ListOrdered,
+  FolderTree,
+  GanttChart,
+  Copy,
+  Check,
+  FileCheck,
+  ArrowRight,
+  AlertTriangle,
+  AlertCircle,
+  Loader2,
+} from 'lucide-react';
 import { TaskItem, TaskListResponse } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { api } from '../api';
+
+export type BacklogView = 'queue' | 'kanban' | 'tree' | 'timeline';
+
+const BACKLOG_VIEW_KEY = 'ai-orch:backlog-view';
+
+const getStoredView = (): BacklogView => {
+  try {
+    const val = localStorage.getItem(BACKLOG_VIEW_KEY);
+    if (val === 'queue' || val === 'kanban' || val === 'tree' || val === 'timeline') {
+      return val;
+    }
+  } catch {
+    // Ignore storage errors (private mode, sandboxed iframe, etc.)
+  }
+  return 'queue';
+};
 
 interface BacklogManagerProps {
   data: TaskListResponse | null;
@@ -11,7 +39,7 @@ interface BacklogManagerProps {
 }
 
 export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh }) => {
-  const [viewMode, setViewMode] = useState<'kanban' | 'list'>('kanban');
+  const [viewMode, setViewMode] = useState<BacklogView>(getStoredView);
   const [selectedTask, setSelectedTask] = useState<TaskItem | null>(null);
   const [syncingIndex, setSyncingIndex] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -22,7 +50,6 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
   const [syncError, setSyncError] = useState<string | null>(null);
 
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
-  const initiatives = data?.initiatives || [];
 
   useEffect(() => {
     if (selectedTask && data?.all_tasks) {
@@ -33,6 +60,19 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
     }
   }, [data, selectedTask]);
 
+  const handleViewChange = (newView: BacklogView) => {
+    setViewMode(newView);
+    try {
+      localStorage.setItem(BACKLOG_VIEW_KEY, newView);
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
+  const isClosedState = (state: string) => {
+    return state === 'done' || state === 'done with a caveat' || state === 'dropped';
+  };
+
   // Compute stats
   const stats = {
     total: tasks.length,
@@ -41,10 +81,26 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
     waiting: tasks.filter((t) => t.state === 'waiting' || t.state === 'blocked').length,
     delivered: tasks.filter((t) => t.state === 'delivered').length,
     verified: tasks.filter((t) => t.state === 'verified').length,
-    done: tasks.filter((t) => t.state === 'done' || t.state === 'done with a caveat').length,
+    done: tasks.filter((t) => isClosedState(t.state) || t.is_done).length,
   };
 
-  const nextUpTasks = tasks.filter((t) => t.next_up === 'yes' && t.state !== 'done');
+  // Queue tasks: emergent only, next_up === 'yes', non-closed, never NN.T
+  const queueTasks = tasks
+    .filter((t) => {
+      if (t.kind !== 'emergent') return false;
+      if (/^\d+\.\d+/.test(t.id)) return false;
+      if (t.next_up !== 'yes') return false;
+      if (isClosedState(t.state) || t.is_done) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const pOrder: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+      const pA = pOrder[a.priority] ?? 99;
+      const pB = pOrder[b.priority] ?? 99;
+      if (pA !== pB) return pA - pB;
+      return a.id.localeCompare(b.id);
+    })
+    .slice(0, 5);
 
   const handleOpenSyncPreview = async () => {
     setSyncingIndex(true);
@@ -89,10 +145,11 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
     };
   };
 
-  const copyHandoff = (e: React.MouseEvent, text?: string, id?: string) => {
+  const copyHandoff = (e: React.MouseEvent, text?: string, id?: string, title?: string) => {
     e.stopPropagation();
-    if (text && id) {
-      navigator.clipboard.writeText(text);
+    if (id) {
+      const content = text || `Execute task ${id}: ${title || ''}`;
+      navigator.clipboard.writeText(content);
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
     }
@@ -108,7 +165,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
   ];
 
   return (
-    <div style={{ padding: '1.5rem', maxWidth: '1400px', margin: '0 auto' }}>
+    <div style={{ padding: '1.25rem 1.5rem', maxWidth: '1400px', margin: '0 auto', width: '100%', boxSizing: 'border-box' }}>
       {/* Non-blocking index out of sync notice */}
       {indexOutOfSync && (
         <div style={{
@@ -174,7 +231,9 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
         display: 'flex',
         justifyContent: 'space-between',
         alignItems: 'center',
-        marginBottom: '1.5rem',
+        flexWrap: 'wrap',
+        gap: '0.75rem',
+        marginBottom: '1rem',
       }}>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
           <h1 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#f8fafc' }}>Task Backlog & Pipeline</h1>
@@ -183,46 +242,41 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
           </span>
         </div>
 
-        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* View switcher */}
           <div style={{ display: 'flex', backgroundColor: '#1e293b', padding: '0.2rem', borderRadius: '0.375rem', border: '1px solid #334155' }}>
-            <button
-              onClick={() => setViewMode('kanban')}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '0.3rem',
-                padding: '0.3rem 0.6rem',
-                borderRadius: '0.25rem',
-                border: 'none',
-                backgroundColor: viewMode === 'kanban' ? '#4f46e5' : 'transparent',
-                color: viewMode === 'kanban' ? '#fff' : '#94a3b8',
-                cursor: 'pointer',
-                fontSize: '0.8rem',
-                fontWeight: 500,
-              }}
-            >
-              <Kanban size={14} />
-              <span>Kanban</span>
-            </button>
-            <button
-              onClick={() => setViewMode('list')}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '0.3rem',
-                padding: '0.3rem 0.6rem',
-                borderRadius: '0.25rem',
-                border: 'none',
-                backgroundColor: viewMode === 'list' ? '#4f46e5' : 'transparent',
-                color: viewMode === 'list' ? '#fff' : '#94a3b8',
-                cursor: 'pointer',
-                fontSize: '0.8rem',
-                fontWeight: 500,
-              }}
-            >
-              <ListFilter size={14} />
-              <span>Initiatives & List</span>
-            </button>
+            {[
+              { id: 'queue' as const, label: 'Queue', icon: ListOrdered },
+              { id: 'kanban' as const, label: 'Kanban', icon: Kanban },
+              { id: 'tree' as const, label: 'Tree', icon: FolderTree },
+              { id: 'timeline' as const, label: 'Timeline', icon: GanttChart },
+            ].map((view) => {
+              const Icon = view.icon;
+              const isActive = viewMode === view.id;
+              return (
+                <button
+                  key={view.id}
+                  onClick={() => handleViewChange(view.id)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    padding: '0.3rem 0.65rem',
+                    borderRadius: '0.25rem',
+                    border: 'none',
+                    backgroundColor: isActive ? '#4f46e5' : 'transparent',
+                    color: isActive ? '#fff' : '#94a3b8',
+                    cursor: 'pointer',
+                    fontSize: '0.8rem',
+                    fontWeight: 500,
+                    transition: 'all 0.15s ease',
+                  }}
+                >
+                  <Icon size={14} />
+                  <span>{view.label}</span>
+                </button>
+              );
+            })}
           </div>
 
           <button
@@ -248,12 +302,17 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
         </div>
       </div>
 
-      {/* KPI Cards */}
+      {/* Compact KPI strip */}
       <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(6, 1fr)',
-        gap: '0.75rem',
-        marginBottom: '1.5rem',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '0.6rem',
+        padding: '0.4rem 0.75rem',
+        backgroundColor: '#1e293b',
+        border: '1px solid #334155',
+        borderRadius: '0.375rem',
+        marginBottom: '1.25rem',
+        flexWrap: 'wrap',
       }}>
         {[
           { label: 'Open', count: stats.open, color: '#94a3b8' },
@@ -262,106 +321,224 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
           { label: 'Delivered', count: stats.delivered, color: '#0ea5e9' },
           { label: 'Verified', count: stats.verified, color: '#10b981' },
           { label: 'Done', count: stats.done, color: '#475569' },
-        ].map((kpi) => (
-          <div
-            key={kpi.label}
-            style={{
-              backgroundColor: '#1e293b',
-              border: '1px solid #334155',
-              borderRadius: '0.5rem',
-              padding: '0.75rem 1rem',
-              borderTop: `3px solid ${kpi.color}`,
-            }}
-          >
-            <div style={{ fontSize: '0.75rem', color: '#94a3b8', fontWeight: 600, textTransform: 'uppercase' }}>{kpi.label}</div>
-            <div style={{ fontSize: '1.4rem', fontWeight: 700, color: '#f8fafc', marginTop: '0.2rem' }}>{kpi.count}</div>
-          </div>
+        ].map((kpi, idx, arr) => (
+          <React.Fragment key={kpi.label}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.35rem',
+              fontSize: '0.8rem',
+            }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: kpi.color, flexShrink: 0 }} />
+              <span style={{ color: '#94a3b8', fontSize: '0.75rem' }}>{kpi.label}:</span>
+              <strong style={{ color: '#f8fafc', fontWeight: 700, fontSize: '0.85rem' }}>{kpi.count}</strong>
+            </div>
+            {idx < arr.length - 1 && (
+              <span style={{ color: '#334155', margin: '0 0.15rem' }}>•</span>
+            )}
+          </React.Fragment>
         ))}
       </div>
 
-      {/* Next Up Focus Queue */}
-      {nextUpTasks.length > 0 && (
-        <div style={{
-          backgroundColor: '#1e293b',
-          border: '1px solid #4338ca',
-          borderRadius: '0.5rem',
-          padding: '1rem',
-          marginBottom: '1.5rem',
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.75rem', color: '#a5b4fc', fontSize: '0.85rem', fontWeight: 600 }}>
-            <ArrowRight size={16} />
-            <span>Next Up Focus Queue (Priority Execution)</span>
+      {/* Main Backlog View */}
+      {viewMode === 'queue' && (
+        <div>
+          <div style={{
+            fontSize: '0.85rem',
+            color: '#94a3b8',
+            marginBottom: '0.75rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+          }}>
+            <ArrowRight size={14} color="#818cf8" style={{ flexShrink: 0 }} />
+            <span>What to start next: emergent tasks marked next-up (initiative tasks join once the timeline engine lands).</span>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '0.75rem' }}>
-            {nextUpTasks.map((t) => (
-              <div
-                key={t.id}
-                onClick={() => setSelectedTask(t)}
-                style={{
-                  backgroundColor: '#0f172a',
-                  border: '1px solid #334155',
-                  borderRadius: '0.375rem',
-                  padding: '0.75rem',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'space-between',
-                  gap: '0.5rem',
-                }}
-              >
-                <div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
-                    <div style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
-                      <span style={{
-                        fontSize: '0.7rem',
-                        fontWeight: 700,
-                        padding: '0.1rem 0.3rem',
-                        borderRadius: '0.2rem',
-                        backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
-                        color: '#fff',
-                      }}>
-                        {t.priority}
-                      </span>
-                      <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</span>
-                    </div>
-                    <span style={{ fontSize: '0.7rem', color: '#94a3b8' }}>{t.category}</span>
-                  </div>
-                  <div style={{ fontSize: '0.85rem', fontWeight: 500, color: '#f1f5f9', lineHeight: 1.3 }}>{t.title}</div>
-                </div>
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: '0.4rem', borderTop: '1px solid #1e293b' }}>
-                  <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Assigned: <strong style={{ color: '#cbd5e1' }}>{t.executor || 'self'}</strong></span>
+          {queueTasks.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              {queueTasks.map((t) => (
+                <div
+                  key={t.id}
+                  onClick={() => setSelectedTask(t)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.75rem',
+                    padding: '0.6rem 0.85rem',
+                    backgroundColor: '#1e293b',
+                    border: '1px solid #334155',
+                    borderRadius: '0.375rem',
+                    cursor: 'pointer',
+                    transition: 'border-color 0.15s ease, background-color 0.15s ease',
+                    boxSizing: 'border-box',
+                    width: '100%',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = '#6366f1';
+                    e.currentTarget.style.backgroundColor = '#243046';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = '#334155';
+                    e.currentTarget.style.backgroundColor = '#1e293b';
+                  }}
+                >
+                  {/* ID */}
+                  <span
+                    style={{
+                      fontSize: '0.8rem',
+                      fontWeight: 700,
+                      color: '#818cf8',
+                      fontFamily: 'monospace',
+                      flexShrink: 0,
+                      minWidth: '42px',
+                    }}
+                  >
+                    {t.id}
+                  </span>
+
+                  {/* Title */}
+                  <span
+                    style={{
+                      fontSize: '0.85rem',
+                      fontWeight: 500,
+                      color: '#f8fafc',
+                      flex: 1,
+                      minWidth: 0,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title={t.title}
+                  >
+                    {t.title}
+                  </span>
+
+                  {/* Priority chip */}
+                  <span
+                    style={{
+                      fontSize: '0.7rem',
+                      fontWeight: 700,
+                      padding: '0.15rem 0.4rem',
+                      borderRadius: '0.2rem',
+                      backgroundColor:
+                        t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
+                      color: '#fff',
+                      flexShrink: 0,
+                    }}
+                  >
+                    {t.priority}
+                  </span>
+
+                  {/* Size chip if present */}
+                  {t.size && (
+                    <span
+                      style={{
+                        fontSize: '0.7rem',
+                        fontWeight: 600,
+                        padding: '0.1rem 0.35rem',
+                        borderRadius: '0.2rem',
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #475569',
+                        color: '#cbd5e1',
+                        flexShrink: 0,
+                      }}
+                    >
+                      {t.size}
+                    </span>
+                  )}
+
+                  {/* Kind chip if present */}
+                  {t.kind && (
+                    <span
+                      style={{
+                        fontSize: '0.7rem',
+                        fontWeight: 500,
+                        padding: '0.1rem 0.35rem',
+                        borderRadius: '0.2rem',
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #334155',
+                        color: '#94a3b8',
+                        flexShrink: 0,
+                      }}
+                    >
+                      {t.kind}
+                    </span>
+                  )}
+
+                  {/* Executor */}
+                  <span
+                    style={{
+                      fontSize: '0.75rem',
+                      color: '#94a3b8',
+                      flexShrink: 0,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.25rem',
+                    }}
+                  >
+                    <span style={{ color: '#64748b' }}>Assigned:</span>
+                    <strong style={{ color: '#cbd5e1', fontWeight: 600 }}>{t.executor || 'self'}</strong>
+                  </span>
+
+                  {/* Handoff copy button */}
                   <button
-                    onClick={(e) => copyHandoff(e, t.handoff, t.id)}
+                    onClick={(e) => copyHandoff(e, t.handoff, t.id, t.title)}
                     title="Copy Handoff Prompt"
                     style={{
-                      background: 'none',
-                      border: 'none',
-                      color: copiedId === t.id ? '#10b981' : '#94a3b8',
+                      background: '#0f172a',
+                      border: '1px solid #334155',
+                      borderRadius: '0.25rem',
+                      padding: '0.25rem 0.5rem',
+                      color: copiedId === t.id ? '#10b981' : '#cbd5e1',
                       cursor: 'pointer',
                       display: 'flex',
                       alignItems: 'center',
-                      gap: '0.2rem',
-                      fontSize: '0.7rem',
+                      gap: '0.25rem',
+                      fontSize: '0.75rem',
+                      flexShrink: 0,
+                      fontWeight: 500,
                     }}
                   >
-                    {copiedId === t.id ? <Check size={13} /> : <Copy size={13} />}
+                    {copiedId === t.id ? <Check size={13} color="#10b981" /> : <Copy size={13} />}
                     <span>{copiedId === t.id ? 'Copied' : 'Handoff'}</span>
                   </button>
                 </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{
+              backgroundColor: '#1e293b',
+              border: '1px dashed #334155',
+              borderRadius: '0.5rem',
+              padding: '3rem 1.5rem',
+              textAlign: 'center',
+              color: '#94a3b8',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: '0.75rem',
+            }}>
+              <ListOrdered size={32} color="#64748b" />
+              <div style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f1f5f9' }}>
+                No emergent tasks marked next-up
               </div>
-            ))}
-          </div>
+              <div style={{ fontSize: '0.85rem', color: '#94a3b8', maxWidth: '480px', lineHeight: 1.4 }}>
+                To queue a task here, set <code style={{ backgroundColor: '#0f172a', padding: '0.1rem 0.35rem', borderRadius: '0.2rem', color: '#a5b4fc', fontSize: '0.8rem' }}>**Next up:** yes</code> in its markdown header, or open the task details to flag it.
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Main View: Kanban vs List */}
-      {viewMode === 'kanban' ? (
+      {viewMode === 'kanban' && (
         <div style={{
           display: 'grid',
-          gridTemplateColumns: 'repeat(6, 1fr)',
+          gridTemplateColumns: 'repeat(6, minmax(0, 1fr))',
           gap: '0.75rem',
           minHeight: '500px',
+          width: '100%',
+          boxSizing: 'border-box',
         }}>
           {kanbanColumns.map((col) => {
             const colTasks = tasks.filter((t) => col.states.includes(t.state));
@@ -375,6 +552,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                   display: 'flex',
                   flexDirection: 'column',
                   overflow: 'hidden',
+                  minWidth: 0,
                 }}
               >
                 {/* Column header */}
@@ -385,12 +563,17 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                   justifyContent: 'space-between',
                   alignItems: 'center',
                   backgroundColor: '#0f172a',
+                  minWidth: 0,
                 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                    <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: col.color }} />
-                    <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0' }}>{col.title}</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: 0 }}>
+                    <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: col.color, flexShrink: 0 }} />
+                    <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {col.title}
+                    </span>
                   </div>
-                  <span style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600 }}>{colTasks.length}</span>
+                  <span style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600, flexShrink: 0, marginLeft: '0.25rem' }}>
+                    {colTasks.length}
+                  </span>
                 </div>
 
                 {/* Cards list */}
@@ -423,7 +606,15 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                         </span>
                         <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</span>
                       </div>
-                      <div style={{ fontSize: '0.8rem', fontWeight: 500, color: '#f8fafc', lineHeight: 1.3, marginBottom: '0.4rem' }}>
+                      <div style={{
+                        fontSize: '0.8rem',
+                        fontWeight: 500,
+                        color: '#f8fafc',
+                        lineHeight: 1.3,
+                        marginBottom: '0.4rem',
+                        overflowWrap: 'break-word',
+                        wordBreak: 'break-word',
+                      }}>
                         {t.title}
                       </div>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.7rem', color: '#64748b' }}>
@@ -442,89 +633,50 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
             );
           })}
         </div>
-      ) : (
-        /* List & Initiatives View */
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-          {/* Initiatives Table */}
-          {initiatives.length > 0 && (
-            <div style={{ backgroundColor: '#1e293b', borderRadius: '0.5rem', border: '1px solid #334155', padding: '1rem' }}>
-              <h2 style={{ fontSize: '1rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                <Layers size={16} color="#818cf8" />
-                <span>Planned Initiatives</span>
-              </h2>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '0.75rem' }}>
-                {initiatives.map((init) => (
-                  <div key={init.id} style={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '0.375rem', padding: '0.75rem' }}>
-                    <div style={{ fontSize: '0.75rem', fontWeight: 600, color: '#818cf8' }}>Initiative #{init.id}</div>
-                    <div style={{ fontSize: '0.9rem', fontWeight: 600, color: '#f1f5f9', marginTop: '0.2rem' }}>{init.title}</div>
-                    <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: '0.4rem' }}>{init.tasks_count} subtask(s) defined</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+      )}
 
-          {/* All Tasks Table */}
-          <div style={{ backgroundColor: '#1e293b', borderRadius: '0.5rem', border: '1px solid #334155', overflow: 'hidden' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-              <thead>
-                <tr style={{ backgroundColor: '#0f172a', color: '#94a3b8', borderBottom: '1px solid #334155' }}>
-                  <th style={{ padding: '0.6rem 0.8rem' }}>Priority</th>
-                  <th style={{ padding: '0.6rem 0.8rem' }}>ID</th>
-                  <th style={{ padding: '0.6rem 0.8rem' }}>Title</th>
-                  <th style={{ padding: '0.6rem 0.8rem' }}>Category</th>
-                  <th style={{ padding: '0.6rem 0.8rem' }}>State</th>
-                  <th style={{ padding: '0.6rem 0.8rem' }}>Executor</th>
-                  <th style={{ padding: '0.6rem 0.8rem' }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tasks.map((t) => (
-                  <tr
-                    key={t.id}
-                    onClick={() => setSelectedTask(t)}
-                    style={{ borderBottom: '1px solid #334155', cursor: 'pointer' }}
-                    onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#243046')}
-                    onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                  >
-                    <td style={{ padding: '0.6rem 0.8rem' }}>
-                      <span style={{
-                        fontSize: '0.7rem',
-                        fontWeight: 700,
-                        padding: '0.1rem 0.3rem',
-                        borderRadius: '0.2rem',
-                        backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
-                        color: '#fff',
-                      }}>
-                        {t.priority}
-                      </span>
-                    </td>
-                    <td style={{ padding: '0.6rem 0.8rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</td>
-                    <td style={{ padding: '0.6rem 0.8rem', color: '#f1f5f9', fontWeight: 500 }}>{t.title}</td>
-                    <td style={{ padding: '0.6rem 0.8rem', color: '#94a3b8' }}>{t.category}</td>
-                    <td style={{ padding: '0.6rem 0.8rem' }}>
-                      <span style={{ fontSize: '0.75rem', padding: '0.1rem 0.4rem', borderRadius: '1rem', backgroundColor: '#334155', color: '#cbd5e1' }}>
-                        {t.state}
-                      </span>
-                    </td>
-                    <td style={{ padding: '0.6rem 0.8rem', color: '#cbd5e1' }}>{t.executor || 'self'}</td>
-                    <td style={{ padding: '0.6rem 0.8rem' }}>
-                      <button
-                        onClick={(e) => copyHandoff(e, t.handoff, t.id)}
-                        style={{
-                          background: 'none',
-                          border: 'none',
-                          color: copiedId === t.id ? '#10b981' : '#94a3b8',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        {copiedId === t.id ? <Check size={14} /> : <Copy size={14} />}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {viewMode === 'tree' && (
+        <div style={{
+          backgroundColor: '#1e293b',
+          border: '1px dashed #334155',
+          borderRadius: '0.5rem',
+          padding: '3.5rem 1.5rem',
+          textAlign: 'center',
+          color: '#94a3b8',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '0.75rem',
+        }}>
+          <FolderTree size={36} color="#64748b" />
+          <div style={{ fontSize: '1rem', fontWeight: 600, color: '#f1f5f9' }}>
+            Tree View
+          </div>
+          <div style={{ fontSize: '0.85rem', color: '#94a3b8', maxWidth: '480px', lineHeight: 1.4 }}>
+            Hierarchical breakdown of initiatives, subtasks, and recursive task trees is coming with initiative 11.
+          </div>
+        </div>
+      )}
+
+      {viewMode === 'timeline' && (
+        <div style={{
+          backgroundColor: '#1e293b',
+          border: '1px dashed #334155',
+          borderRadius: '0.5rem',
+          padding: '3.5rem 1.5rem',
+          textAlign: 'center',
+          color: '#94a3b8',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '0.75rem',
+        }}>
+          <GanttChart size={36} color="#64748b" />
+          <div style={{ fontSize: '1rem', fontWeight: 600, color: '#f1f5f9' }}>
+            Timeline View
+          </div>
+          <div style={{ fontSize: '0.85rem', color: '#94a3b8', maxWidth: '480px', lineHeight: 1.4 }}>
+            Interactive timeline, dependency graph, and heaviest-chain Gantt view are coming with task 10.2.
           </div>
         </div>
       )}

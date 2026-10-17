@@ -29,14 +29,16 @@ export const Navbar: React.FC<NavbarProps> = ({
       padding: '0.75rem 1.5rem',
       backgroundColor: '#1e293b',
       borderBottom: '1px solid #334155',
+      flexWrap: 'wrap',
+      gap: '0.75rem',
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, fontSize: '1.1rem', color: '#818cf8' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, fontSize: '1.1rem', color: '#818cf8', flexShrink: 0 }}>
           <Layers size={22} />
           <span>ai-orchestration</span>
         </div>
 
-        <nav style={{ display: 'flex', gap: '0.25rem', marginLeft: '1.5rem' }}>
+        <nav style={{ display: 'flex', gap: '0.25rem', marginLeft: '1rem', flexWrap: 'wrap' }}>
           <button
             onClick={() => setActiveTab('backlog')}
             style={{

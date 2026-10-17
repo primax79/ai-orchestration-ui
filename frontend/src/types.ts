@@ -15,13 +15,14 @@ export type CognitiveProfile = 'deep-reasoning' | 'orchestration' | 'bulk-execut
 export type VerificationMode = 'self' | 'independent-session' | 'cross-agent' | 'panel' | 'owner';
 
 export interface TaskItem {
-  kind: 'emergent' | 'initiative_task';
+  kind: 'emergent' | 'initiative_task' | string;
   id: string;
   title: string;
   category: string;
   priority: Priority;
   priority_reason?: string;
   next_up?: string;
+  size?: string;
   state: TaskState;
   executor: string;
   depends_on?: string;
