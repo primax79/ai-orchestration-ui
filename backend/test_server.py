@@ -1770,3 +1770,30 @@ def test_global_config_override_reaches_config_commands(monkeypatch):
             pass
         assert "--global-config" in captured["cmd"], args
         assert captured["cmd"][captured["cmd"].index("--global-config") + 1] == "/tmp/scratch-global.toml"
+
+
+def test_task_detail_for_plan_tasks(monkeypatch, tmp_path):
+    tasks = tmp_path / "tasks"
+    (tasks / "05-sample").mkdir(parents=True)
+    (tasks / "05-sample" / "plan.md").write_text(
+        "# 05 - Sample\n\n## Tasks\n\n### 05.1 - First\n\n- **Status:** `open`\n- **Goal:** one\n\n"
+        "### 05.2 - Second\n- **Status:** `done`\n\n## Log\n\n- entry\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(state, "workspace", tmp_path)
+    headers = {"X-AI-Orch-Token": get_or_create_token()}
+
+    res = client.get("/api/tasks/05.1", headers=headers)
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["relative_path"] == "tasks/05-sample/plan.md"
+    assert data["content"].startswith("### 05.1 - First") and "05.2" not in data["content"]
+
+    res = client.get("/api/tasks/05.2", headers=headers)
+    assert "## Log" not in res.json()["content"]
+
+    res = client.get("/api/tasks/INIT-05", headers=headers)
+    assert res.status_code == 200 and "## Log" in res.json()["content"]
+
+    assert client.get("/api/tasks/05.9", headers=headers).status_code == 404
+    assert client.get("/api/tasks/T0*", headers=headers).status_code == 400

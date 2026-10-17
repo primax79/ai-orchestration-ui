@@ -735,9 +735,53 @@ async def api_sync_index(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
+TASK_DETAIL_ID_RE = re.compile(r"^(T\d{3,}|\d{2,}\.\d+|INIT-\d{2,})$")
+
+
+def _plan_for_initiative(tasks_dir: pathlib.Path, init_id: str) -> pathlib.Path | None:
+    for pattern in (f"{init_id}-*/plan.md", f"done/{init_id}-*/plan.md", f"*/{init_id}-*/plan.md"):
+        found = sorted(tasks_dir.glob(pattern))
+        if found:
+            return found[0]
+    return None
+
+
+def _plan_task_block(plan_text: str, task_id: str) -> str | None:
+    """The `### NN.T - title` block of a plan, up to the next heading of level <= 3."""
+    lines = plan_text.splitlines()
+    head = re.compile(rf"^###\s+{re.escape(task_id)}\s+[\u2014\u2013-]\s+")
+    start = next((i for i, ln in enumerate(lines) if head.match(ln)), None)
+    if start is None:
+        return None
+    end = next((j for j in range(start + 1, len(lines)) if re.match(r"^#{1,3}\s", lines[j])), len(lines))
+    return "\n".join(lines[start:end]).rstrip() + "\n"
+
+
 async def api_get_task_detail(request: Request) -> JSONResponse:
     task_id = request.path_params["task_id"]
+    if not TASK_DETAIL_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
     tasks_dir = state.workspace / "tasks"
+
+    # Initiative tasks (NN.T) and synthetic initiative cards (INIT-NN) live in plan.md.
+    if not task_id.startswith("T"):
+        init_id = task_id[5:] if task_id.startswith("INIT-") else task_id.split(".")[0]
+        plan = _plan_for_initiative(tasks_dir, init_id)
+        if plan is None:
+            return JSONResponse({"error": f"Plan for initiative {init_id} not found"}, status_code=404)
+        plan_text = plan.read_text(encoding="utf-8")
+        content = plan_text if task_id.startswith("INIT-") else _plan_task_block(plan_text, task_id)
+        if content is None:
+            return JSONResponse({"error": f"Task {task_id} not found in {plan.relative_to(state.workspace)}"}, status_code=404)
+        return JSONResponse({
+            "task_id": task_id,
+            "file_path": str(plan),
+            "relative_path": str(plan.relative_to(state.workspace)),
+            "is_folder_bundle": False,
+            "is_plan_task": True,
+            "content": content,
+            "progress_content": None,
+        })
 
     candidates = list(tasks_dir.glob(f"*/{task_id}-*.md")) + list(tasks_dir.glob(f"*/{task_id}/README.md"))
     candidates += list(tasks_dir.glob(f"done/*/{task_id}-*.md")) + list(tasks_dir.glob(f"done/*/{task_id}/README.md"))
