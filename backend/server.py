@@ -258,6 +258,10 @@ async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[in
         home = get_ai_orch_home()
         if home and "--home" not in cmd_args:
             cmd_args = ["env", "--home", str(home), *cmd_args[1:]]
+    elif cmd_args and cmd_args[0] == "run":
+        global_cfg = os.environ.get("AI_ORCH_GLOBAL_CONFIG", "").strip()
+        if global_cfg and "--global-config" not in cmd_args:
+            cmd_args = ["run", "--global-config", global_cfg, *cmd_args[1:]]
 
     if os.access(bin_path, os.X_OK):
         cmd = [str(bin_path), *cmd_args]
@@ -312,10 +316,21 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
 
     err_str = ""
     if isinstance(data, dict):
-        if data.get("error") in ("stale-task", "lock-timeout"):
+        reason = str(data.get("reason") or "").lower()
+        err_val = str(data.get("error") or data.get("message") or "").lower()
+        if data.get("error") in ("stale-task", "lock-timeout") or reason in (
+            "stale-task",
+            "lock-timeout",
+            "plan-hash-mismatch",
+            "task-hash-mismatch",
+            "task-bundle-hash-drift",
+            "target-branch-head-drift",
+            "target-head-drift",
+            "same-task-active",
+            "active-chain-run",
+        ):
             return 409
-        err_val = data.get("error") or data.get("message") or ""
-        err_str = str(err_val).lower()
+        err_str = f"{reason} {err_val}"
     elif isinstance(data, str):
         err_str = data.lower()
 
@@ -329,6 +344,12 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "refusing to apply" in err_str
         or "workspace has no project config" in err_str
         or "no project config" in err_str
+        or "drift" in err_str
+        or "has changed" in err_str
+        or "same-task-active" in err_str
+        or "already has an active run" in err_str
+        or "active-chain-run" in err_str
+        or "references the same worktree" in err_str
     ):
         return 409
 
@@ -345,6 +366,8 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "must end with" in err_str
         or "exceeds 160" in err_str
         or "single line" in err_str
+        or "cannot cancel run in terminal state" in err_str
+        or "cannot clean up run" in err_str
     ):
         return 400
 
@@ -452,6 +475,21 @@ def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) ->
         except OSError:
             pass
 
+    runs_dir = workspace / ".ai-orchestration" / "runs"
+    if runs_dir.is_dir():
+        try:
+            mtimes[f"runs:{runs_dir}"] = runs_dir.stat().st_mtime
+            for p in runs_dir.iterdir():
+                try:
+                    if p.is_dir():
+                        run_json = p / "run.json"
+                        if run_json.is_file():
+                            mtimes[f"runs:{run_json}"] = run_json.stat().st_mtime
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     return mtimes
 
 
@@ -475,6 +513,8 @@ async def _polling_watcher_loop() -> None:
                         changed_areas.add("tasks")
                     elif k.startswith("tasks:"):
                         changed_areas.add("tasks")
+                    elif k.startswith("runs:"):
+                        changed_areas.add("runs")
 
             if changed_areas:
                 await asyncio.sleep(0.3)
@@ -488,6 +528,8 @@ async def _polling_watcher_loop() -> None:
                             changed_areas.add("tasks")
                         elif k.startswith("tasks:"):
                             changed_areas.add("tasks")
+                        elif k.startswith("runs:"):
+                            changed_areas.add("runs")
                 last_snapshot = debounce_snapshot
                 await state.broadcast({"type": "changed", "areas": sorted(list(changed_areas))})
             else:
@@ -518,6 +560,8 @@ async def _watchfiles_watcher_loop() -> None:
                     areas.add("tasks")
                 elif p.suffix == ".md" or p == (state.workspace / "tasks"):
                     areas.add("tasks")
+            elif ".ai-orchestration" in p.parts and "runs" in p.parts and (p.name == "run.json" or p.name == "runs"):
+                areas.add("runs")
         if areas:
             await state.broadcast({"type": "changed", "areas": sorted(list(areas))})
 
@@ -1252,6 +1296,283 @@ async def api_apply_agents_md(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# REST Endpoints: Agent Runs & Execution (07.6)
+# ---------------------------------------------------------------------------
+
+RUN_ID_RE = re.compile(r"^\d{8}-\d{6}-[A-Za-z0-9.]+-(kilo|claude|codex)-[0-9a-f]{4}$")
+
+
+async def api_run_options(request: Request) -> JSONResponse:
+    task = request.query_params.get("task")
+    if not task:
+        return JSONResponse({"error": "task query parameter is required"}, status_code=400)
+    cmd = ["run", "options", "--task", str(task), "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_run_preview(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    task = body.get("task")
+    if not task:
+        return JSONResponse({"error": "task is required"}, status_code=400)
+    cmd = ["run", "preview", "--task", str(task), "--workspace", str(state.workspace), "--json"]
+    if body.get("mode"):
+        cmd.extend(["--mode", str(body["mode"])])
+    if body.get("tool"):
+        cmd.extend(["--tool", str(body["tool"])])
+    if body.get("profile"):
+        cmd.extend(["--profile", str(body["profile"])])
+    if body.get("model"):
+        cmd.extend(["--model", str(body["model"])])
+    if body.get("variant"):
+        cmd.extend(["--variant", str(body["variant"])])
+    if body.get("effort"):
+        cmd.extend(["--effort", str(body["effort"])])
+    if body.get("isolation"):
+        cmd.extend(["--isolation", str(body["isolation"])])
+    if body.get("target_run"):
+        cmd.extend(["--target-run", str(body["target_run"])])
+    if body.get("instructions"):
+        cmd.extend(["--instructions", str(body["instructions"])])
+    if body.get("allow_same_tool"):
+        cmd.append("--allow-same-tool")
+    if body.get("allow_dirty_base"):
+        cmd.append("--allow-dirty-base")
+    if body.get("force"):
+        cmd.append("--force")
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_run_start(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    task = body.get("task")
+    if not task:
+        return JSONResponse({"error": "task is required"}, status_code=400)
+    expect_plan_hash = body.get("expect_plan_hash")
+    if not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    cmd = [
+        "run", "start",
+        "--task", str(task),
+        "--expect-plan-hash", str(expect_plan_hash),
+        "--requested-by", "ui",
+        "--workspace", str(state.workspace),
+        "--json",
+    ]
+    if body.get("mode"):
+        cmd.extend(["--mode", str(body["mode"])])
+    if body.get("tool"):
+        cmd.extend(["--tool", str(body["tool"])])
+    if body.get("profile"):
+        cmd.extend(["--profile", str(body["profile"])])
+    if body.get("model"):
+        cmd.extend(["--model", str(body["model"])])
+    if body.get("variant"):
+        cmd.extend(["--variant", str(body["variant"])])
+    if body.get("effort"):
+        cmd.extend(["--effort", str(body["effort"])])
+    if body.get("isolation"):
+        cmd.extend(["--isolation", str(body["isolation"])])
+    if body.get("target_run"):
+        cmd.extend(["--target-run", str(body["target_run"])])
+    if body.get("instructions"):
+        cmd.extend(["--instructions", str(body["instructions"])])
+    if body.get("allow_same_tool"):
+        cmd.append("--allow-same-tool")
+    if body.get("allow_dirty_base"):
+        cmd.append("--allow-dirty-base")
+    if body.get("force"):
+        cmd.append("--force")
+
+    code, data = await run_ai_orch(cmd, timeout=60.0)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_run_continue(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = [
+        "run", "start",
+        "--continue", run_id,
+        "--requested-by", "ui",
+        "--workspace", str(state.workspace),
+        "--json",
+    ]
+    if body.get("instructions"):
+        cmd.extend(["--instructions", str(body["instructions"])])
+    if body.get("expect_plan_hash"):
+        cmd.extend(["--expect-plan-hash", str(body["expect_plan_hash"])])
+
+    code, data = await run_ai_orch(cmd, timeout=60.0)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_list_runs(request: Request) -> JSONResponse:
+    cmd = ["run", "list", "--workspace", str(state.workspace), "--json"]
+    task = request.query_params.get("task")
+    if task:
+        cmd.extend(["--task", task])
+    active = request.query_params.get("active")
+    if active is not None and active.lower() in ("1", "true", "yes", ""):
+        cmd.append("--active")
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_run(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    cmd = ["run", "show", run_id, "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("reason") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    return JSONResponse(data if isinstance(data, dict) else {"run": data})
+
+
+async def api_get_run_logs(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    cmd = ["run", "logs", run_id, "--workspace", str(state.workspace), "--json"]
+    since_offset = request.query_params.get("since_offset")
+    if since_offset is not None and since_offset != "":
+        cmd.extend(["--since-offset", str(since_offset)])
+    tail = request.query_params.get("tail")
+    if tail is not None and tail != "":
+        cmd.extend(["--tail", str(tail)])
+
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("reason") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    return JSONResponse(data if isinstance(data, dict) else {"logs": data})
+
+
+async def api_cancel_run(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    cmd = ["run", "cancel", run_id, "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd, timeout=60.0)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("reason") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    await state.broadcast({"type": "run_cancelled", "run_id": run_id})
+    return JSONResponse(data if isinstance(data, dict) else {"ok": True, "run_id": run_id, "status": "cancelled"})
+
+
+async def api_mark_delivered_run(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = ["run", "mark-delivered", run_id, "--workspace", str(state.workspace), "--json"]
+    expect_hash = body.get("expect_task_hash") or body.get("expect_task_sha256")
+    if expect_hash:
+        cmd.extend(["--expect-task-hash", str(expect_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "task_delivered", "run_id": run_id})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_apply_verdict_run(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    panel_id = body.get("panel_id")
+    if panel_id:
+        cmd = ["run", "apply-verdict", "--panel", str(panel_id), "--workspace", str(state.workspace), "--json"]
+    else:
+        cmd = ["run", "apply-verdict", run_id, "--workspace", str(state.workspace), "--json"]
+
+    expect_hash = body.get("expect_task_hash") or body.get("expect_task_sha256")
+    if expect_hash:
+        cmd.extend(["--expect-task-hash", str(expect_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "verdict_applied", "run_id": run_id})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_cleanup_run(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = ["run", "cleanup", run_id, "--workspace", str(state.workspace), "--json"]
+    if body.get("discard"):
+        cmd.append("--discard")
+    if body.get("dry_run"):
+        cmd.append("--dry-run")
+    if body.get("expect_plan_hash"):
+        cmd.extend(["--expect-plan-hash", str(body["expect_plan_hash"])])
+        cmd.extend(["--requested-by", "ui"])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket Endpoint: Live File & State Updates
 # ---------------------------------------------------------------------------
 
@@ -1306,6 +1627,17 @@ routes = [
     Route("/api/config/render-agents-md", api_render_agents_md, methods=["GET"]),
     Route("/api/config/render-agents-md/preview", api_preview_agents_md, methods=["GET"]),
     Route("/api/config/render-agents-md/apply", api_apply_agents_md, methods=["POST"]),
+    Route("/api/runs/options", api_run_options, methods=["GET"]),
+    Route("/api/runs/preview", api_run_preview, methods=["POST"]),
+    Route("/api/runs", api_list_runs, methods=["GET"]),
+    Route("/api/runs", api_run_start, methods=["POST"]),
+    Route("/api/runs/{id}", api_get_run, methods=["GET"]),
+    Route("/api/runs/{id}/continue", api_run_continue, methods=["POST"]),
+    Route("/api/runs/{id}/logs", api_get_run_logs, methods=["GET"]),
+    Route("/api/runs/{id}/cancel", api_cancel_run, methods=["POST"]),
+    Route("/api/runs/{id}/mark-delivered", api_mark_delivered_run, methods=["POST"]),
+    Route("/api/runs/{id}/apply-verdict", api_apply_verdict_run, methods=["POST"]),
+    Route("/api/runs/{id}/cleanup", api_cleanup_run, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ]
 

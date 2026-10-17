@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import time
@@ -1065,3 +1067,291 @@ def test_watcher_broadcasts_on_question_file_change(monkeypatch):
                     assert "tasks" in areas
         finally:
             state.workspace = old_ws
+
+
+def _setup_runs_workspace(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, stub_args: list[str] | None = None) -> pathlib.Path:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(ws), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestUser"], cwd=str(ws), check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(ws), check=True)
+
+    t_dir = ws / "tasks" / "features"
+    t_dir.mkdir(parents=True)
+    task_file = t_dir / "T001-sample-task.md"
+    task_file.write_text(
+        "# T001 Sample Task\n\n"
+        "- id: T001\n"
+        "- state: open\n"
+        "- priority: P1\n"
+        "- assignee: kilo\n"
+        "- profile: bulk-execution\n"
+        "- verifier: -\n"
+        "- decider: -\n"
+        "- plan-hash: -\n\n"
+        "## Goal\nSample goal\n\n"
+        "## Steps\n1. Step 1\n\n"
+        "## Verification\nSample verification\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=str(ws), check=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=str(ws), check=True, capture_output=True)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    kilo_sym = bin_dir / "kilo"
+    if not kilo_sym.exists():
+        kilo_sym.symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+    if stub_args is None:
+        stub_args = ["--commit", "--final-report", "--session-id", "s1"]
+
+    stub_agent_path = "/Users/Alfredo/works/ai-coding-tools/ai-orchestration/scripts/fixtures/runs/stub_agent.py"
+    args_json = json.dumps([sys.executable, stub_agent_path, *stub_args])
+
+    cfg = tmp_path / "global_orchestration.toml"
+    cfg.write_text(
+        f'[routing]\n'
+        f'default_orchestrator = "kilo"\n'
+        f'default_executor = "kilo"\n'
+        f'default_profile = "bulk-execution"\n'
+        f'verification_mode = "cross-agent"\n\n'
+        f'[tools.kilo]\n'
+        f'enabled = true\n\n'
+        f'[tools.kilo.profiles.bulk-execution]\n'
+        f'model = "google/gemini-3.8-flash"\n'
+        f'variant = "medium"\n\n'
+        f'[tools.kilo.headless]\n'
+        f'argv = {args_json}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_ORCH_GLOBAL_CONFIG", str(cfg))
+    return ws
+
+
+def test_runs_options_preview_start_show_logs_delivered_cleanup(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    ws = _setup_runs_workspace(tmp_path, monkeypatch)
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # 1. Options
+        res_opt = client.get("/api/runs/options?task=T001", headers=headers)
+        assert res_opt.status_code == 200
+        opt_data = res_opt.json()
+        assert opt_data.get("ok") is True
+        assert "tools" in opt_data
+        assert opt_data["tools"]["kilo"]["available"] is True
+        assert "execute" in opt_data.get("allowed_modes", [])
+
+        # Missing task param on options -> 400
+        res_opt_bad = client.get("/api/runs/options", headers=headers)
+        assert res_opt_bad.status_code == 400
+
+        # 2. Preview
+        preview_payload = {"task": "T001", "mode": "execute", "tool": "kilo"}
+        res_prev = client.post("/api/runs/preview", headers=headers, json=preview_payload)
+        assert res_prev.status_code == 200
+        prev_data = res_prev.json()
+        assert prev_data.get("ok") is True
+        assert "plan_hash" in prev_data
+        assert "prompt" in prev_data
+        assert "argv_display" in prev_data
+        plan_hash = prev_data["plan_hash"]
+
+        # Missing task on preview -> 400
+        res_prev_bad = client.post("/api/runs/preview", headers=headers, json={})
+        assert res_prev_bad.status_code == 400
+
+        # 3. Start: missing plan_hash -> 400
+        res_start_nohash = client.post("/api/runs", headers=headers, json={"task": "T001", "mode": "execute", "tool": "kilo"})
+        assert res_start_nohash.status_code == 400
+        assert "expect_plan_hash is required" in res_start_nohash.json().get("error", "")
+
+        # 4. Start: stale plan_hash -> 409
+        res_start_stale = client.post(
+            "/api/runs",
+            headers=headers,
+            json={"task": "T001", "mode": "execute", "tool": "kilo", "expect_plan_hash": "deadbeef" * 8},
+        )
+        assert res_start_stale.status_code == 409
+        assert "plan hash mismatch" in res_start_stale.json().get("error", "").lower()
+
+        # 5. Start: success with matching plan_hash -> 200
+        res_start = client.post(
+            "/api/runs",
+            headers=headers,
+            json={"task": "T001", "mode": "execute", "tool": "kilo", "expect_plan_hash": plan_hash},
+        )
+        assert res_start.status_code == 200
+        start_data = res_start.json()
+        assert start_data.get("ok") is True
+        run_id = start_data["run_id"]
+        assert start_data.get("status") == "starting"
+
+        # 6. Poll show until succeeded
+        run_record = None
+        for _ in range(30):
+            time.sleep(0.5)
+            res_show = client.get(f"/api/runs/{run_id}", headers=headers)
+            assert res_show.status_code == 200
+            show_data = res_show.json()
+            assert show_data.get("ok") is True
+            run_record = show_data.get("run", {})
+            if run_record.get("status") == "succeeded":
+                break
+
+        assert run_record is not None
+        assert run_record.get("status") == "succeeded"
+        assert run_record.get("final_commit") is not None
+        assert run_record.get("final_report") is not None
+
+        # 7. List runs
+        res_list = client.get("/api/runs?task=T001", headers=headers)
+        assert res_list.status_code == 200
+        list_data = res_list.json()
+        assert list_data.get("ok") is True
+        assert any(r["run_id"] == run_id for r in list_data.get("runs", []))
+
+        # 8. Logs incremental
+        res_logs = client.get(f"/api/runs/{run_id}/logs", headers=headers)
+        assert res_logs.status_code == 200
+        logs_data = res_logs.json()
+        assert logs_data.get("ok") is True
+        assert len(logs_data.get("events", [])) > 0
+        next_offset = logs_data.get("next_offset")
+        assert next_offset > 0
+
+        # Incremental logs starting from next_offset -> empty
+        res_inc = client.get(f"/api/runs/{run_id}/logs?since_offset={next_offset}", headers=headers)
+        assert res_inc.status_code == 200
+        inc_data = res_inc.json()
+        assert inc_data.get("ok") is True
+        assert len(inc_data.get("events", [])) == 0
+
+        # 9. Mark-delivered
+        res_del = client.post(f"/api/runs/{run_id}/mark-delivered", headers=headers, json={})
+        assert res_del.status_code == 200
+        del_data = res_del.json()
+        assert del_data.get("ok") is True
+        assert del_data.get("state") == "delivered"
+
+        # 10. Cleanup
+        res_clean = client.post(f"/api/runs/{run_id}/cleanup", headers=headers, json={"discard": True})
+        assert res_clean.status_code == 200
+        clean_data = res_clean.json()
+        assert clean_data.get("ok") is True
+        assert clean_data.get("cleaned") is True
+    finally:
+        state.workspace = old_ws
+
+
+def test_runs_cancel_long_sleeping_stub(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    ws = _setup_runs_workspace(tmp_path, monkeypatch, stub_args=["--sleep", "30"])
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # Preview
+        res_prev = client.post(
+            "/api/runs/preview",
+            headers=headers,
+            json={"task": "T001", "mode": "execute", "tool": "kilo"},
+        )
+        assert res_prev.status_code == 200
+        plan_hash = res_prev.json()["plan_hash"]
+
+        # Start
+        res_start = client.post(
+            "/api/runs",
+            headers=headers,
+            json={"task": "T001", "mode": "execute", "tool": "kilo", "expect_plan_hash": plan_hash},
+        )
+        assert res_start.status_code == 200
+        run_id = res_start.json()["run_id"]
+
+        # Wait briefly for process to spawn
+        time.sleep(1.0)
+
+        # Cancel
+        res_cancel = client.post(f"/api/runs/{run_id}/cancel", headers=headers)
+        assert res_cancel.status_code == 200
+        cancel_data = res_cancel.json()
+        assert cancel_data.get("ok") is True
+        assert cancel_data.get("status") == "cancelled"
+
+        # Verify show returns cancelled
+        res_show = client.get(f"/api/runs/{run_id}", headers=headers)
+        assert res_show.status_code == 200
+        assert res_show.json()["run"]["status"] == "cancelled"
+    finally:
+        state.workspace = old_ws
+
+
+def test_runs_bad_id_format(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    for bad_id in ["invalid", "T001", "bad-run-id", "20261017-123456-T001-unknown-1234", "1234-56-T1-kilo-1234"]:
+        assert client.get(f"/api/runs/{bad_id}", headers=headers).status_code == 400
+        assert client.post(f"/api/runs/{bad_id}/continue", headers=headers, json={}).status_code == 400
+        assert client.get(f"/api/runs/{bad_id}/logs", headers=headers).status_code == 400
+        assert client.post(f"/api/runs/{bad_id}/cancel", headers=headers).status_code == 400
+        assert client.post(f"/api/runs/{bad_id}/mark-delivered", headers=headers, json={}).status_code == 400
+        assert client.post(f"/api/runs/{bad_id}/apply-verdict", headers=headers, json={}).status_code == 400
+        assert client.post(f"/api/runs/{bad_id}/cleanup", headers=headers, json={}).status_code == 400
+
+    # Valid run_id format but not found -> 404
+    non_existent = "20261017-123456-T999-kilo-abcd"
+    assert client.get(f"/api/runs/{non_existent}", headers=headers).status_code == 404
+    assert client.get(f"/api/runs/{non_existent}/logs", headers=headers).status_code == 404
+
+
+def test_runs_watcher_broadcast(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    monkeypatch.setenv("AI_ORCH_WATCH_POLLING", "1")
+    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.5")
+
+    runs_dir = tmp_path / ".ai-orchestration" / "runs" / "20261017-123456-T001-kilo-1234"
+    runs_dir.mkdir(parents=True)
+    run_file = runs_dir / "run.json"
+    run_file.write_text(json.dumps({"run_id": "20261017-123456-T001-kilo-1234", "status": "starting"}), encoding="utf-8")
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        with TestClient(app) as test_client:
+            with test_client.websocket_connect(f"/ws?token={token}") as ws:
+                init_msg = ws.receive_json()
+                assert init_msg.get("type") == "connected"
+
+                # Touch run.json (metadata only)
+                time.sleep(0.1)
+                run_file.write_text(json.dumps({"run_id": "20261017-123456-T001-kilo-1234", "status": "running"}), encoding="utf-8")
+
+                # Wait for broadcast
+                broadcast_msg = ws.receive_json()
+                assert broadcast_msg.get("type") == "changed"
+                assert "runs" in broadcast_msg.get("areas", [])
+    finally:
+        state.workspace = old_ws
+
+
+def test_runs_auth_enforced():
+    # Endpoints without token -> 401
+    assert client.get("/api/runs").status_code == 401
+    assert client.get("/api/runs/options?task=T001").status_code == 401
+    assert client.post("/api/runs/preview", json={}).status_code == 401
+    assert client.post("/api/runs", json={}).status_code == 401
+    assert client.get("/api/runs/20261017-123456-T001-kilo-1234").status_code == 401
+    assert client.post("/api/runs/20261017-123456-T001-kilo-1234/continue", json={}).status_code == 401
+    assert client.get("/api/runs/20261017-123456-T001-kilo-1234/logs").status_code == 401
+    assert client.post("/api/runs/20261017-123456-T001-kilo-1234/cancel").status_code == 401
+    assert client.post("/api/runs/20261017-123456-T001-kilo-1234/mark-delivered", json={}).status_code == 401
+    assert client.post("/api/runs/20261017-123456-T001-kilo-1234/apply-verdict", json={}).status_code == 401
+    assert client.post("/api/runs/20261017-123456-T001-kilo-1234/cleanup", json={}).status_code == 401

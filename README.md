@@ -129,6 +129,19 @@ For all mutating environment commands, the API provides preview/apply endpoint p
 - `POST /api/questions/{id}/answer` — Answer a blocking question (`choice`, optional `text` capped at 32 KB, `by`). Once all questions for a task are resolved, restores the task to its prior state.
 - `POST /api/questions/{id}/withdraw` — Withdraw a blocking question (`reason` required, optional `by`), restoring blocked tasks.
 
+### 5. Agent Runs & Execution (07.6)
+- `GET /api/runs/options?task=ID` — Retrieve available tools, models per profile, resolved defaults, and usable verify targets for a task.
+- `POST /api/runs/preview` — Validate launch request and return binding plan preview (`{prompt, argv_display, cwd, planned_worktree, warnings, plan_hash}`).
+- `POST /api/runs` — Start an agent run, strictly requiring `expect_plan_hash` matching the preview (missing hash returns `HTTP 400`, stale hash returns `HTTP 409`).
+- `GET /api/runs` — List recent and active runs, with optional filters `task` and `active`.
+- `GET /api/runs/{id}` — Retrieve detailed execution record and lifecycle status for a run (ID validated against `^\d{8}-\d{6}-[A-Za-z0-9.]+-(kilo|claude|codex)-[0-9a-f]{4}$`).
+- `POST /api/runs/{id}/continue` — Continue a terminal run with new `{instructions, expect_plan_hash?}`.
+- `GET /api/runs/{id}/logs` — Retrieve streaming or incremental events with `since_offset` and `tail` query parameters.
+- `POST /api/runs/{id}/cancel` — Cancel an active run by terminating its process group (60 s timeout).
+- `POST /api/runs/{id}/mark-delivered` — Transition task to `delivered` after a successful execute run verifying git branch, commit, and Final Report invariants (`expect_task_hash` supported).
+- `POST /api/runs/{id}/apply-verdict` — Apply verification verdict (`verified` or `bounced`) to transition the task (`expect_task_hash` and `panel_id` supported).
+- `POST /api/runs/{id}/cleanup` — Remove worktree and branch for terminal runs (`discard` and `dry_run` supported).
+
 ---
 
 ## Development
