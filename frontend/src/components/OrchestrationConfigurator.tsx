@@ -49,7 +49,6 @@ interface CellEditState {
 export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps> = ({
   configData,
   onRefresh,
-  onNavigateToDecisions,
 }) => {
   // Scope: 'global' vs 'project'
   const [selectedScope, setSelectedScope] = useState<'global' | 'project'>(() => {
@@ -665,75 +664,37 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         </div>
       )}
 
-      {/* Claude Headless Tool Policy (R11) Warning / Status */}
+      {/* Claude headless permission policy (R11). Since 07.12 (decision Q001 = A) an empty
+          config is valid: runs use the built-in per-mode allow-list, never --dangerously-*. */}
       <div style={{
-        backgroundColor: isClaudeAllowedToolsConfigured ? '#0f172a' : '#3b1c1c',
-        border: `1px solid ${isClaudeAllowedToolsConfigured ? '#334155' : '#ef4444'}`,
-        borderLeft: `4px solid ${isClaudeAllowedToolsConfigured ? '#10b981' : '#ef4444'}`,
+        backgroundColor: '#0f172a',
+        border: '1px solid #334155',
+        borderLeft: '4px solid #10b981',
         borderRadius: '0.5rem',
         padding: '0.85rem 1rem',
         display: 'flex',
         alignItems: 'center',
-        justifyContent: 'space-between',
-        flexWrap: 'wrap',
-        gap: '0.75rem',
+        gap: '0.5rem',
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flex: 1, minWidth: '280px' }}>
-          {isClaudeAllowedToolsConfigured ? (
-            <CheckCircle2 size={17} color="#10b981" />
-          ) : (
-            <AlertTriangle size={18} color="#f87171" />
-          )}
-          <div>
-            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: isClaudeAllowedToolsConfigured ? '#e2e8f0' : '#fca5a5' }}>
-              Claude Headless Permission Policy (R11):{' '}
-              {isClaudeAllowedToolsConfigured ? (
-                <span style={{ color: '#10b981', fontWeight: 500 }}>Configured</span>
-              ) : (
-                <span style={{ color: '#ef4444' }}>Missing Allowed Tools</span>
-              )}
-            </div>
-            <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: '0.15rem' }}>
-              {isClaudeAllowedToolsConfigured ? (
-                <span>Allowed tools: <code>{claudeAllowedTools?.join(', ')}</code></span>
-              ) : (
-                <span>
-                  No <code>allowed_tools</code> configured under <code>[tools.claude.headless]</code>. Headless Claude runs will be refused until configured.
-                </span>
-              )}
-            </div>
+        <CheckCircle2 size={17} color="#10b981" />
+        <div>
+          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e2e8f0' }}>
+            Claude headless permissions:{' '}
+            <span style={{ color: '#10b981', fontWeight: 500 }}>
+              {isClaudeAllowedToolsConfigured ? 'custom allow-list' : 'built-in per-mode allow-list'}
+            </span>
           </div>
-        </div>
-
-        {!isClaudeAllowedToolsConfigured && (
-          <div>
-            {onNavigateToDecisions ? (
-              <button
-                onClick={onNavigateToDecisions}
-                style={{
-                  padding: '0.35rem 0.75rem',
-                  backgroundColor: '#7f1d1d',
-                  border: '1px solid #b91c1c',
-                  borderRadius: '0.375rem',
-                  color: '#fee2e2',
-                  fontSize: '0.78rem',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.3rem',
-                }}
-              >
-                <span>See Decision Q001</span>
-                <span>&rarr;</span>
-              </button>
+          <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: '0.15rem' }}>
+            {isClaudeAllowedToolsConfigured ? (
+              <span>Allowed tools: <code>{claudeAllowedTools?.join(', ')}</code></span>
             ) : (
-              <span style={{ fontSize: '0.75rem', color: '#f87171', fontWeight: 500 }}>
-                Refer to Question Q001 in Decisions
+              <span>
+                Each run mode (execute, verify, orchestrate) gets its own default tool list (decision Q001). Set{' '}
+                <code>allowed_tools</code> under <code>[tools.claude.headless]</code> only to override it.
               </span>
             )}
           </div>
-        )}
+        </div>
       </div>
 
       {/* Scope Selector Card */}
