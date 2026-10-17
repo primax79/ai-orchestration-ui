@@ -3,6 +3,7 @@ import { AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { BacklogManager } from './components/BacklogManager';
 import { DecisionsTab } from './components/DecisionsTab';
+import { InboxPanel } from './components/InboxPanel';
 import { RunsTab } from './components/RunsTab';
 import { TaskDetailModal } from './components/TaskDetailModal';
 import { SkillInstaller } from './components/SkillInstaller';
@@ -84,7 +85,7 @@ const PanelLoading: React.FC<{ label: string }> = ({ label }) => (
 );
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'runs' | 'installer' | 'doctor' | 'config'>('backlog');
+  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'installer' | 'doctor' | 'config'>('backlog');
 
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
 
@@ -94,6 +95,9 @@ export const App: React.FC = () => {
 
   const [openQuestionsCount, setOpenQuestionsCount] = useState<number>(0);
   const [questionsRefreshKey, setQuestionsRefreshKey] = useState<number>(0);
+
+  const [inboxBadgeCount, setInboxBadgeCount] = useState<number>(0);
+  const [inboxRefreshKey, setInboxRefreshKey] = useState<number>(0);
 
   const [activeRunsCount, setActiveRunsCount] = useState<number>(0);
   const [runsRefreshKey, setRunsRefreshKey] = useState<number>(0);
@@ -167,6 +171,20 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  const loadInboxNotesCount = useCallback(async () => {
+    try {
+      const res = await api.listInboxNotes();
+      if (res && res.notes) {
+        const count = res.notes.filter(
+          (n) => (n.status || 'draft').toLowerCase() === 'draft' || (n.status || '').toLowerCase() === 'ready'
+        ).length;
+        setInboxBadgeCount(count);
+      }
+    } catch (e: any) {
+      console.error('Failed to load inbox notes count:', e);
+    }
+  }, []);
+
   const loadEnv = useCallback(async () => {
     setEnvLoading(true);
     setEnvError(null);
@@ -200,9 +218,11 @@ export const App: React.FC = () => {
     setQuestionsRefreshKey((k) => k + 1);
     loadActiveRunsCount();
     setRunsRefreshKey((k) => k + 1);
+    loadInboxNotesCount();
+    setInboxRefreshKey((k) => k + 1);
     loadEnv();
     loadConfig();
-  }, [loadWorkspace, loadTasks, loadQuestionsCount, loadActiveRunsCount, loadEnv, loadConfig]);
+  }, [loadWorkspace, loadTasks, loadQuestionsCount, loadActiveRunsCount, loadInboxNotesCount, loadEnv, loadConfig]);
 
   // Debounced area reloading (300 ms)
   const pendingAreas = useRef<Set<string>>(new Set());
@@ -221,6 +241,10 @@ export const App: React.FC = () => {
       if (toReload.has('tasks')) {
         loadTasks();
       }
+      if (toReload.has('inbox') || toReload.has('tasks')) {
+        loadInboxNotesCount();
+        setInboxRefreshKey((k) => k + 1);
+      }
       if (toReload.has('runs')) {
         loadActiveRunsCount();
         setRunsRefreshKey((k) => k + 1);
@@ -236,7 +260,7 @@ export const App: React.FC = () => {
         loadEnv();
       }
     }, 300);
-  }, [loadTasks, loadActiveRunsCount, loadQuestionsCount, loadConfig, loadEnv]);
+  }, [loadTasks, loadInboxNotesCount, loadActiveRunsCount, loadQuestionsCount, loadConfig, loadEnv]);
 
   useEffect(() => {
     loadAll();
@@ -271,6 +295,8 @@ export const App: React.FC = () => {
           triggerDebouncedReload(['env']);
         } else if (msg.type === 'config_updated' || msg.type === 'agents_md_applied') {
           triggerDebouncedReload(['config']);
+        } else if (msg.type === 'inbox_updated') {
+          triggerDebouncedReload(['inbox']);
         } else if (
           msg.type === 'run_cancelled' ||
           msg.type === 'task_delivered' ||
@@ -300,6 +326,7 @@ export const App: React.FC = () => {
         isWsConnected={isWsConnected}
         openQuestionsCount={openQuestionsCount}
         activeRunsCount={activeRunsCount}
+        inboxNotesCount={inboxBadgeCount}
       />
 
       <main style={{ flex: 1 }}>
@@ -340,6 +367,19 @@ export const App: React.FC = () => {
                 recordOwnAction('tasks');
                 loadQuestionsCount();
                 loadTasks();
+              }}
+            />
+          </div>
+        )}
+
+        {activeTab === 'inbox' && (
+          <div>
+            <InboxPanel
+              key={inboxRefreshKey}
+              refreshTrigger={inboxRefreshKey}
+              onRefreshNotesCount={() => {
+                recordOwnAction('inbox');
+                loadInboxNotesCount();
               }}
             />
           </div>

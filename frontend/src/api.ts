@@ -21,6 +21,18 @@ import {
   RunCleanupPayload,
   RunApplyVerdictPayload,
   RunMarkDeliveredPayload,
+  InboxListResponse,
+  InboxNoteResponse,
+  AddInboxNotePayload,
+  EditInboxNotePayload,
+  AddInboxNoteResponse,
+  EditInboxNoteResponse,
+  UploadAttachmentResponse,
+  DeleteAttachmentResponse,
+  ResolveInboxNotePayload,
+  DiscardInboxNotePayload,
+  InboxToTaskPayload,
+  InboxToTaskResponse,
 } from './types';
 
 // Custom ApiError to carry HTTP status and response payload
@@ -144,6 +156,19 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> 
   }
 
   return res.json();
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const res = reader.result as string;
+      const base64 = res.includes(',') ? res.split(',')[1] : res;
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 export const api = {
@@ -649,6 +674,186 @@ export const api = {
     return apiFetch(`/api/runs/${encodeURIComponent(runId)}/cleanup`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
+    });
+  },
+
+  // -------------------------------------------------------------------------
+  // Inbox API methods (Task 09.3)
+  // -------------------------------------------------------------------------
+
+  async listInboxNotes(params?: { status?: string }): Promise<InboxListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<InboxListResponse>('listInbox', params || {});
+    }
+    const query = new URLSearchParams();
+    if (params?.status) query.set('status', params.status);
+    const qs = query.toString();
+    return apiFetch<InboxListResponse>(`/api/inbox${qs ? `?${qs}` : ''}`);
+  },
+
+  async getInboxNote(id: string): Promise<InboxNoteResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<InboxNoteResponse>('getInboxNote', { id });
+    }
+    return apiFetch<InboxNoteResponse>(`/api/inbox/${encodeURIComponent(id)}`);
+  },
+
+  async addInboxNote(payload: AddInboxNotePayload): Promise<AddInboxNoteResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<AddInboxNoteResponse>('addInboxNote', payload);
+    }
+    return apiFetch<AddInboxNoteResponse>('/api/inbox', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async editInboxNote(id: string, payload: EditInboxNotePayload): Promise<EditInboxNoteResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<EditInboxNoteResponse>('editInboxNote', { id, ...payload });
+    }
+    return apiFetch<EditInboxNoteResponse>(`/api/inbox/${encodeURIComponent(id)}`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async uploadInboxAttachment(
+    id: string,
+    file: File | Blob,
+    filename?: string
+  ): Promise<UploadAttachmentResponse> {
+    const fname = filename || (file instanceof File ? file.name : 'attachment.png');
+    if (isVsCode && vscode) {
+      const base64 = await blobToBase64(file);
+      return sendVsCodeMessage<UploadAttachmentResponse>('uploadInboxAttachment', {
+        id,
+        filename: fname,
+        data: base64,
+      });
+    }
+
+    const formData = new FormData();
+    formData.append('file', file, fname);
+    const token = getApiToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['X-AI-Orch-Token'] = token;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/inbox/${encodeURIComponent(id)}/attachments`, {
+        method: 'POST',
+        headers,
+        body: formData,
+      });
+    } catch {
+      throw new Error('Server not reachable: is ./start.sh still running?');
+    }
+
+    if (!res.ok) {
+      let err = `${res.status} ${res.statusText}`;
+      let data: any = null;
+      try {
+        data = await res.json();
+        if (data && data.error) {
+          err = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+        }
+      } catch {}
+      throw new ApiError(err, res.status, data);
+    }
+
+    return res.json();
+  },
+
+  async getInboxAttachment(id: string, name: string): Promise<Blob> {
+    if (isVsCode && vscode) {
+      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getInboxAttachment', { id, name });
+      const byteCharacters = atob(res.data);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      return new Blob([byteArray], { type: res.contentType || 'image/png' });
+    }
+
+    const token = getApiToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['X-AI-Orch-Token'] = token;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/inbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(name)}`, {
+        headers,
+      });
+    } catch {
+      throw new Error('Server not reachable: is ./start.sh still running?');
+    }
+
+    if (!res.ok) {
+      let err = `${res.status} ${res.statusText}`;
+      let data: any = null;
+      try {
+        data = await res.json();
+        if (data && data.error) {
+          err = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+        }
+      } catch {}
+      throw new ApiError(err, res.status, data);
+    }
+
+    return res.blob();
+  },
+
+  async deleteInboxAttachment(id: string, name: string): Promise<DeleteAttachmentResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<DeleteAttachmentResponse>('deleteInboxAttachment', { id, name });
+    }
+    return apiFetch<DeleteAttachmentResponse>(`/api/inbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async resolveInboxNote(id: string, payload: ResolveInboxNotePayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('resolveInboxNote', { id, ...payload });
+    }
+    return apiFetch(`/api/inbox/${encodeURIComponent(id)}/resolve`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async discardInboxNote(id: string, payload: DiscardInboxNotePayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('discardInboxNote', { id, ...payload });
+    }
+    return apiFetch(`/api/inbox/${encodeURIComponent(id)}/discard`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async reopenInboxNote(id: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('reopenInboxNote', { id });
+    }
+    return apiFetch(`/api/inbox/${encodeURIComponent(id)}/reopen`, {
+      method: 'POST',
+    });
+  },
+
+  async inboxToTask(id: string, payload: InboxToTaskPayload): Promise<InboxToTaskResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<InboxToTaskResponse>('inboxToTask', { id, ...payload });
+    }
+    return apiFetch<InboxToTaskResponse>(`/api/inbox/${encodeURIComponent(id)}/to-task`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
     });
   },
 

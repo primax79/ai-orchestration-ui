@@ -1,15 +1,16 @@
 import React from 'react';
-import { Layers, HelpCircle, DownloadCloud, Activity, Settings, RefreshCw, FolderGit2, Terminal } from 'lucide-react';
+import { Layers, HelpCircle, Inbox, DownloadCloud, Activity, Settings, RefreshCw, FolderGit2, Terminal } from 'lucide-react';
 import { WorkspaceInfo } from '../types';
 
 interface NavbarProps {
-  activeTab: 'backlog' | 'decisions' | 'runs' | 'installer' | 'doctor' | 'config';
-  setActiveTab: (tab: 'backlog' | 'decisions' | 'runs' | 'installer' | 'doctor' | 'config') => void;
+  activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'installer' | 'doctor' | 'config';
+  setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'installer' | 'doctor' | 'config') => void;
   workspace: WorkspaceInfo | null;
   onRefresh: () => void;
   isWsConnected: boolean;
   openQuestionsCount?: number;
   activeRunsCount?: number;
+  inboxNotesCount?: number;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -20,6 +21,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   isWsConnected,
   openQuestionsCount = 0,
   activeRunsCount = 0,
+  inboxNotesCount = 0,
 }) => {
   return (
     <header style={{
@@ -94,6 +96,46 @@ export const Navbar: React.FC<NavbarProps> = ({
                 }}
               >
                 {openQuestionsCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setActiveTab('inbox')}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.4rem',
+              padding: '0.4rem 0.8rem',
+              borderRadius: '0.375rem',
+              border: 'none',
+              cursor: 'pointer',
+              backgroundColor: activeTab === 'inbox' ? '#4f46e5' : 'transparent',
+              color: activeTab === 'inbox' ? '#fff' : '#94a3b8',
+              fontWeight: 500,
+            }}
+          >
+            <Inbox size={16} />
+            <span>Inbox</span>
+            {inboxNotesCount > 0 && (
+              <span
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  backgroundColor: '#ef4444',
+                  color: '#fff',
+                  fontSize: '0.7rem',
+                  fontWeight: 700,
+                  minWidth: '1.15rem',
+                  height: '1.15rem',
+                  padding: '0 0.3rem',
+                  borderRadius: '1rem',
+                  lineHeight: 1,
+                  marginLeft: '0.15rem',
+                }}
+              >
+                {inboxNotesCount}
               </span>
             )}
           </button>

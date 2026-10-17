@@ -4,6 +4,7 @@ interface SafeMarkdownProps {
   content: string;
   className?: string;
   style?: React.CSSProperties;
+  attachmentBlobUrls?: Record<string, string>;
 }
 
 /**
@@ -32,13 +33,13 @@ export function isSafeUrl(url: string): boolean {
 }
 
 /**
- * Parse inline Markdown (code, bold, italic, links) into React elements.
+ * Parse inline Markdown (images, code, bold, italic, links) into React elements.
  * All raw text is emitted as React text children, completely escaping any HTML.
  */
-function renderInline(text: string): React.ReactNode[] {
+function renderInline(text: string, attachmentBlobUrls?: Record<string, string>): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  // Tokenize regex for `code`, **bold**, *italic*, [label](url)
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+  // Tokenize regex for images (![alt](url)), `code`, **bold**, *italic*, [label](url)
+  const regex = /(!\[[^\]]*\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -47,7 +48,60 @@ function renderInline(text: string): React.ReactNode[] {
       nodes.push(text.slice(lastIndex, match.index));
     }
     const token = match[0];
-    if (token.startsWith('`') && token.endsWith('`')) {
+    if (token.startsWith('!')) {
+      const imgMatch = token.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
+      if (imgMatch) {
+        const [, alt, url] = imgMatch;
+        let resolvedUrl: string | null = null;
+        if (url.startsWith('attachments/')) {
+          const filename = url.slice('attachments/'.length);
+          resolvedUrl = attachmentBlobUrls?.[filename] || null;
+        } else if (isSafeUrl(url) || url.startsWith('blob:') || url.startsWith('data:image/')) {
+          resolvedUrl = url;
+        }
+
+        if (resolvedUrl) {
+          nodes.push(
+            <img
+              key={match.index}
+              src={resolvedUrl}
+              alt={alt || 'attachment'}
+              style={{
+                maxWidth: '100%',
+                maxHeight: '400px',
+                objectFit: 'contain',
+                borderRadius: '0.375rem',
+                border: '1px solid #334155',
+                display: 'block',
+                margin: '0.5rem 0',
+              }}
+            />
+          );
+        } else {
+          nodes.push(
+            <span
+              key={match.index}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                padding: '0.2rem 0.5rem',
+                backgroundColor: '#0f172a',
+                border: '1px solid #334155',
+                borderRadius: '0.25rem',
+                fontSize: '0.8rem',
+                color: '#94a3b8',
+                margin: '0.25rem 0',
+              }}
+            >
+              🖼️ {url}
+            </span>
+          );
+        }
+      } else {
+        nodes.push(token);
+      }
+    } else if (token.startsWith('`') && token.endsWith('`')) {
       nodes.push(
         <code
           key={match.index}
@@ -104,8 +158,10 @@ function renderInline(text: string): React.ReactNode[] {
   return nodes;
 }
 
-export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) => {
+export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style, attachmentBlobUrls }) => {
   if (!content) return null;
+
+  const inline = (text: string) => renderInline(text, attachmentBlobUrls);
 
   const lines = content.split('\n');
   const elements: React.ReactNode[] = [];
@@ -177,7 +233,7 @@ export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) =>
       flushList(`flush-${i}`);
       elements.push(
         <h1 key={`h1-${i}`} style={{ fontSize: '1.3rem', fontWeight: 700, color: '#f8fafc', margin: '1rem 0 0.5rem' }}>
-          {renderInline(line.slice(2))}
+          {inline(line.slice(2))}
         </h1>
       );
       continue;
@@ -186,7 +242,7 @@ export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) =>
       flushList(`flush-${i}`);
       elements.push(
         <h2 key={`h2-${i}`} style={{ fontSize: '1.15rem', fontWeight: 600, color: '#f1f5f9', margin: '0.8rem 0 0.4rem' }}>
-          {renderInline(line.slice(3))}
+          {inline(line.slice(3))}
         </h2>
       );
       continue;
@@ -195,7 +251,7 @@ export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) =>
       flushList(`flush-${i}`);
       elements.push(
         <h3 key={`h3-${i}`} style={{ fontSize: '1rem', fontWeight: 600, color: '#e2e8f0', margin: '0.6rem 0 0.3rem' }}>
-          {renderInline(line.slice(4))}
+          {inline(line.slice(4))}
         </h3>
       );
       continue;
@@ -215,7 +271,7 @@ export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) =>
             fontStyle: 'italic',
           }}
         >
-          {renderInline(line.slice(2))}
+          {inline(line.slice(2))}
         </blockquote>
       );
       continue;
@@ -230,7 +286,7 @@ export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) =>
       }
       listItems.push(
         <li key={`li-${i}`} style={{ margin: '0.2rem 0', lineHeight: 1.4 }}>
-          {renderInline(ulMatch[2])}
+          {inline(ulMatch[2])}
         </li>
       );
       continue;
@@ -245,7 +301,7 @@ export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) =>
       }
       listItems.push(
         <li key={`li-${i}`} style={{ margin: '0.2rem 0', lineHeight: 1.4 }}>
-          {renderInline(olMatch[2])}
+          {inline(olMatch[2])}
         </li>
       );
       continue;
@@ -261,7 +317,7 @@ export const SafeMarkdown: React.FC<SafeMarkdownProps> = ({ content, style }) =>
     flushList(`flush-${i}`);
     elements.push(
       <p key={`p-${i}`} style={{ margin: '0.4rem 0', lineHeight: 1.5, color: '#cbd5e1' }}>
-        {renderInline(line)}
+        {inline(line)}
       </p>
     );
   }

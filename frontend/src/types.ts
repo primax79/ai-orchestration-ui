@@ -443,3 +443,117 @@ export interface RunMarkDeliveredPayload {
   expect_task_hash?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Inbox Notes Types (Task 09.3)
+// ---------------------------------------------------------------------------
+
+export type InboxNoteKind = 'note' | 'bug' | 'feature' | 'idea' | 'request' | 'question';
+export type InboxNoteStatus = 'draft' | 'ready' | 'processing' | 'processed' | 'discarded';
+
+export interface InboxNoteItem {
+  id: string;
+  title: string;
+  kind: InboxNoteKind | string;
+  status: InboxNoteStatus | string;
+  created: string;
+  author: string;
+  about: string;
+  produced: string;
+  processed_by?: string;
+  body: string;
+  attachments: string[];
+  bundle_sha256?: string;
+  legacy?: boolean;
+  folder_name?: string;
+  folder_path?: string;
+  file_path?: string;
+  rel_path?: string;
+  in_analyzed?: boolean;
+}
+
+export interface InboxListResponse {
+  ok: boolean;
+  notes: InboxNoteItem[];
+}
+
+export interface InboxNoteResponse {
+  ok: boolean;
+  note: InboxNoteItem;
+}
+
+export interface AddInboxNotePayload {
+  title: string;
+  kind?: string;
+  about?: string;
+  author?: string;
+  status?: string;
+  body?: string;
+}
+
+export interface EditInboxNotePayload {
+  title?: string;
+  kind?: string;
+  about?: string;
+  author?: string;
+  status?: string;
+  body?: string;
+  expect_hash?: string;
+}
+
+export interface AddInboxNoteResponse {
+  ok: boolean;
+  id: string;
+  rel_path?: string;
+  bundle_sha256: string;
+}
+
+export interface EditInboxNoteResponse {
+  ok: boolean;
+  id: string;
+  status: string;
+  bundle_sha256: string;
+}
+
+export interface UploadAttachmentResponse {
+  ok: boolean;
+  id: string;
+  attachment: string;
+  markdown: string;
+  path?: string;
+  bundle_sha256?: string;
+}
+
+export interface DeleteAttachmentResponse {
+  ok: boolean;
+  id: string;
+  attachment: string;
+  bundle_sha256?: string;
+}
+
+export interface ResolveInboxNotePayload {
+  produced: string;
+  by?: string;
+}
+
+export interface DiscardInboxNotePayload {
+  reason: string;
+}
+
+export interface InboxToTaskPayload {
+  category: string;
+  title: string;
+  priority?: string;
+  priority_reason?: string;
+  executor?: string;
+  next_up?: string;
+  depends_on?: string;
+  decider?: string;
+}
+
+export interface InboxToTaskResponse {
+  ok: boolean;
+  id: string;
+  file?: string;
+  [key: string]: any;
+}
+
