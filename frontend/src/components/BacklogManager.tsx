@@ -244,9 +244,10 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
       };
 
   const visibleColumns: KanbanColumnDef[] = [
+    // Waiting first: tasks blocked on a decision are the ones that need the owner.
+    { id: 'waiting_blocked', title: 'Waiting / Blocked', states: ['waiting', 'blocked'], color: '#f59e0b' },
     { id: 'open', title: 'Open', states: ['open'], color: '#94a3b8' },
     { id: 'in_progress', title: 'In Progress', states: ['in progress', 'bounced'], color: '#6366f1' },
-    { id: 'waiting_blocked', title: 'Waiting / Blocked', states: ['waiting', 'blocked'], color: '#f59e0b' },
     { id: 'delivered_verified', title: 'Delivered / Verified', color: '#0ea5e9', isSplit: true },
   ];
 
