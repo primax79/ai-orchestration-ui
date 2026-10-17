@@ -11,6 +11,8 @@ import {
   AlertTriangle,
   AlertCircle,
   Loader2,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { TaskItem, TaskListResponse } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
@@ -20,6 +22,7 @@ import { api } from '../api';
 export type BacklogView = 'queue' | 'kanban' | 'tree' | 'timeline';
 
 const BACKLOG_VIEW_KEY = 'ai-orch:backlog-view';
+const KANBAN_SHOW_DONE_KEY = 'ai-orch:kanban-show-done';
 
 const getStoredView = (): BacklogView => {
   try {
@@ -33,6 +36,15 @@ const getStoredView = (): BacklogView => {
   return 'queue';
 };
 
+const getStoredShowDone = (): boolean => {
+  try {
+    return localStorage.getItem(KANBAN_SHOW_DONE_KEY) === 'true';
+  } catch {
+    // Ignore storage errors (private mode, sandboxed iframe, etc.)
+    return false;
+  }
+};
+
 interface BacklogManagerProps {
   data: TaskListResponse | null;
   onRefresh: () => void;
@@ -40,6 +52,7 @@ interface BacklogManagerProps {
 
 export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh }) => {
   const [viewMode, setViewMode] = useState<BacklogView>(getStoredView);
+  const [showDone, setShowDone] = useState<boolean>(getStoredShowDone);
   const [selectedTask, setSelectedTask] = useState<TaskItem | null>(null);
   const [syncingIndex, setSyncingIndex] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -155,14 +168,109 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
     }
   };
 
-  const kanbanColumns: { title: string; states: string[]; color: string }[] = [
-    { title: 'Open', states: ['open'], color: '#94a3b8' },
-    { title: 'In Progress', states: ['in progress', 'bounced'], color: '#6366f1' },
-    { title: 'Waiting / Blocked', states: ['waiting', 'blocked'], color: '#f59e0b' },
-    { title: 'Delivered (Verify)', states: ['delivered'], color: '#0ea5e9' },
-    { title: 'Verified', states: ['verified'], color: '#10b981' },
-    { title: 'Done', states: ['done', 'done with a caveat'], color: '#475569' },
+  const handleToggleShowDone = () => {
+    setShowDone((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(KANBAN_SHOW_DONE_KEY, String(next));
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+  };
+
+  // Kanban task partitions
+  const deliveredCards = tasks.filter((t) => t.state === 'delivered');
+  const verifiedCards = tasks.filter((t) => t.state === 'verified');
+  const doneCards = tasks.filter((t) => t.state === 'done' || t.state === 'done with a caveat');
+  const droppedCards = tasks.filter((t) => t.state === 'dropped');
+  const closedCardsCount = doneCards.length + droppedCards.length;
+
+  type KanbanColumnDef =
+    | {
+        id: string;
+        title: string;
+        color: string;
+        states: string[];
+        isSplit?: false;
+      }
+    | {
+        id: string;
+        title: string;
+        color: string;
+        isSplit: true;
+      };
+
+  const visibleColumns: KanbanColumnDef[] = [
+    { id: 'open', title: 'Open', states: ['open'], color: '#94a3b8' },
+    { id: 'in_progress', title: 'In Progress', states: ['in progress', 'bounced'], color: '#6366f1' },
+    { id: 'waiting_blocked', title: 'Waiting / Blocked', states: ['waiting', 'blocked'], color: '#f59e0b' },
+    { id: 'delivered_verified', title: 'Delivered / Verified', color: '#0ea5e9', isSplit: true },
   ];
+
+  if (showDone) {
+    visibleColumns.push({
+      id: 'done',
+      title: 'Done',
+      states: ['done', 'done with a caveat'],
+      color: '#475569',
+    });
+    if (droppedCards.length > 0) {
+      visibleColumns.push({
+        id: 'dropped',
+        title: 'Dropped',
+        states: ['dropped'],
+        color: '#64748b',
+      });
+    }
+  }
+
+  const renderKanbanCard = (t: TaskItem) => (
+    <div
+      key={t.id}
+      onClick={() => setSelectedTask(t)}
+      style={{
+        backgroundColor: '#0f172a',
+        border: '1px solid #334155',
+        borderRadius: '0.375rem',
+        padding: '0.6rem',
+        cursor: 'pointer',
+        transition: 'border-color 0.15s ease',
+      }}
+      onMouseEnter={(e) => (e.currentTarget.style.borderColor = '#6366f1')}
+      onMouseLeave={(e) => (e.currentTarget.style.borderColor = '#334155')}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.2rem' }}>
+        <span style={{
+          fontSize: '0.65rem',
+          fontWeight: 700,
+          padding: '0.1rem 0.25rem',
+          borderRadius: '0.2rem',
+          backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
+          color: '#fff',
+        }}>
+          {t.priority}
+        </span>
+        <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</span>
+      </div>
+      <div style={{
+        fontSize: '0.8rem',
+        fontWeight: 500,
+        color: '#f8fafc',
+        lineHeight: 1.3,
+        marginBottom: '0.4rem',
+        overflowWrap: 'break-word',
+        wordBreak: 'break-word',
+      }}>
+        {t.title}
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.7rem', color: '#64748b' }}>
+        <span>{t.executor || 'self'}</span>
+        <span style={{ color: '#475569' }}>{t.category}</span>
+      </div>
+    </div>
+  );
 
   return (
     <div style={{ padding: '1.25rem 1.5rem', maxWidth: '1400px', margin: '0 auto', width: '100%', boxSizing: 'border-box' }}>
@@ -532,106 +640,189 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
       )}
 
       {viewMode === 'kanban' && (
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(6, minmax(0, 1fr))',
-          gap: '0.75rem',
-          minHeight: '500px',
-          width: '100%',
-          boxSizing: 'border-box',
-        }}>
-          {kanbanColumns.map((col) => {
-            const colTasks = tasks.filter((t) => col.states.includes(t.state));
-            return (
-              <div
-                key={col.title}
-                style={{
-                  backgroundColor: '#1e293b',
-                  borderRadius: '0.5rem',
-                  border: '1px solid #334155',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  overflow: 'hidden',
-                  minWidth: 0,
-                }}
-              >
-                {/* Column header */}
-                <div style={{
-                  padding: '0.6rem 0.8rem',
-                  borderBottom: '1px solid #334155',
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  backgroundColor: '#0f172a',
-                  minWidth: 0,
-                }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: 0 }}>
-                    <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: col.color, flexShrink: 0 }} />
-                    <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {col.title}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', width: '100%' }}>
+          {/* Kanban toolbar */}
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: '0.5rem',
+          }}>
+            <div style={{ fontSize: '0.85rem', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+              <Kanban size={14} color="#818cf8" />
+              <span>Workflow board ({visibleColumns.length} columns)</span>
+            </div>
+
+            <button
+              onClick={handleToggleShowDone}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.35rem',
+                padding: '0.3rem 0.65rem',
+                backgroundColor: showDone ? '#334155' : '#1e293b',
+                border: '1px solid #334155',
+                borderRadius: '0.375rem',
+                color: showDone ? '#f8fafc' : '#cbd5e1',
+                cursor: 'pointer',
+                fontSize: '0.8rem',
+                fontWeight: 500,
+                transition: 'all 0.15s ease',
+              }}
+            >
+              {showDone ? <EyeOff size={14} color="#94a3b8" /> : <Eye size={14} color="#94a3b8" />}
+              <span>{showDone ? `Hide done (${closedCardsCount})` : `Show done (${closedCardsCount})`}</span>
+            </button>
+          </div>
+
+          {/* Kanban grid */}
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: `repeat(${visibleColumns.length}, minmax(0, 1fr))`,
+            gap: '0.75rem',
+            minHeight: '500px',
+            width: '100%',
+            boxSizing: 'border-box',
+          }}>
+            {visibleColumns.map((col) => {
+              if (col.isSplit) {
+                const totalSplitCount = deliveredCards.length + verifiedCards.length;
+                return (
+                  <div
+                    key={col.id}
+                    style={{
+                      backgroundColor: '#1e293b',
+                      borderRadius: '0.5rem',
+                      border: '1px solid #334155',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      overflow: 'hidden',
+                      minWidth: 0,
+                    }}
+                  >
+                    {/* Column header */}
+                    <div style={{
+                      padding: '0.6rem 0.8rem',
+                      borderBottom: '1px solid #334155',
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      backgroundColor: '#0f172a',
+                      minWidth: 0,
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: 0 }}>
+                        <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: col.color, flexShrink: 0 }} />
+                        <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {col.title}
+                        </span>
+                      </div>
+                      <span style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600, flexShrink: 0, marginLeft: '0.25rem' }}>
+                        {totalSplitCount}
+                      </span>
+                    </div>
+
+                    {/* Split cards list */}
+                    <div style={{ padding: '0.5rem', flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
+                      {/* Delivered sub-section */}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                        <div style={{
+                          fontSize: '0.72rem',
+                          fontWeight: 600,
+                          color: '#94a3b8',
+                          padding: '0.1rem 0.2rem',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          Delivered — needs verification ({deliveredCards.length})
+                        </div>
+                        {deliveredCards.length > 0 ? (
+                          deliveredCards.map(renderKanbanCard)
+                        ) : (
+                          <div style={{ color: '#475569', fontSize: '0.75rem', textAlign: 'center', padding: '0.5rem 0', fontStyle: 'italic' }}>
+                            No delivered tasks
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Thin divider */}
+                      <div style={{ height: '1px', backgroundColor: '#334155', margin: '0.6rem 0', flexShrink: 0 }} />
+
+                      {/* Verified sub-section */}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                        <div style={{
+                          fontSize: '0.72rem',
+                          fontWeight: 600,
+                          color: '#94a3b8',
+                          padding: '0.1rem 0.2rem',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          Verified — ready to close ({verifiedCards.length})
+                        </div>
+                        {verifiedCards.length > 0 ? (
+                          verifiedCards.map(renderKanbanCard)
+                        ) : (
+                          <div style={{ color: '#475569', fontSize: '0.75rem', textAlign: 'center', padding: '0.5rem 0', fontStyle: 'italic' }}>
+                            No verified tasks
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              }
+
+              const colTasks = tasks.filter((t) => col.states.includes(t.state));
+              return (
+                <div
+                  key={col.id}
+                  style={{
+                    backgroundColor: '#1e293b',
+                    borderRadius: '0.5rem',
+                    border: '1px solid #334155',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    overflow: 'hidden',
+                    minWidth: 0,
+                  }}
+                >
+                  {/* Column header */}
+                  <div style={{
+                    padding: '0.6rem 0.8rem',
+                    borderBottom: '1px solid #334155',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    backgroundColor: '#0f172a',
+                    minWidth: 0,
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: 0 }}>
+                      <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: col.color, flexShrink: 0 }} />
+                      <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {col.title}
+                      </span>
+                    </div>
+                    <span style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600, flexShrink: 0, marginLeft: '0.25rem' }}>
+                      {colTasks.length}
                     </span>
                   </div>
-                  <span style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600, flexShrink: 0, marginLeft: '0.25rem' }}>
-                    {colTasks.length}
-                  </span>
-                </div>
 
-                {/* Cards list */}
-                <div style={{ padding: '0.5rem', flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  {colTasks.map((t) => (
-                    <div
-                      key={t.id}
-                      onClick={() => setSelectedTask(t)}
-                      style={{
-                        backgroundColor: '#0f172a',
-                        border: '1px solid #334155',
-                        borderRadius: '0.375rem',
-                        padding: '0.6rem',
-                        cursor: 'pointer',
-                        transition: 'border-color 0.15s ease',
-                      }}
-                      onMouseEnter={(e) => (e.currentTarget.style.borderColor = '#6366f1')}
-                      onMouseLeave={(e) => (e.currentTarget.style.borderColor = '#334155')}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.2rem' }}>
-                        <span style={{
-                          fontSize: '0.65rem',
-                          fontWeight: 700,
-                          padding: '0.1rem 0.25rem',
-                          borderRadius: '0.2rem',
-                          backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
-                          color: '#fff',
-                        }}>
-                          {t.priority}
-                        </span>
-                        <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</span>
+                  {/* Cards list */}
+                  <div style={{ padding: '0.5rem', flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {colTasks.map(renderKanbanCard)}
+                    {colTasks.length === 0 && (
+                      <div style={{ color: '#475569', fontSize: '0.75rem', textAlign: 'center', padding: '1rem 0', fontStyle: 'italic' }}>
+                        No tasks
                       </div>
-                      <div style={{
-                        fontSize: '0.8rem',
-                        fontWeight: 500,
-                        color: '#f8fafc',
-                        lineHeight: 1.3,
-                        marginBottom: '0.4rem',
-                        overflowWrap: 'break-word',
-                        wordBreak: 'break-word',
-                      }}>
-                        {t.title}
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.7rem', color: '#64748b' }}>
-                        <span>{t.executor || 'self'}</span>
-                        <span style={{ color: '#475569' }}>{t.category}</span>
-                      </div>
-                    </div>
-                  ))}
-                  {colTasks.length === 0 && (
-                    <div style={{ color: '#475569', fontSize: '0.75rem', textAlign: 'center', padding: '1rem 0' }}>
-                      No tasks
-                    </div>
-                  )}
+                    )}
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
       )}
 
