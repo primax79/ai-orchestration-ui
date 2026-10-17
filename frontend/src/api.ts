@@ -33,6 +33,9 @@ import {
   DiscardInboxNotePayload,
   InboxToTaskPayload,
   InboxToTaskResponse,
+  TriageProposalResponse,
+  AcceptTriagePayload,
+  AcceptTriageResponse,
 } from './types';
 
 // Custom ApiError to carry HTTP status and response payload
@@ -572,11 +575,17 @@ export const api = {
   // Agent Runs Endpoints (Task 07.7)
   // -------------------------------------------------------------------------
 
-  async getRunOptions(task: string): Promise<RunOptionsResponse> {
+  async getRunOptions(target: string | { task?: string; note?: string }): Promise<RunOptionsResponse> {
+    const payload = typeof target === 'string'
+      ? (target.startsWith('N') ? { note: target } : { task: target })
+      : target;
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<RunOptionsResponse>('getRunOptions', { task });
+      return sendVsCodeMessage<RunOptionsResponse>('getRunOptions', payload);
     }
-    return apiFetch<RunOptionsResponse>(`/api/runs/options?task=${encodeURIComponent(task)}`);
+    const query = new URLSearchParams();
+    if (payload.task) query.set('task', payload.task);
+    if (payload.note) query.set('note', payload.note);
+    return apiFetch<RunOptionsResponse>(`/api/runs/options?${query.toString()}`);
   },
 
   async previewRun(payload: RunPreviewPayload): Promise<RunPreviewResponse> {
@@ -609,12 +618,13 @@ export const api = {
     });
   },
 
-  async listRuns(params?: { task?: string; active?: boolean }): Promise<RunListResponse> {
+  async listRuns(params?: { task?: string; note?: string; active?: boolean }): Promise<RunListResponse> {
     if (isVsCode && vscode) {
       return sendVsCodeMessage<RunListResponse>('listRuns', params);
     }
     const query = new URLSearchParams();
     if (params?.task) query.set('task', params.task);
+    if (params?.note) query.set('note', params.note);
     if (params?.active) query.set('active', '1');
     const qs = query.toString();
     return apiFetch<RunListResponse>(`/api/runs${qs ? `?${qs}` : ''}`);
@@ -672,6 +682,23 @@ export const api = {
       return sendVsCodeMessage('cleanupRun', { runId, ...(payload || {}) });
     }
     return apiFetch(`/api/runs/${encodeURIComponent(runId)}/cleanup`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async getTriageProposal(runId: string): Promise<TriageProposalResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TriageProposalResponse>('getTriageProposal', { runId });
+    }
+    return apiFetch<TriageProposalResponse>(`/api/runs/${encodeURIComponent(runId)}/triage-proposal`);
+  },
+
+  async acceptTriage(runId: string, payload?: AcceptTriagePayload): Promise<AcceptTriageResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<AcceptTriageResponse>('acceptTriage', { runId, ...(payload || {}) });
+    }
+    return apiFetch<AcceptTriageResponse>(`/api/runs/${encodeURIComponent(runId)}/accept-triage`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
     });

@@ -18,15 +18,22 @@ import {
   Layers,
   ArrowRight,
   Upload,
+  Play,
+  Check,
+  ExternalLink,
+  Info,
 } from 'lucide-react';
 import {
   InboxNoteItem,
   InboxNoteKind,
   InboxNoteStatus,
   InboxToTaskPayload,
+  RunRecord,
+  TriageProposal,
 } from '../types';
 import { api, ApiError } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
+import { RunDialog } from './RunDialog';
 
 const ALL_STATUSES: InboxNoteStatus[] = ['draft', 'ready', 'processing', 'processed', 'discarded'];
 const ALL_KINDS: Array<InboxNoteKind | 'all'> = ['all', 'note', 'bug', 'feature', 'idea', 'request', 'question'];
@@ -609,6 +616,21 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const [createdTasks, setCreatedTasks] = useState<string[]>([]);
   const [showConvertToTask, setShowConvertToTask] = useState(false);
 
+  // Run and Triage Proposal states
+  const [showRunDialog, setShowRunDialog] = useState(false);
+  const [triageRuns, setTriageRuns] = useState<RunRecord[]>([]);
+  const [loadingRuns, setLoadingRuns] = useState(false);
+  const [selectedRunProposal, setSelectedRunProposal] = useState<{
+    runId: string;
+    proposal: TriageProposal | null;
+    proposal_status: string | null;
+    proposal_error?: string | null;
+  } | null>(null);
+  const [selectedTaskIndices, setSelectedTaskIndices] = useState<Set<number>>(new Set());
+  const [isAcceptingTriage, setIsAcceptingTriage] = useState(false);
+  const [triageActionError, setTriageActionError] = useState<string | null>(null);
+  const [triageSuccessTasks, setTriageSuccessTasks] = useState<string[]>([]);
+
   // Dialogs for discard and mark processed
   const [showDiscardPrompt, setShowDiscardPrompt] = useState(false);
   const [discardReason, setDiscardReason] = useState('');
@@ -660,8 +682,173 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     setInlineError(null);
     setConflictError(null);
     setCreatedTasks([]);
+    setTriageSuccessTasks([]);
+    setTriageActionError(null);
     setIsPreview(false);
   }, [initialNote, isOpen]);
+
+  // Load triage runs and proposals
+  const loadTriageRuns = useCallback(async () => {
+    if (!noteId || !noteId.startsWith('N')) return;
+    try {
+      setLoadingRuns(true);
+      const res = await api.listRuns({ note: noteId });
+      const runs = (res.runs || []).filter((r) => r.mode === 'triage' || r.note_id === noteId);
+      setTriageRuns(runs);
+
+      const pendingRun = runs.find((r) => r.proposal_status === 'pending');
+      const targetRun = pendingRun || runs.find((r) => r.proposal_status === 'invalid') || (runs.length > 0 ? runs[0] : null);
+
+      if (targetRun) {
+        if (targetRun.proposal_status === 'pending') {
+          try {
+            const propRes = await api.getTriageProposal(targetRun.run_id);
+            setSelectedRunProposal({
+              runId: targetRun.run_id,
+              proposal: propRes.proposal,
+              proposal_status: propRes.proposal_status,
+              proposal_error: propRes.proposal_error,
+            });
+            if (propRes.proposal?.tasks) {
+              setSelectedTaskIndices(new Set(propRes.proposal.tasks.map((_, i) => i)));
+            }
+          } catch (e: any) {
+            setSelectedRunProposal({
+              runId: targetRun.run_id,
+              proposal: null,
+              proposal_status: targetRun.proposal_status || null,
+              proposal_error: e?.message || 'Failed to load proposal',
+            });
+          }
+        } else {
+          setSelectedRunProposal({
+            runId: targetRun.run_id,
+            proposal: null,
+            proposal_status: targetRun.proposal_status || null,
+            proposal_error: targetRun.proposal_error || null,
+          });
+        }
+      } else {
+        setSelectedRunProposal(null);
+      }
+    } catch (err: any) {
+      console.error('Failed to load triage runs for note:', err);
+    } finally {
+      setLoadingRuns(false);
+    }
+  }, [noteId]);
+
+  useEffect(() => {
+    if (isOpen && noteId && noteId.startsWith('N')) {
+      loadTriageRuns();
+    } else {
+      setTriageRuns([]);
+      setSelectedRunProposal(null);
+    }
+  }, [isOpen, noteId, loadTriageRuns]);
+
+  useEffect(() => {
+    if (!isOpen || !noteId || !noteId.startsWith('N')) return;
+    const hasActive = triageRuns.some((r) => r.status === 'starting' || r.status === 'running');
+    if (!hasActive) return;
+
+    const interval = setInterval(() => {
+      loadTriageRuns();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [isOpen, noteId, triageRuns, loadTriageRuns]);
+
+  useEffect(() => {
+    if (!isOpen || !noteId) return;
+    const unsubscribe = api.subscribeWebSocket((msg: any) => {
+      if (msg?.type === 'changed') {
+        const areas = msg.areas || [];
+        if (areas.includes('inbox') || areas.includes('runs') || areas.includes('tasks')) {
+          loadTriageRuns();
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, [isOpen, noteId, loadTriageRuns]);
+
+  const handleSelectRun = async (run: RunRecord) => {
+    setTriageActionError(null);
+    if (run.proposal_status === 'pending') {
+      try {
+        const propRes = await api.getTriageProposal(run.run_id);
+        setSelectedRunProposal({
+          runId: run.run_id,
+          proposal: propRes.proposal,
+          proposal_status: propRes.proposal_status,
+          proposal_error: propRes.proposal_error,
+        });
+        if (propRes.proposal?.tasks) {
+          setSelectedTaskIndices(new Set(propRes.proposal.tasks.map((_, i) => i)));
+        }
+      } catch (e: any) {
+        setTriageActionError(e?.message || String(e));
+      }
+    } else {
+      setSelectedRunProposal({
+        runId: run.run_id,
+        proposal: null,
+        proposal_status: run.proposal_status || null,
+        proposal_error: run.proposal_error || null,
+      });
+    }
+  };
+
+  const toggleTaskAccept = (idx: number) => {
+    setSelectedTaskIndices((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) {
+        next.delete(idx);
+      } else {
+        next.add(idx);
+      }
+      return next;
+    });
+  };
+
+  const handleAcceptTriage = async () => {
+    if (!selectedRunProposal || !selectedRunProposal.runId) return;
+    if (selectedTaskIndices.size === 0) {
+      setTriageActionError('Please select at least one proposed task to accept.');
+      return;
+    }
+
+    setIsAcceptingTriage(true);
+    setTriageActionError(null);
+    try {
+      const sortedIndices = Array.from(selectedTaskIndices).sort((a, b) => a - b);
+      const res = await api.acceptTriage(selectedRunProposal.runId, {
+        only: sortedIndices,
+        expect_note_hash: currentHash,
+      });
+
+      if (res && res.tasks_created) {
+        setTriageSuccessTasks(res.tasks_created);
+        setCreatedTasks((prev) => Array.from(new Set([...prev, ...res.tasks_created])));
+        await handleReloadConflict();
+        await loadTriageRuns();
+        onSaved();
+      }
+    } catch (err: any) {
+      const msg = err?.data?.error || err?.message || String(err);
+      if (
+        err.status === 409 ||
+        msg.includes('409') ||
+        msg.toLowerCase().includes('hash mismatch') ||
+        msg.toLowerCase().includes('changed')
+      ) {
+        setTriageActionError('Note has changed since triage run started (hash mismatch). Please re-process.');
+      } else {
+        setTriageActionError(msg);
+      }
+    } finally {
+      setIsAcceptingTriage(false);
+    }
+  };
 
   // Insert markdown reference at cursor
   const insertMarkdownAtCursor = (markdownRef: string) => {
@@ -1565,6 +1752,550 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               <span>Uploading attachment...</span>
             </div>
           )}
+
+          {/* Triage Runs & Proposal Review Section */}
+          {noteId && noteId.startsWith('N') && (
+            <div
+              style={{
+                marginTop: '1rem',
+                paddingTop: '1rem',
+                borderTop: '1px solid #334155',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.85rem',
+              }}
+            >
+              {/* Header */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Play size={16} color="#818cf8" />
+                  <span style={{ fontSize: '0.9rem', fontWeight: 600, color: '#f8fafc' }}>
+                    Agent Triage Runs {triageRuns.length > 0 && `(${triageRuns.length})`}
+                  </span>
+                  {loadingRuns && <Loader2 size={14} className="spin" color="#818cf8" />}
+                </div>
+                {status === 'ready' && (
+                  <button
+                    type="button"
+                    onClick={() => setShowRunDialog(true)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.3rem',
+                      padding: '0.3rem 0.6rem',
+                      backgroundColor: '#312e81',
+                      border: '1px solid #4338ca',
+                      borderRadius: '0.375rem',
+                      color: '#c7d2fe',
+                      fontSize: '0.75rem',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <Play size={12} />
+                    <span>Process with…</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Triage Runs List */}
+              {triageRuns.length > 0 ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                  {triageRuns.map((r) => {
+                    const isSelected = selectedRunProposal?.runId === r.run_id;
+                    return (
+                      <div
+                        key={r.run_id}
+                        onClick={() => handleSelectRun(r)}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          padding: '0.5rem 0.75rem',
+                          backgroundColor: isSelected ? '#1e293b' : '#0f172a',
+                          border: isSelected ? '1px solid #6366f1' : '1px solid #334155',
+                          borderRadius: '0.375rem',
+                          fontSize: '0.8rem',
+                          cursor: 'pointer',
+                          transition: 'border-color 0.15s ease',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                          <span style={{ fontFamily: 'monospace', color: '#f8fafc', fontWeight: 600 }}>
+                            {r.run_id}
+                          </span>
+                          <span style={{ color: '#94a3b8' }}>
+                            {r.tool} ({r.profile})
+                          </span>
+                          <span
+                            style={{
+                              padding: '0.15rem 0.45rem',
+                              borderRadius: '0.25rem',
+                              fontSize: '0.7rem',
+                              fontWeight: 600,
+                              textTransform: 'uppercase',
+                              backgroundColor:
+                                r.status === 'succeeded'
+                                  ? '#064e3b'
+                                  : r.status === 'running' || r.status === 'starting'
+                                  ? '#1e3a8a'
+                                  : r.status === 'failed'
+                                  ? '#451a1a'
+                                  : '#334155',
+                              color:
+                                r.status === 'succeeded'
+                                  ? '#6ee7b7'
+                                  : r.status === 'running' || r.status === 'starting'
+                                  ? '#93c5fd'
+                                  : r.status === 'failed'
+                                  ? '#fca5a5'
+                                  : '#cbd5e1',
+                            }}
+                          >
+                            {r.status}
+                          </span>
+                          {r.proposal_status && (
+                            <span
+                              style={{
+                                padding: '0.15rem 0.45rem',
+                                borderRadius: '0.25rem',
+                                fontSize: '0.7rem',
+                                fontWeight: 600,
+                                textTransform: 'uppercase',
+                                backgroundColor:
+                                  r.proposal_status === 'accepted'
+                                    ? '#064e3b'
+                                    : r.proposal_status === 'pending'
+                                    ? '#78350f'
+                                    : '#451a1a',
+                                color:
+                                  r.proposal_status === 'accepted'
+                                    ? '#6ee7b7'
+                                    : r.proposal_status === 'pending'
+                                    ? '#fde68a'
+                                    : '#fca5a5',
+                              }}
+                            >
+                              Proposal: {r.proposal_status}
+                            </span>
+                          )}
+                        </div>
+                        <span style={{ color: '#64748b', fontSize: '0.75rem' }}>
+                          {formatRelativeAge(r.started_at)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: '0.8rem', color: '#64748b', fontStyle: 'italic' }}>
+                  No triage runs yet for this note.
+                </div>
+              )}
+
+              {/* Triage Success Message / Created Tasks Banner */}
+              {triageSuccessTasks.length > 0 && (
+                <div
+                  style={{
+                    padding: '0.75rem 1rem',
+                    backgroundColor: '#064e3b',
+                    border: '1px solid #10b981',
+                    borderRadius: '0.375rem',
+                    color: '#6ee7b7',
+                    fontSize: '0.85rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: '0.5rem',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <CheckCircle2 size={18} color="#10b981" />
+                    <span>Triage proposal accepted! Created tasks:</span>
+                    <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                      {triageSuccessTasks.map((tId) => (
+                        <a
+                          key={tId}
+                          href={`#${tId}`}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            onClose();
+                          }}
+                          style={{
+                            padding: '0.15rem 0.5rem',
+                            backgroundColor: '#047857',
+                            color: '#fff',
+                            borderRadius: '0.25rem',
+                            fontWeight: 600,
+                            textDecoration: 'none',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '0.25rem',
+                          }}
+                        >
+                          <span>{tId}</span>
+                          <ExternalLink size={12} />
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Action Error Banner */}
+              {triageActionError && (
+                <div
+                  style={{
+                    padding: '0.6rem 0.8rem',
+                    backgroundColor: '#451a1a',
+                    border: '1px solid #ef4444',
+                    borderRadius: '0.375rem',
+                    color: '#fca5a5',
+                    fontSize: '0.8rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.4rem',
+                  }}
+                >
+                  <AlertCircle size={15} color="#ef4444" />
+                  <span>{triageActionError}</span>
+                </div>
+              )}
+
+              {/* Invalid Proposal State */}
+              {selectedRunProposal && selectedRunProposal.proposal_status === 'invalid' && (
+                <div
+                  style={{
+                    padding: '0.85rem 1rem',
+                    backgroundColor: '#451a1a',
+                    border: '1px solid #ef4444',
+                    borderRadius: '0.375rem',
+                    color: '#fca5a5',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.5rem',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontWeight: 600 }}>
+                      <AlertTriangle size={16} color="#ef4444" />
+                      <span>Invalid Triage Proposal</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowRunDialog(true)}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                        padding: '0.35rem 0.75rem',
+                        backgroundColor: '#ef4444',
+                        border: 'none',
+                        borderRadius: '0.25rem',
+                        color: '#fff',
+                        fontSize: '0.75rem',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <RotateCcw size={13} />
+                      <span>Process again</span>
+                    </button>
+                  </div>
+                  <div style={{ fontSize: '0.8rem', color: '#fecaca', whiteSpace: 'pre-wrap' }}>
+                    {selectedRunProposal.proposal_error || 'Agent did not produce a valid ```ai-orch-triage block.'}
+                  </div>
+                </div>
+              )}
+
+              {/* Proposal Review Panel (pending proposal) */}
+              {selectedRunProposal &&
+                selectedRunProposal.proposal_status === 'pending' &&
+                selectedRunProposal.proposal && (
+                  <div
+                    style={{
+                      padding: '1rem',
+                      backgroundColor: '#1e293b',
+                      border: '1px solid #4338ca',
+                      borderRadius: '0.5rem',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '0.85rem',
+                    }}
+                  >
+                    {/* Panel Header */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <span style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f8fafc' }}>
+                            Proposal Review
+                          </span>
+                          <span style={{ fontSize: '0.75rem', color: '#818cf8', fontFamily: 'monospace' }}>
+                            ({selectedRunProposal.runId})
+                          </span>
+                        </div>
+                        <div
+                          style={{
+                            fontSize: '0.75rem',
+                            color: '#94a3b8',
+                            fontStyle: 'italic',
+                            marginTop: '0.2rem',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.25rem',
+                          }}
+                        >
+                          <Info size={12} color="#818cf8" />
+                          <span>Edit the task after it is created</span>
+                        </div>
+                      </div>
+
+                      {/* Accept Selected Button */}
+                      <button
+                        type="button"
+                        disabled={isAcceptingTriage || selectedTaskIndices.size === 0}
+                        onClick={handleAcceptTriage}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.4rem',
+                          padding: '0.45rem 1rem',
+                          backgroundColor: selectedTaskIndices.size > 0 ? '#4f46e5' : '#334155',
+                          border: 'none',
+                          borderRadius: '0.375rem',
+                          color: '#fff',
+                          fontSize: '0.85rem',
+                          fontWeight: 600,
+                          cursor: selectedTaskIndices.size > 0 && !isAcceptingTriage ? 'pointer' : 'not-allowed',
+                          opacity: isAcceptingTriage ? 0.7 : 1,
+                        }}
+                      >
+                        {isAcceptingTriage ? <Loader2 size={15} className="spin" /> : <Check size={15} />}
+                        <span>
+                          {isAcceptingTriage
+                            ? 'Accepting...'
+                            : `Accept selected (${selectedTaskIndices.size} of ${selectedRunProposal.proposal.tasks.length})`}
+                        </span>
+                      </button>
+                    </div>
+
+                    {/* Proposed Tasks Cards */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                      {selectedRunProposal.proposal.tasks.map((pt, idx) => {
+                        const isAccepted = selectedTaskIndices.has(idx);
+                        return (
+                          <div
+                            key={idx}
+                            style={{
+                              padding: '0.85rem 1rem',
+                              backgroundColor: isAccepted ? '#0f172a' : '#141c2e',
+                              border: isAccepted ? '1px solid #334155' : '1px solid #1e293b',
+                              borderRadius: '0.375rem',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '0.5rem',
+                              opacity: isAccepted ? 1 : 0.65,
+                              transition: 'opacity 0.15s ease',
+                            }}
+                          >
+                            {/* Card Top: Checkbox, Title, Badges, Reject Toggle */}
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem', flexWrap: 'wrap' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                                <input
+                                  type="checkbox"
+                                  checked={isAccepted}
+                                  onChange={() => toggleTaskAccept(idx)}
+                                  id={`pt-check-${idx}`}
+                                  style={{ cursor: 'pointer', width: '16px', height: '16px', accentColor: '#4f46e5' }}
+                                />
+                                <label
+                                  htmlFor={`pt-check-${idx}`}
+                                  style={{
+                                    fontSize: '0.9rem',
+                                    fontWeight: 600,
+                                    color: isAccepted ? '#f8fafc' : '#94a3b8',
+                                    cursor: 'pointer',
+                                    textDecoration: isAccepted ? 'none' : 'line-through',
+                                  }}
+                                >
+                                  {pt.title}
+                                </label>
+                              </div>
+
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                                {/* Category badge */}
+                                <span
+                                  style={{
+                                    padding: '0.15rem 0.45rem',
+                                    borderRadius: '0.25rem',
+                                    fontSize: '0.7rem',
+                                    fontWeight: 600,
+                                    backgroundColor: '#312e81',
+                                    color: '#c7d2fe',
+                                  }}
+                                >
+                                  {pt.category}
+                                </span>
+
+                                {/* Priority + Reason */}
+                                <span
+                                  style={{
+                                    padding: '0.15rem 0.45rem',
+                                    borderRadius: '0.25rem',
+                                    fontSize: '0.7rem',
+                                    fontWeight: 600,
+                                    backgroundColor: '#1e293b',
+                                    color: '#cbd5e1',
+                                    border: '1px solid #334155',
+                                  }}
+                                  title={pt.priority_reason ? `Reason: ${pt.priority_reason}` : undefined}
+                                >
+                                  {pt.priority}
+                                  {pt.priority_reason ? ` (${pt.priority_reason})` : ''}
+                                </span>
+
+                                {/* Reject / Accept Toggle */}
+                                <button
+                                  type="button"
+                                  onClick={() => toggleTaskAccept(idx)}
+                                  style={{
+                                    padding: '0.2rem 0.5rem',
+                                    borderRadius: '0.25rem',
+                                    border: 'none',
+                                    fontSize: '0.7rem',
+                                    fontWeight: 600,
+                                    cursor: 'pointer',
+                                    backgroundColor: isAccepted ? '#451a1a' : '#064e3b',
+                                    color: isAccepted ? '#fca5a5' : '#6ee7b7',
+                                  }}
+                                >
+                                  {isAccepted ? 'Reject' : 'Accept'}
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Goal */}
+                            {pt.goal && (
+                              <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
+                                <span style={{ fontWeight: 600, color: '#94a3b8', marginRight: '0.35rem' }}>Goal:</span>
+                                {pt.goal}
+                              </div>
+                            )}
+
+                            {/* Steps */}
+                            {pt.steps && (
+                              <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
+                                <span style={{ fontWeight: 600, color: '#94a3b8' }}>Steps:</span>
+                                {Array.isArray(pt.steps) ? (
+                                  <ol style={{ margin: '0.25rem 0 0 0', paddingLeft: '1.25rem' }}>
+                                    {pt.steps.map((step, sIdx) => (
+                                      <li key={sIdx} style={{ marginBottom: '0.15rem' }}>
+                                        {step}
+                                      </li>
+                                    ))}
+                                  </ol>
+                                ) : (
+                                  <div style={{ whiteSpace: 'pre-wrap', marginTop: '0.2rem' }}>{pt.steps}</div>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Verification */}
+                            {pt.verification && (
+                              <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
+                                <span style={{ fontWeight: 600, color: '#94a3b8', marginRight: '0.35rem' }}>
+                                  Verification:
+                                </span>
+                                {pt.verification}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Updates (read-only) */}
+                    {selectedRunProposal.proposal.updates &&
+                      selectedRunProposal.proposal.updates.length > 0 && (
+                        <div
+                          style={{
+                            padding: '0.75rem',
+                            backgroundColor: '#0f172a',
+                            border: '1px solid #334155',
+                            borderRadius: '0.375rem',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '0.4rem',
+                          }}
+                        >
+                          <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#94a3b8' }}>
+                            Proposed Updates (read-only)
+                          </span>
+                          <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
+                            {selectedRunProposal.proposal.updates.map((u: any, uIdx: number) => (
+                              <div key={uIdx} style={{ marginBottom: '0.25rem' }}>
+                                {typeof u === 'string' ? u : JSON.stringify(u, null, 2)}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                    {/* Spec (read-only) */}
+                    {selectedRunProposal.proposal.spec && (
+                      <div
+                        style={{
+                          padding: '0.75rem',
+                          backgroundColor: '#0f172a',
+                          border: '1px solid #334155',
+                          borderRadius: '0.375rem',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '0.4rem',
+                        }}
+                      >
+                        <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#94a3b8' }}>
+                          Proposed Spec (read-only)
+                        </span>
+                        <pre style={{ margin: 0, fontSize: '0.75rem', color: '#cbd5e1', overflowX: 'auto' }}>
+                          {typeof selectedRunProposal.proposal.spec === 'string'
+                            ? selectedRunProposal.proposal.spec
+                            : JSON.stringify(selectedRunProposal.proposal.spec, null, 2)}
+                        </pre>
+                      </div>
+                    )}
+
+                    {/* Questions (read-only) */}
+                    {selectedRunProposal.proposal.questions &&
+                      selectedRunProposal.proposal.questions.length > 0 && (
+                        <div
+                          style={{
+                            padding: '0.75rem',
+                            backgroundColor: '#0f172a',
+                            border: '1px solid #334155',
+                            borderRadius: '0.375rem',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '0.4rem',
+                          }}
+                        >
+                          <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#94a3b8' }}>
+                            Questions from Agent (read-only)
+                          </span>
+                          <ul style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.8rem', color: '#cbd5e1' }}>
+                            {selectedRunProposal.proposal.questions.map((q: any, qIdx: number) => (
+                              <li key={qIdx}>
+                                {typeof q === 'string' ? q : q.question || JSON.stringify(q)}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                  </div>
+                )}
+            </div>
+          )}
         </div>
 
         {/* Modal Footer / Actions */}
@@ -1625,6 +2356,32 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               >
                 <Layers size={14} />
                 <span>Convert to Task</span>
+              </button>
+            )}
+
+            {noteId && (
+              <button
+                type="button"
+                disabled={status !== 'ready'}
+                onClick={() => setShowRunDialog(true)}
+                title={status !== 'ready' ? 'Note must be marked Ready to process with an agent' : 'Process note with agent triage'}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.35rem',
+                  padding: '0.4rem 0.8rem',
+                  backgroundColor: status === 'ready' ? '#312e81' : '#1e293b',
+                  border: status === 'ready' ? '1px solid #4338ca' : '1px solid #334155',
+                  borderRadius: '0.375rem',
+                  color: status === 'ready' ? '#c7d2fe' : '#64748b',
+                  fontSize: '0.8rem',
+                  fontWeight: 600,
+                  cursor: status === 'ready' ? 'pointer' : 'not-allowed',
+                  opacity: status === 'ready' ? 1 : 0.6,
+                }}
+              >
+                <Play size={14} />
+                <span>Process with…</span>
               </button>
             )}
 
@@ -1765,6 +2522,23 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           onSuccess={(taskId) => {
             setCreatedTasks((prev) => [...prev, taskId]);
             onSaved();
+          }}
+        />
+      )}
+
+      {/* Triage Run Dialog */}
+      {noteId && showRunDialog && (
+        <RunDialog
+          isOpen={true}
+          note={{
+            id: noteId,
+            title,
+            bundle_sha256: currentHash,
+          }}
+          onClose={() => setShowRunDialog(false)}
+          onRunStarted={(_runId) => {
+            setShowRunDialog(false);
+            loadTriageRuns();
           }}
         />
       )}

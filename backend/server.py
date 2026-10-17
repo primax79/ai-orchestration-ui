@@ -375,6 +375,8 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         if data.get("error") in ("stale-task", "lock-timeout", "stale-note") or reason in (
             "stale-task",
             "stale-note",
+            "stale-note-hash",
+            "note-hash-mismatch",
             "lock-timeout",
             "plan-hash-mismatch",
             "task-hash-mismatch",
@@ -434,6 +436,9 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "single line" in err_str
         or "cannot cancel run in terminal state" in err_str
         or "cannot clean up run" in err_str
+        or "proposal" in err_str
+        or "not-triage-run" in err_str
+        or "run-not-terminal" in err_str
     ):
         return 400
 
@@ -1434,13 +1439,20 @@ async def api_apply_agents_md(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 RUN_ID_RE = re.compile(r"^\d{8}-\d{6}-[A-Za-z0-9.]+-(kilo|claude|codex)-[0-9a-f]{4}$")
+NOTE_ID_RE = re.compile(r"^N\d{3,}$")
 
 
 async def api_run_options(request: Request) -> JSONResponse:
+    note = request.query_params.get("note")
     task = request.query_params.get("task")
-    if not task:
-        return JSONResponse({"error": "task query parameter is required"}, status_code=400)
-    cmd = ["run", "options", "--task", str(task), "--workspace", str(state.workspace), "--json"]
+    if not note and not task:
+        return JSONResponse({"error": "task or note query parameter is required"}, status_code=400)
+    if note:
+        if not NOTE_ID_RE.match(note):
+            return JSONResponse({"error": f"Invalid note ID {note!r}"}, status_code=400)
+        cmd = ["run", "options", "--note", str(note), "--workspace", str(state.workspace), "--json"]
+    else:
+        cmd = ["run", "options", "--task", str(task), "--workspace", str(state.workspace), "--json"]
     code, data = await run_ai_orch(cmd)
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -1452,9 +1464,17 @@ async def api_run_preview(request: Request) -> JSONResponse:
     except Exception:
         body = {}
     task = body.get("task")
-    if not task:
-        return JSONResponse({"error": "task is required"}, status_code=400)
-    cmd = ["run", "preview", "--task", str(task), "--workspace", str(state.workspace), "--json"]
+    note = body.get("note")
+    if not task and not note:
+        return JSONResponse({"error": "task or note is required"}, status_code=400)
+    if note:
+        if not isinstance(note, str) or not NOTE_ID_RE.match(note):
+            return JSONResponse({"error": f"Invalid note ID {note!r}"}, status_code=400)
+        target_args = ["--note", str(note)]
+    else:
+        target_args = ["--task", str(task)]
+
+    cmd = ["run", "preview", *target_args, "--workspace", str(state.workspace), "--json"]
     if body.get("mode"):
         cmd.extend(["--mode", str(body["mode"])])
     if body.get("tool"):
@@ -1491,15 +1511,23 @@ async def api_run_start(request: Request) -> JSONResponse:
     except Exception:
         body = {}
     task = body.get("task")
-    if not task:
-        return JSONResponse({"error": "task is required"}, status_code=400)
+    note = body.get("note")
+    if not task and not note:
+        return JSONResponse({"error": "task or note is required"}, status_code=400)
     expect_plan_hash = body.get("expect_plan_hash")
     if not expect_plan_hash:
         return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
 
+    if note:
+        if not isinstance(note, str) or not NOTE_ID_RE.match(note):
+            return JSONResponse({"error": f"Invalid note ID {note!r}"}, status_code=400)
+        target_args = ["--note", str(note)]
+    else:
+        target_args = ["--task", str(task)]
+
     cmd = [
         "run", "start",
-        "--task", str(task),
+        *target_args,
         "--expect-plan-hash", str(expect_plan_hash),
         "--requested-by", "ui",
         "--workspace", str(state.workspace),
@@ -1565,6 +1593,11 @@ async def api_list_runs(request: Request) -> JSONResponse:
     task = request.query_params.get("task")
     if task:
         cmd.extend(["--task", task])
+    note = request.query_params.get("note")
+    if note:
+        if not NOTE_ID_RE.match(note):
+            return JSONResponse({"error": f"Invalid note ID {note!r}"}, status_code=400)
+        cmd.extend(["--note", note])
     active = request.query_params.get("active")
     if active is not None and active.lower() in ("1", "true", "yes", ""):
         cmd.append("--active")
@@ -1706,11 +1739,98 @@ async def api_cleanup_run(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
+async def api_get_triage_proposal(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    cmd = ["run", "show", run_id, "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("reason") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+    run_record = (
+        data.get("run")
+        if (isinstance(data, dict) and isinstance(data.get("run"), dict))
+        else (data if isinstance(data, dict) else {})
+    )
+    if run_record.get("mode") and run_record.get("mode") != "triage":
+        return JSONResponse(
+            {"error": f"Run '{run_id}' is not a triage run (mode={run_record.get('mode')})"},
+            status_code=400,
+        )
+
+    proposal_status = run_record.get("proposal_status")
+    proposal_error = run_record.get("proposal_error")
+
+    proposal = run_record.get("triage_proposal") or run_record.get("proposal")
+    if proposal is None:
+        proposal_file = state.workspace / ".ai-orchestration" / "runs" / run_id / "triage-proposal.json"
+        if proposal_file.is_file():
+            try:
+                proposal = json.loads(proposal_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                if not proposal_error:
+                    proposal_error = f"Failed to parse stored proposal JSON: {e}"
+
+    if proposal_status is None and proposal is not None:
+        proposal_status = "pending"
+
+    return JSONResponse({
+        "ok": True,
+        "run_id": run_id,
+        "proposal_status": proposal_status,
+        "proposal_error": proposal_error,
+        "proposal": proposal,
+    })
+
+
+async def api_accept_triage_run(request: Request) -> JSONResponse:
+    run_id = request.path_params["id"]
+    if not RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = ["run", "accept-triage", run_id, "--workspace", str(state.workspace), "--json"]
+    only = body.get("only")
+    if only is not None:
+        if isinstance(only, (list, tuple)):
+            cmd.extend(["--only", ",".join(str(x) for x in only)])
+        elif isinstance(only, (str, int)):
+            cmd.extend(["--only", str(only).strip()])
+    expect_note_hash = body.get("expect_note_hash")
+    if expect_note_hash:
+        cmd.extend(["--expect-note-hash", str(expect_note_hash).strip()])
+
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("reason") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+    await state.broadcast({"type": "changed", "areas": ["inbox", "tasks"]})
+    return JSONResponse(data if isinstance(data, dict) else {"ok": True, "run_id": run_id, "proposal_status": "accepted"})
+
+
 # ---------------------------------------------------------------------------
 # REST Endpoints: Inbox Notes & Attachments (09.2)
 # ---------------------------------------------------------------------------
 
-NOTE_ID_RE = re.compile(r"^N\d{3,}$")
 ATTACHMENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
 
@@ -2296,6 +2416,8 @@ routes = [
     Route("/api/runs/{id}", api_get_run, methods=["GET"]),
     Route("/api/runs/{id}/continue", api_run_continue, methods=["POST"]),
     Route("/api/runs/{id}/logs", api_get_run_logs, methods=["GET"]),
+    Route("/api/runs/{id}/triage-proposal", api_get_triage_proposal, methods=["GET"]),
+    Route("/api/runs/{id}/accept-triage", api_accept_triage_run, methods=["POST"]),
     Route("/api/runs/{id}/cancel", api_cancel_run, methods=["POST"]),
     Route("/api/runs/{id}/mark-delivered", api_mark_delivered_run, methods=["POST"]),
     Route("/api/runs/{id}/apply-verdict", api_apply_verdict_run, methods=["POST"]),

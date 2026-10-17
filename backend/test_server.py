@@ -1877,3 +1877,309 @@ def test_use_cases_api_endpoints(monkeypatch, tmp_path):
     assert res_camp.status_code == 200
     assert res_camp.json()["passed"] == 1
     assert res_camp.json()["readiness_score"] == 100.0
+
+
+def test_runs_triage_endpoints_options_preview_start_and_validation(monkeypatch, tmp_path):
+    import server as srv
+
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+
+    recorded_cmds: list[list[str]] = []
+
+    async def fake_run_ai_orch(cmd, timeout=None):
+        recorded_cmds.append(cmd)
+        if cmd[0:2] == ["run", "options"]:
+            return 0, {"ok": True, "mode": "triage", "allowed_modes": ["triage"]}
+        if cmd[0:2] == ["run", "preview"]:
+            return 0, {"ok": True, "plan_hash": "testhash1234", "argv_display": ["ai-orch", "run", "start"]}
+        if cmd[0:2] == ["run", "start"]:
+            return 0, {"ok": True, "run_id": "20261017-150000-N001-kilo-abcd", "status": "starting"}
+        if cmd[0:2] == ["run", "list"]:
+            return 0, {"ok": True, "runs": []}
+        return 0, {"ok": True}
+
+    monkeypatch.setattr(srv, "run_ai_orch", fake_run_ai_orch)
+
+    try:
+        # 1. Options: missing both task and note -> 400
+        res = client.get("/api/runs/options", headers=headers)
+        assert res.status_code == 400
+        assert "task or note" in res.json().get("error", "")
+
+        # Options: invalid note ID format -> 400
+        res = client.get("/api/runs/options?note=invalid", headers=headers)
+        assert res.status_code == 400
+        assert "Invalid note ID" in res.json().get("error", "")
+
+        # Options: valid note N001 -> 200, passes --note N001
+        res = client.get("/api/runs/options?note=N001", headers=headers)
+        assert res.status_code == 200
+        assert recorded_cmds[-1][0:4] == ["run", "options", "--note", "N001"]
+
+        # Options: task still works -> 200, passes --task T001
+        res = client.get("/api/runs/options?task=T001", headers=headers)
+        assert res.status_code == 200
+        assert recorded_cmds[-1][0:4] == ["run", "options", "--task", "T001"]
+
+        # 2. Preview: missing both task and note -> 400
+        res = client.post("/api/runs/preview", headers=headers, json={"mode": "triage"})
+        assert res.status_code == 400
+        assert "task or note is required" in res.json().get("error", "")
+
+        # Preview: invalid note -> 400
+        res = client.post("/api/runs/preview", headers=headers, json={"note": "bad", "mode": "triage"})
+        assert res.status_code == 400
+        assert "Invalid note ID" in res.json().get("error", "")
+
+        # Preview: valid note -> 200, passes --note N001
+        res = client.post("/api/runs/preview", headers=headers, json={"note": "N001", "mode": "triage"})
+        assert res.status_code == 200
+        assert "--note" in recorded_cmds[-1]
+        assert "N001" in recorded_cmds[-1]
+
+        # Preview: task still works
+        res = client.post("/api/runs/preview", headers=headers, json={"task": "T001", "mode": "execute"})
+        assert res.status_code == 200
+        assert "--task" in recorded_cmds[-1]
+        assert "T001" in recorded_cmds[-1]
+
+        # 3. Start: missing both task and note -> 400
+        res = client.post("/api/runs", headers=headers, json={"expect_plan_hash": "testhash1234"})
+        assert res.status_code == 400
+
+        # Start: invalid note -> 400
+        res = client.post("/api/runs", headers=headers, json={"note": "invalid", "expect_plan_hash": "testhash1234"})
+        assert res.status_code == 400
+
+        # Start: valid note -> 200, passes --note N001
+        res = client.post("/api/runs", headers=headers, json={"note": "N001", "expect_plan_hash": "testhash1234", "mode": "triage"})
+        assert res.status_code == 200
+        assert "--note" in recorded_cmds[-1]
+        assert "N001" in recorded_cmds[-1]
+
+        # 4. List: note filter
+        res = client.get("/api/runs?note=bad", headers=headers)
+        assert res.status_code == 400
+
+        res = client.get("/api/runs?note=N001", headers=headers)
+        assert res.status_code == 200
+        assert "--note" in recorded_cmds[-1]
+        assert "N001" in recorded_cmds[-1]
+
+    finally:
+        state.workspace = old_ws
+
+
+def test_runs_triage_proposal_endpoint(monkeypatch, tmp_path):
+    import server as srv
+
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+
+    valid_run_id = "20261017-150000-N001-kilo-abcd"
+    run_dir = tmp_path / ".ai-orchestration" / "runs" / valid_run_id
+    run_dir.mkdir(parents=True)
+
+    proposal_data = {
+        "tasks": [
+            {
+                "title": "Proposed task 1",
+                "category": "feature",
+                "priority": "P2",
+                "priority_reason": "important",
+                "goal": "Do something",
+                "steps": ["Step 1"],
+                "verification": "Check it",
+            }
+        ],
+        "updates": [],
+        "spec": None,
+        "questions": [],
+    }
+    (run_dir / "triage-proposal.json").write_text(json.dumps(proposal_data), encoding="utf-8")
+
+    show_mode = "triage"
+    show_status = "succeeded"
+    show_prop_status = "pending"
+    show_prop_err = None
+
+    async def fake_run_ai_orch(cmd, timeout=None):
+        if cmd[0:2] == ["run", "show"]:
+            if cmd[2] == "nonexistent-id":
+                return 1, {"error": "Run not found", "reason": "not-found"}
+            return 0, {
+                "ok": True,
+                "run": {
+                    "run_id": cmd[2],
+                    "mode": show_mode,
+                    "status": show_status,
+                    "proposal_status": show_prop_status,
+                    "proposal_error": show_prop_err,
+                },
+            }
+        return 0, {"ok": True}
+
+    monkeypatch.setattr(srv, "run_ai_orch", fake_run_ai_orch)
+
+    try:
+        # Auth check
+        res = client.get(f"/api/runs/{valid_run_id}/triage-proposal")
+        assert res.status_code == 401
+
+        # Invalid run ID format
+        res = client.get("/api/runs/bad-id/triage-proposal", headers=headers)
+        assert res.status_code == 400
+
+        # Run not found -> 404
+        bad_run = "20261017-150000-none-kilo-0000"
+        async def fake_not_found(cmd, timeout=None):
+            return 1, {"error": "Run not found", "reason": "not-found"}
+        monkeypatch.setattr(srv, "run_ai_orch", fake_not_found)
+        res = client.get(f"/api/runs/{bad_run}/triage-proposal", headers=headers)
+        assert res.status_code == 404
+        monkeypatch.setattr(srv, "run_ai_orch", fake_run_ai_orch)
+
+        # Non-triage run -> 400
+        show_mode = "execute"
+        res = client.get(f"/api/runs/{valid_run_id}/triage-proposal", headers=headers)
+        assert res.status_code == 400
+        assert "not a triage run" in res.json().get("error", "")
+
+        # Valid triage run with pending proposal
+        show_mode = "triage"
+        show_prop_status = "pending"
+        res = client.get(f"/api/runs/{valid_run_id}/triage-proposal", headers=headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("ok") is True
+        assert data.get("proposal_status") == "pending"
+        assert data.get("proposal") == proposal_data
+
+        # Valid triage run with invalid proposal
+        show_prop_status = "invalid"
+        show_prop_err = "Syntax error in ```ai-orch-triage block"
+        (run_dir / "triage-proposal.json").unlink()
+        res = client.get(f"/api/runs/{valid_run_id}/triage-proposal", headers=headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("proposal_status") == "invalid"
+        assert data.get("proposal_error") == show_prop_err
+        assert data.get("proposal") is None
+
+    finally:
+        state.workspace = old_ws
+
+
+def test_runs_accept_triage_endpoint_and_broadcast(monkeypatch, tmp_path):
+    import server as srv
+
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+
+    valid_run_id = "20261017-150000-N001-kilo-abcd"
+    last_cmd: list[str] = []
+    cli_return_code = 0
+    cli_return_data: dict = {
+        "ok": True,
+        "run_id": valid_run_id,
+        "note_id": "N001",
+        "proposal_status": "accepted",
+        "tasks_created": ["T010", "T011"],
+    }
+
+    async def fake_run_ai_orch(cmd, timeout=None):
+        nonlocal last_cmd
+        last_cmd = cmd
+        return cli_return_code, cli_return_data
+
+    monkeypatch.setattr(srv, "run_ai_orch", fake_run_ai_orch)
+
+    try:
+        # Auth check
+        res = client.post(f"/api/runs/{valid_run_id}/accept-triage", json={})
+        assert res.status_code == 401
+
+        # Bad run ID
+        res = client.post("/api/runs/bad-id/accept-triage", headers=headers, json={})
+        assert res.status_code == 400
+
+        # Success case with only and expect_note_hash
+        broadcasts: list[dict] = []
+        orig_broadcast = state.broadcast
+
+        async def capture_broadcast(msg):
+            broadcasts.append(msg)
+            await orig_broadcast(msg)
+
+        monkeypatch.setattr(state, "broadcast", capture_broadcast)
+
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"only": [0, 1], "expect_note_hash": "notehash123"},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("ok") is True
+        assert data.get("proposal_status") == "accepted"
+        assert data.get("tasks_created") == ["T010", "T011"]
+
+        # Check command args passed to CLI
+        assert last_cmd[0:3] == ["run", "accept-triage", valid_run_id]
+        assert "--only" in last_cmd
+        assert last_cmd[last_cmd.index("--only") + 1] == "0,1"
+        assert "--expect-note-hash" in last_cmd
+        assert last_cmd[last_cmd.index("--expect-note-hash") + 1] == "notehash123"
+
+        # Check broadcast
+        assert any(b.get("type") == "changed" and set(b.get("areas", [])) == {"inbox", "tasks"} for b in broadcasts)
+
+        # Conflict error (e.g. note changed, stale-note-hash) -> 409
+        cli_return_code = 1
+        cli_return_data = {
+            "error": "Inbox note 'N001' hash mismatch",
+            "reason": "stale-note-hash",
+        }
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"expect_note_hash": "oldhash"},
+        )
+        assert res.status_code == 409
+
+        # Run not found -> 404
+        cli_return_code = 1
+        cli_return_data = {
+            "error": "Run not found",
+            "reason": "run-not-found",
+        }
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={},
+        )
+        assert res.status_code == 404
+
+        # Proposal not pending -> 400
+        cli_return_code = 1
+        cli_return_data = {
+            "error": "Proposal already accepted",
+            "reason": "proposal-not-pending",
+        }
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={},
+        )
+        assert res.status_code == 400
+
+    finally:
+        state.workspace = old_ws
+

@@ -301,7 +301,8 @@ export interface RunOptionsResponse {
 }
 
 export interface RunPreviewPayload {
-  task: string;
+  task?: string;
+  note?: string;
   mode?: string;
   tool?: string;
   profile?: string;
@@ -329,7 +330,8 @@ export interface RunPreviewResponse {
 }
 
 export interface RunStartPayload {
-  task: string;
+  task?: string;
+  note?: string;
   expect_plan_hash: string;
   mode?: string;
   tool?: string;
@@ -409,6 +411,55 @@ export interface RunRecord {
   questions?: string[];
   question_errors?: any[];
   task_transition_error?: string | null;
+  note_id?: string | null;
+  note_bundle_sha256?: string | null;
+  proposal_status?: 'pending' | 'invalid' | 'accepted' | string | null;
+  proposal_error?: string | null;
+  accepted_tasks?: string[];
+  accepted_at?: string | null;
+}
+
+export interface ProposedTask {
+  title: string;
+  category: string;
+  priority: Priority | string;
+  priority_reason: string;
+  goal: string;
+  steps?: string[] | string;
+  verification?: string;
+  [key: string]: any;
+}
+
+export interface TriageProposal {
+  tasks: ProposedTask[];
+  updates?: any[];
+  spec?: any;
+  questions?: any[];
+  [key: string]: any;
+}
+
+export interface TriageProposalResponse {
+  ok: boolean;
+  run_id: string;
+  proposal_status: 'pending' | 'invalid' | 'accepted' | string | null;
+  proposal_error?: string | null;
+  proposal: TriageProposal | null;
+}
+
+export interface AcceptTriagePayload {
+  only?: number[] | string[];
+  expect_note_hash?: string;
+}
+
+export interface AcceptTriageResponse {
+  ok: boolean;
+  run_id: string;
+  note_id: string;
+  proposal_status: string;
+  tasks_created: string[];
+  produced?: string;
+  processed_by?: string;
+  [key: string]: any;
 }
 
 export interface RunListResponse {

@@ -23,7 +23,8 @@ import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface RunDialogProps {
   isOpen: boolean;
-  task: TaskItem;
+  task?: TaskItem;
+  note?: { id: string; title: string; bundle_sha256?: string; [key: string]: any };
   onClose: () => void;
   onRunStarted: (runId: string) => void;
 }
@@ -31,9 +32,14 @@ interface RunDialogProps {
 export const RunDialog: React.FC<RunDialogProps> = ({
   isOpen,
   task,
+  note,
   onClose,
   onRunStarted,
 }) => {
+  const targetId = note?.id || task?.id || '';
+  const targetTitle = note?.title || task?.title || '';
+  const isNote = Boolean(note?.id);
+
   const [loadingOptions, setLoadingOptions] = useState(false);
   const [options, setOptions] = useState<RunOptionsResponse | null>(null);
   const [optionsError, setOptionsError] = useState<string | null>(null);
@@ -67,13 +73,13 @@ export const RunDialog: React.FC<RunDialogProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     loadOptions();
-  }, [isOpen, task.id]);
+  }, [isOpen, task?.id, note?.id]);
 
   const loadOptions = async () => {
     setLoadingOptions(true);
     setOptionsError(null);
     try {
-      const res = await api.getRunOptions(task.id);
+      const res = await api.getRunOptions(isNote ? { note: note!.id } : { task: task!.id });
       setOptions(res);
 
       // Initialize form with defaults
@@ -146,7 +152,7 @@ export const RunDialog: React.FC<RunDialogProps> = ({
   // Debounced preview execution
   const fetchPreview = useCallback(async (customPayload?: RunPreviewPayload): Promise<RunPreviewResponse> => {
     const payload: RunPreviewPayload = customPayload || {
-      task: task.id,
+      ...(isNote ? { note: note!.id } : { task: task?.id }),
       mode,
       tool,
       profile,
@@ -161,7 +167,7 @@ export const RunDialog: React.FC<RunDialogProps> = ({
     };
 
     return await api.previewRun(payload);
-  }, [task.id, mode, tool, profile, model, variant, effort, isolation, targetRun, instructions, allowSameTool, allowDirtyBase]);
+  }, [task?.id, note?.id, isNote, mode, tool, profile, model, variant, effort, isolation, targetRun, instructions, allowSameTool, allowDirtyBase]);
 
   useEffect(() => {
     if (!isOpen || !options) return;
@@ -215,7 +221,7 @@ export const RunDialog: React.FC<RunDialogProps> = ({
     }
 
     const payload = {
-      task: task.id,
+      ...(isNote ? { note: note!.id } : { task: task?.id }),
       mode,
       tool,
       profile,
@@ -257,7 +263,7 @@ export const RunDialog: React.FC<RunDialogProps> = ({
     const updated = await fetchPreview();
     setPreview(updated);
     return {
-      summary: `Launch ${mode} run for ${task.id} with ${tool} (${profile})`,
+      summary: `Launch ${mode} run for ${targetId} with ${tool} (${profile})`,
       hash: updated.plan_hash,
       warnings: updated.warnings,
       diff: [
@@ -326,10 +332,10 @@ export const RunDialog: React.FC<RunDialogProps> = ({
               <Play size={20} color="#818cf8" />
               <div>
                 <h2 style={{ fontSize: '1.1rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
-                  Run Task: <span style={{ color: '#818cf8' }}>{task.id}</span>
+                  {isNote ? 'Triage Note: ' : 'Run Task: '}<span style={{ color: '#818cf8' }}>{targetId}</span>
                 </h2>
                 <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginTop: '0.15rem' }}>
-                  {task.title}
+                  {targetTitle}
                 </div>
               </div>
             </div>
@@ -888,7 +894,7 @@ export const RunDialog: React.FC<RunDialogProps> = ({
       {isConfirmOpen && preview && (
         <ConfirmDialog
           isOpen={true}
-          title={`Launch ${mode.toUpperCase()} Run for ${task.id}`}
+          title={`Launch ${mode.toUpperCase()} Run for ${targetId}`}
           summary={`Starting ${tool} (${profile}) model: ${model || 'default'}${mode === 'execute' ? ` with ${isolation} isolation` : ''}`}
           hash={preview.plan_hash}
           warnings={preview.warnings}
