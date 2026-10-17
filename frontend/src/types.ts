@@ -34,6 +34,8 @@ export interface TaskItem {
   verifier?: string;
   file_path?: string;
   is_done?: boolean;
+  bundle_sha256?: string;
+  task_bundle_sha256?: string;
 }
 
 export interface InitiativeItem {
@@ -209,3 +211,212 @@ export interface WithdrawQuestionPayload {
   reason: string;
   by?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Run Engine Types (Task 07.7)
+// ---------------------------------------------------------------------------
+
+export type RunStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'lost' | string;
+export type RunMode = 'execute' | 'orchestrate' | 'verify' | string;
+
+export interface ToolStatus {
+  enabled: boolean;
+  installed: boolean;
+  available: boolean;
+  cli_command?: string;
+  path?: string | null;
+  version?: string | null;
+  reason?: string | null;
+}
+
+export interface ProfileModelConfig {
+  model?: string;
+  variant?: string;
+  effort?: string;
+}
+
+export interface ResolvedDefaultRun {
+  mode: string;
+  tool: string;
+  profile: string;
+  model?: string;
+  variant?: string;
+  effort?: string;
+  isolation?: string;
+  target_run?: string;
+}
+
+export interface VerifyTarget {
+  run_id: string;
+  ended_at?: string;
+  final_commit?: string;
+  tool?: string;
+}
+
+export interface RunOptionsResponse {
+  ok: boolean;
+  task: {
+    id: string;
+    title: string;
+    state: string;
+    executor: string;
+    profile?: string;
+    bundle_sha256?: string;
+  };
+  allowed_modes: string[];
+  default_mode: string;
+  tools: Record<string, ToolStatus>;
+  models_per_profile: Record<string, Record<string, ProfileModelConfig>>;
+  resolved_defaults: Record<string, ResolvedDefaultRun>;
+  usable_verify_targets: VerifyTarget[];
+}
+
+export interface RunPreviewPayload {
+  task: string;
+  mode?: string;
+  tool?: string;
+  profile?: string;
+  model?: string;
+  variant?: string;
+  effort?: string;
+  isolation?: string;
+  target_run?: string;
+  instructions?: string;
+  allow_same_tool?: boolean;
+  allow_dirty_base?: boolean;
+  force?: boolean;
+}
+
+export interface RunPreviewResponse {
+  ok: boolean;
+  prompt: string;
+  prompt_sha256?: string;
+  argv_display: string[];
+  cwd: string;
+  planned_worktree?: string | null;
+  planned_branch?: string | null;
+  warnings: string[];
+  plan_hash: string;
+}
+
+export interface RunStartPayload {
+  task: string;
+  expect_plan_hash: string;
+  mode?: string;
+  tool?: string;
+  profile?: string;
+  model?: string;
+  variant?: string;
+  effort?: string;
+  isolation?: string;
+  target_run?: string;
+  instructions?: string;
+  allow_same_tool?: boolean;
+  allow_dirty_base?: boolean;
+  force?: boolean;
+}
+
+export interface RunContinuePayload {
+  instructions?: string;
+  expect_plan_hash?: string;
+}
+
+export interface FindingItem {
+  id: string;
+  severity: 'blocker' | 'major' | 'minor' | string;
+  text: string;
+}
+
+export interface CheckItem {
+  step: string;
+  result: 'pass' | 'fail' | string;
+  evidence?: string;
+}
+
+export interface RunVerdict {
+  verdict: 'verified' | 'bounced' | string;
+  findings?: FindingItem[];
+  checks?: CheckItem[];
+}
+
+export interface RunRecord {
+  run_id: string;
+  task_id: string;
+  mode: RunMode;
+  tool: string;
+  profile: string;
+  model?: string;
+  variant?: string;
+  effort?: string;
+  requested_by?: string;
+  workspace?: string;
+  cwd?: string;
+  isolation?: string;
+  worktree_path?: string | null;
+  branch?: string | null;
+  base_commit?: string | null;
+  final_commit?: string | null;
+  commits_after_base?: number | null;
+  invariant_error?: string | null;
+  target_run?: string | null;
+  target_commit?: string | null;
+  task_bundle_sha256?: string | null;
+  plan_hash?: string;
+  supervisor?: { pid: number | null; start_time: number | null };
+  agent?: { pid: number | null; pgid: number | null; start_time: number | null };
+  argv_display?: string[];
+  status: RunStatus;
+  exit_code?: number | null;
+  started_at?: string;
+  ended_at?: string | null;
+  session_id?: string | null;
+  continued_from?: string | null;
+  final_report?: string | null;
+  verdict?: RunVerdict | null;
+  panel_id?: string | null;
+  verification_mode?: string | null;
+  keep_worktree?: boolean;
+  worktree_removed?: boolean | null;
+  questions?: string[];
+  question_errors?: any[];
+  task_transition_error?: string | null;
+}
+
+export interface RunListResponse {
+  ok: boolean;
+  runs: RunRecord[];
+}
+
+export interface RunLogEvent {
+  type?: string;
+  text?: string;
+  tool_call?: any;
+  error?: any;
+  raw?: any;
+  [key: string]: any;
+}
+
+export interface RunLogsResponse {
+  ok: boolean;
+  run_id: string;
+  first_available_offset: number;
+  next_offset: number;
+  events: RunLogEvent[];
+  raw?: string;
+}
+
+export interface RunCleanupPayload {
+  discard?: boolean;
+  dry_run?: boolean;
+  expect_plan_hash?: string;
+}
+
+export interface RunApplyVerdictPayload {
+  expect_task_hash?: string;
+  panel_id?: string;
+}
+
+export interface RunMarkDeliveredPayload {
+  expect_task_hash?: string;
+}
+

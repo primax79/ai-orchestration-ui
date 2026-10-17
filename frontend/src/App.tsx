@@ -3,6 +3,8 @@ import { AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { BacklogManager } from './components/BacklogManager';
 import { DecisionsTab } from './components/DecisionsTab';
+import { RunsTab } from './components/RunsTab';
+import { TaskDetailModal } from './components/TaskDetailModal';
 import { SkillInstaller } from './components/SkillInstaller';
 import { EnvironmentDoctor } from './components/EnvironmentDoctor';
 import { OrchestrationConfigurator } from './components/OrchestrationConfigurator';
@@ -12,6 +14,7 @@ import {
   TaskListResponse,
   EnvStatusResponse,
   OrchestrationConfigResponse,
+  TaskItem,
 } from './types';
 
 const PanelErrorBanner: React.FC<{ title: string; error: string; onRetry: () => void }> = ({
@@ -81,7 +84,7 @@ const PanelLoading: React.FC<{ label: string }> = ({ label }) => (
 );
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'installer' | 'doctor' | 'config'>('backlog');
+  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'runs' | 'installer' | 'doctor' | 'config'>('backlog');
 
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
 
@@ -91,6 +94,10 @@ export const App: React.FC = () => {
 
   const [openQuestionsCount, setOpenQuestionsCount] = useState<number>(0);
   const [questionsRefreshKey, setQuestionsRefreshKey] = useState<number>(0);
+
+  const [activeRunsCount, setActiveRunsCount] = useState<number>(0);
+  const [runsRefreshKey, setRunsRefreshKey] = useState<number>(0);
+  const [modalTaskAndRun, setModalTaskAndRun] = useState<{ task: TaskItem; runId?: string } | null>(null);
 
   const [envStatus, setEnvStatus] = useState<EnvStatusResponse | null>(null);
   const [envLoading, setEnvLoading] = useState(false);
@@ -141,6 +148,17 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  const loadActiveRunsCount = useCallback(async () => {
+    try {
+      const res = await api.listRuns({ active: true });
+      if (res && res.runs) {
+        setActiveRunsCount(res.runs.length);
+      }
+    } catch (e: any) {
+      console.error('Failed to load active runs count:', e);
+    }
+  }, []);
+
   const loadEnv = useCallback(async () => {
     setEnvLoading(true);
     setEnvError(null);
@@ -172,9 +190,11 @@ export const App: React.FC = () => {
     loadTasks();
     loadQuestionsCount();
     setQuestionsRefreshKey((k) => k + 1);
+    loadActiveRunsCount();
+    setRunsRefreshKey((k) => k + 1);
     loadEnv();
     loadConfig();
-  }, [loadWorkspace, loadTasks, loadQuestionsCount, loadEnv, loadConfig]);
+  }, [loadWorkspace, loadTasks, loadQuestionsCount, loadActiveRunsCount, loadEnv, loadConfig]);
 
   // Debounced area reloading (300 ms)
   const pendingAreas = useRef<Set<string>>(new Set());
@@ -197,6 +217,13 @@ export const App: React.FC = () => {
           loadTasks();
         }
       }
+      if (toReload.has('runs')) {
+        const lastAction = ownActionTimestamps.current['runs'] || 0;
+        if (now - lastAction > 800) {
+          loadActiveRunsCount();
+          setRunsRefreshKey((k) => k + 1);
+        }
+      }
       if (toReload.has('questions')) {
         const lastAction = ownActionTimestamps.current['questions'] || 0;
         if (now - lastAction > 800) {
@@ -217,7 +244,7 @@ export const App: React.FC = () => {
         }
       }
     }, 300);
-  }, [loadTasks, loadQuestionsCount, loadConfig, loadEnv]);
+  }, [loadTasks, loadActiveRunsCount, loadQuestionsCount, loadConfig, loadEnv]);
 
   useEffect(() => {
     loadAll();
@@ -252,6 +279,12 @@ export const App: React.FC = () => {
           triggerDebouncedReload(['env']);
         } else if (msg.type === 'config_updated' || msg.type === 'agents_md_applied') {
           triggerDebouncedReload(['config']);
+        } else if (
+          msg.type === 'run_cancelled' ||
+          msg.type === 'task_delivered' ||
+          msg.type === 'verdict_applied'
+        ) {
+          triggerDebouncedReload(['runs', 'tasks']);
         }
       },
       (status) => {
@@ -274,6 +307,7 @@ export const App: React.FC = () => {
         onRefresh={loadAll}
         isWsConnected={isWsConnected}
         openQuestionsCount={openQuestionsCount}
+        activeRunsCount={activeRunsCount}
       />
 
       <main style={{ flex: 1 }}>
@@ -294,8 +328,10 @@ export const App: React.FC = () => {
                 onRefresh={() => {
                   recordOwnAction('tasks');
                   recordOwnAction('questions');
+                  recordOwnAction('runs');
                   loadTasks();
                   loadQuestionsCount();
+                  loadActiveRunsCount();
                 }}
               />
             )}
@@ -312,6 +348,19 @@ export const App: React.FC = () => {
                 recordOwnAction('tasks');
                 loadQuestionsCount();
                 loadTasks();
+              }}
+            />
+          </div>
+        )}
+
+        {activeTab === 'runs' && (
+          <div>
+            <RunsTab
+              key={runsRefreshKey}
+              tasks={tasksData?.all_tasks || tasksData?.emergent_tasks || []}
+              refreshKey={runsRefreshKey}
+              onSelectRun={(task, runId) => {
+                setModalTaskAndRun({ task, runId });
               }}
             />
           </div>
@@ -374,6 +423,26 @@ export const App: React.FC = () => {
           </div>
         )}
       </main>
+
+      {/* Task Detail Modal when opened from RunsTab or other tabs */}
+      {modalTaskAndRun && (
+        <TaskDetailModal
+          task={modalTaskAndRun.task}
+          initialRunId={modalTaskAndRun.runId}
+          onClose={() => setModalTaskAndRun(null)}
+          onActionComplete={() => {
+            recordOwnAction('tasks');
+            recordOwnAction('runs');
+            loadTasks();
+            loadActiveRunsCount();
+            setRunsRefreshKey((k) => k + 1);
+          }}
+          onNavigateToDecisions={() => {
+            setModalTaskAndRun(null);
+            setActiveTab('decisions');
+          }}
+        />
+      )}
     </div>
   );
 };

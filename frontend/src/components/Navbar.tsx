@@ -1,14 +1,15 @@
 import React from 'react';
-import { Layers, HelpCircle, DownloadCloud, Activity, Settings, RefreshCw, FolderGit2 } from 'lucide-react';
+import { Layers, HelpCircle, DownloadCloud, Activity, Settings, RefreshCw, FolderGit2, Terminal } from 'lucide-react';
 import { WorkspaceInfo } from '../types';
 
 interface NavbarProps {
-  activeTab: 'backlog' | 'decisions' | 'installer' | 'doctor' | 'config';
-  setActiveTab: (tab: 'backlog' | 'decisions' | 'installer' | 'doctor' | 'config') => void;
+  activeTab: 'backlog' | 'decisions' | 'runs' | 'installer' | 'doctor' | 'config';
+  setActiveTab: (tab: 'backlog' | 'decisions' | 'runs' | 'installer' | 'doctor' | 'config') => void;
   workspace: WorkspaceInfo | null;
   onRefresh: () => void;
   isWsConnected: boolean;
   openQuestionsCount?: number;
+  activeRunsCount?: number;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -18,6 +19,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onRefresh,
   isWsConnected,
   openQuestionsCount = 0,
+  activeRunsCount = 0,
 }) => {
   return (
     <header style={{
@@ -90,6 +92,46 @@ export const Navbar: React.FC<NavbarProps> = ({
                 }}
               >
                 {openQuestionsCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setActiveTab('runs')}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.4rem',
+              padding: '0.4rem 0.8rem',
+              borderRadius: '0.375rem',
+              border: 'none',
+              cursor: 'pointer',
+              backgroundColor: activeTab === 'runs' ? '#4f46e5' : 'transparent',
+              color: activeTab === 'runs' ? '#fff' : '#94a3b8',
+              fontWeight: 500,
+            }}
+          >
+            <Terminal size={16} />
+            <span>Runs</span>
+            {activeRunsCount > 0 && (
+              <span
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  backgroundColor: '#0ea5e9',
+                  color: '#fff',
+                  fontSize: '0.7rem',
+                  fontWeight: 700,
+                  minWidth: '1.15rem',
+                  height: '1.15rem',
+                  padding: '0 0.3rem',
+                  borderRadius: '1rem',
+                  lineHeight: 1,
+                  marginLeft: '0.15rem',
+                }}
+              >
+                {activeRunsCount}
               </span>
             )}
           </button>

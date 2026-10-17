@@ -19,21 +19,27 @@ import {
 import { TaskItem, QuestionItem, AskQuestionPayload } from '../types';
 import { api } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
+import { RunDialog } from './RunDialog';
+import { TaskRunsPanel } from './TaskRunsPanel';
 
 interface TaskDetailModalProps {
   task: TaskItem;
+  initialRunId?: string;
   onClose: () => void;
   onActionComplete: () => void;
   onIndexOutOfSync?: () => void;
   onRequestSyncIndex?: () => void;
+  onNavigateToDecisions?: (questionId: string) => void;
 }
 
 export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   task,
+  initialRunId,
   onClose,
   onActionComplete,
   onIndexOutOfSync,
   onRequestSyncIndex,
+  onNavigateToDecisions,
 }) => {
   const [loading, setLoading] = useState(false);
   const [detail, setDetail] = useState<any>(null);
@@ -42,6 +48,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [copiedHandoff, setCopiedHandoff] = useState(false);
   const [transitionError, setTransitionError] = useState<string | null>(null);
   const [indexOutOfSync, setIndexOutOfSync] = useState(false);
+  const [showRunDialog, setShowRunDialog] = useState(false);
 
   // Questions section state
   const [taskQuestions, setTaskQuestions] = useState<QuestionItem[]>([]);
@@ -908,6 +915,18 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             </div>
           )}
 
+          {/* Agent Runs Panel */}
+          <TaskRunsPanel
+            task={task}
+            initialRunId={initialRunId}
+            onRefreshTask={() => {
+              loadDetail();
+              onActionComplete();
+            }}
+            onNavigateToDecisions={onNavigateToDecisions}
+            onOpenRunDialog={() => setShowRunDialog(true)}
+          />
+
           {/* Inline Transition Error */}
           {transitionError && (
             <div style={{
@@ -942,26 +961,76 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           </div>
 
           <div style={{ display: 'flex', gap: '0.5rem' }}>
+            {/* Run button for emergent tasks in active states */}
+            {(task.kind === 'emergent' || task.id.startsWith('T')) &&
+              task.state !== 'open' &&
+              task.state !== 'done' &&
+              task.state !== 'done with a caveat' &&
+              task.state !== 'dropped' &&
+              task.state !== 'verified' && (
+                <button
+                  onClick={() => setShowRunDialog(true)}
+                  disabled={loading}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #6366f1',
+                    backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                    color: '#a5b4fc',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <Play size={14} />
+                  <span>Run…</span>
+                </button>
+              )}
+
             {task.state === 'open' && (
-              <button
-                onClick={() => handleTransition('in progress')}
-                disabled={loading}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.3rem',
-                  padding: '0.4rem 0.8rem',
-                  borderRadius: '0.375rem',
-                  border: 'none',
-                  backgroundColor: '#6366f1',
-                  color: '#fff',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                }}
-              >
-                {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
-                <span>Start Task (In Progress)</span>
-              </button>
+              task.kind === 'emergent' || task.id.startsWith('T') ? (
+                <button
+                  onClick={() => setShowRunDialog(true)}
+                  disabled={loading}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: 'none',
+                    backgroundColor: '#4f46e5',
+                    color: '#fff',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <Play size={15} />
+                  <span>Run…</span>
+                </button>
+              ) : (
+                <button
+                  onClick={() => handleTransition('in progress')}
+                  disabled={loading}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    border: 'none',
+                    backgroundColor: '#6366f1',
+                    color: '#fff',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+                  <span>Start Task (In Progress)</span>
+                </button>
+              )
             )}
 
             {task.state === 'in progress' && (
@@ -1054,6 +1123,19 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Run Dialog */}
+      {showRunDialog && (
+        <RunDialog
+          isOpen={true}
+          task={task}
+          onClose={() => setShowRunDialog(false)}
+          onRunStarted={() => {
+            loadDetail();
+            onActionComplete();
+          }}
+        />
+      )}
     </div>
   );
 };

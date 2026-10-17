@@ -8,6 +8,17 @@ import {
   AskQuestionPayload,
   AnswerQuestionPayload,
   WithdrawQuestionPayload,
+  RunOptionsResponse,
+  RunPreviewPayload,
+  RunPreviewResponse,
+  RunStartPayload,
+  RunContinuePayload,
+  RunRecord,
+  RunListResponse,
+  RunLogsResponse,
+  RunCleanupPayload,
+  RunApplyVerdictPayload,
+  RunMarkDeliveredPayload,
 } from './types';
 
 // Custom ApiError to carry HTTP status and response payload
@@ -521,6 +532,115 @@ export const api = {
     return apiFetch('/api/config/render-agents-md/apply', {
       method: 'POST',
       body: JSON.stringify({ expect_hash: expectHash, allow_global_routing: allowGlobalRouting }),
+    });
+  },
+
+  // -------------------------------------------------------------------------
+  // Agent Runs Endpoints (Task 07.7)
+  // -------------------------------------------------------------------------
+
+  async getRunOptions(task: string): Promise<RunOptionsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<RunOptionsResponse>('getRunOptions', { task });
+    }
+    return apiFetch<RunOptionsResponse>(`/api/runs/options?task=${encodeURIComponent(task)}`);
+  },
+
+  async previewRun(payload: RunPreviewPayload): Promise<RunPreviewResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<RunPreviewResponse>('previewRun', payload);
+    }
+    return apiFetch<RunPreviewResponse>('/api/runs/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async startRun(payload: RunStartPayload): Promise<{ ok: boolean; run_id: string; status: string; [key: string]: any }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('startRun', payload);
+    }
+    return apiFetch('/api/runs', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async continueRun(runId: string, payload?: RunContinuePayload): Promise<{ ok: boolean; run_id: string; status: string; [key: string]: any }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('continueRun', { runId, ...(payload || {}) });
+    }
+    return apiFetch(`/api/runs/${encodeURIComponent(runId)}/continue`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async listRuns(params?: { task?: string; active?: boolean }): Promise<RunListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<RunListResponse>('listRuns', params);
+    }
+    const query = new URLSearchParams();
+    if (params?.task) query.set('task', params.task);
+    if (params?.active) query.set('active', '1');
+    const qs = query.toString();
+    return apiFetch<RunListResponse>(`/api/runs${qs ? `?${qs}` : ''}`);
+  },
+
+  async getRun(runId: string): Promise<{ ok: boolean; run: RunRecord }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean; run: RunRecord }>('getRun', { runId });
+    }
+    return apiFetch<{ ok: boolean; run: RunRecord }>(`/api/runs/${encodeURIComponent(runId)}`);
+  },
+
+  async getRunLogs(runId: string, params?: { since_offset?: number; tail?: number }): Promise<RunLogsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<RunLogsResponse>('getRunLogs', { runId, ...(params || {}) });
+    }
+    const query = new URLSearchParams();
+    if (params?.since_offset !== undefined) query.set('since_offset', String(params.since_offset));
+    if (params?.tail !== undefined) query.set('tail', String(params.tail));
+    const qs = query.toString();
+    return apiFetch<RunLogsResponse>(`/api/runs/${encodeURIComponent(runId)}/logs${qs ? `?${qs}` : ''}`);
+  },
+
+  async cancelRun(runId: string): Promise<{ ok: boolean; run_id: string; status: string }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('cancelRun', { runId });
+    }
+    return apiFetch(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    });
+  },
+
+  async markDeliveredRun(runId: string, payload?: RunMarkDeliveredPayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('markDeliveredRun', { runId, ...(payload || {}) });
+    }
+    return apiFetch(`/api/runs/${encodeURIComponent(runId)}/mark-delivered`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async applyVerdictRun(runId: string, payload?: RunApplyVerdictPayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('applyVerdictRun', { runId, ...(payload || {}) });
+    }
+    return apiFetch(`/api/runs/${encodeURIComponent(runId)}/apply-verdict`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async cleanupRun(runId: string, payload?: RunCleanupPayload): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('cleanupRun', { runId, ...(payload || {}) });
+    }
+    return apiFetch(`/api/runs/${encodeURIComponent(runId)}/cleanup`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
     });
   },
 
