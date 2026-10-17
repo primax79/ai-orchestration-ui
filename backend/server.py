@@ -794,14 +794,22 @@ def _plan_for_initiative(tasks_dir: pathlib.Path, init_id: str) -> pathlib.Path 
 
 
 def _plan_task_block(plan_text: str, task_id: str) -> str | None:
-    """The `### NN.T - title` block of a plan, up to the next heading of level <= 3."""
+    """The `### NN.T - title` block of a plan, up to the next heading of level <= 3,
+    or matching table row, with fallback to the full plan."""
     lines = plan_text.splitlines()
     head = re.compile(rf"^###\s+{re.escape(task_id)}\s+[\u2014\u2013-]\s+")
     start = next((i for i, ln in enumerate(lines) if head.match(ln)), None)
-    if start is None:
-        return None
-    end = next((j for j in range(start + 1, len(lines)) if re.match(r"^#{1,3}\s", lines[j])), len(lines))
-    return "\n".join(lines[start:end]).rstrip() + "\n"
+    if start is not None:
+        end = next((j for j in range(start + 1, len(lines)) if re.match(r"^#{1,3}\s", lines[j])), len(lines))
+        return "\n".join(lines[start:end]).rstrip() + "\n"
+
+    # Also check table rows (e.g. | **T1** | ... | or | **08.T1** | ... |)
+    short_id = task_id.split(".")[-1] if "." in task_id else task_id
+    table_re = re.compile(rf"^\|\s*\*\*({re.escape(task_id)}|{re.escape(short_id)})\*\*\s*\|\s*(.+?)\|")
+    matching_row = next((ln for ln in lines if table_re.match(ln)), None)
+    if matching_row:
+        return f"### Task {task_id}\n\n{matching_row.strip()}\n\n---\n\n{plan_text}"
+    return None
 
 
 async def api_get_task_detail(request: Request) -> JSONResponse:
