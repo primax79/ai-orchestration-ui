@@ -388,6 +388,7 @@ export interface RunListResponse {
 }
 
 export interface RunLogEvent {
+  offset?: number;
   type?: string;
   text?: string;
   tool_call?: any;

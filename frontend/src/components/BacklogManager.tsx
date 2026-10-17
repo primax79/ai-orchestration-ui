@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Layers, Kanban, ListFilter, Copy, Check, FileCheck, ArrowRight, AlertTriangle, AlertCircle, Loader2 } from 'lucide-react';
 import { TaskItem, TaskListResponse } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
@@ -23,6 +23,15 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
 
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
   const initiatives = data?.initiatives || [];
+
+  useEffect(() => {
+    if (selectedTask && data?.all_tasks) {
+      const updated = data.all_tasks.find((t) => t.id === selectedTask.id);
+      if (updated && updated.state !== selectedTask.state) {
+        setSelectedTask(updated);
+      }
+    }
+  }, [data, selectedTask]);
 
   // Compute stats
   const stats = {

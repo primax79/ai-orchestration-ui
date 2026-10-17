@@ -14,7 +14,6 @@ import {
   CheckCheck,
   Ban,
   FileText,
-  X,
 } from 'lucide-react';
 import {
   TaskItem,
@@ -28,6 +27,8 @@ import { ConfirmDialog } from './ConfirmDialog';
 interface TaskRunsPanelProps {
   task: TaskItem;
   initialRunId?: string;
+  refreshTrigger?: number;
+  onRunsLoaded?: (runs: RunRecord[]) => void;
   onRefreshTask?: () => void;
   onNavigateToDecisions?: (questionId: string) => void;
   onOpenRunDialog: () => void;
@@ -36,6 +37,8 @@ interface TaskRunsPanelProps {
 export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
   task,
   initialRunId,
+  refreshTrigger,
+  onRunsLoaded,
   onRefreshTask,
   onNavigateToDecisions,
   onOpenRunDialog,
@@ -46,17 +49,17 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
 
   const [selectedRunId, setSelectedRunId] = useState<string | null>(initialRunId || null);
   const [logs, setLogs] = useState<RunLogEvent[]>([]);
-  const [logOffset, setLogOffset] = useState<number>(0);
   const [logsLoading, setLogsLoading] = useState<boolean>(false);
   const [autoScroll, setAutoScroll] = useState<boolean>(true);
 
-  // Continuation modal state
-  const [continueModalOpen, setContinueModalOpen] = useState<boolean>(false);
+  // ConfirmDialog states for all mutating actions
+  const [cancelConfirm, setCancelConfirm] = useState<RunRecord | null>(null);
+  const [deliverConfirm, setDeliverConfirm] = useState<RunRecord | null>(null);
+  const [verdictConfirm, setVerdictConfirm] = useState<RunRecord | null>(null);
+  const [continueConfirm, setContinueConfirm] = useState<RunRecord | null>(null);
   const [continueInstructions, setContinueInstructions] = useState<string>('');
-  const [continuing, setContinuing] = useState<boolean>(false);
-  const [continueError, setContinueError] = useState<string | null>(null);
 
-  // Cleanup confirmation state
+  // Cleanup confirmation state (with dry-run preview)
   const [cleanupConfirm, setCleanupConfirm] = useState<{
     isOpen: boolean;
     runId: string;
@@ -71,10 +74,13 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
   const [showFinalReport, setShowFinalReport] = useState<boolean>(false);
 
   const logContainerRef = useRef<HTMLDivElement | null>(null);
-  const logOffsetRef = useRef<number>(0);
-  logOffsetRef.current = logOffset;
-
   const pollIntervalRef = useRef<any>(null);
+  const wsDebounceTimerRef = useRef<any>(null);
+
+  // Incremental merge refs: keep next_offset per run, guard in-flight
+  const nextOffsetsRef = useRef<Record<string, number>>({});
+  const isFetchingLogsRef = useRef<boolean>(false);
+  const prevRunIdRef = useRef<string | null>(null);
 
   const loadRuns = useCallback(async (selectId?: string) => {
     setLoading(true);
@@ -83,6 +89,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
       const res = await api.listRuns({ task: task.id });
       const runList = res.runs || [];
       setRuns(runList);
+      onRunsLoaded?.(runList);
 
       if (selectId) {
         setSelectedRunId(selectId);
@@ -101,77 +108,174 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
     } finally {
       setLoading(false);
     }
-  }, [task.id, initialRunId, selectedRunId]);
+  }, [task.id, initialRunId, selectedRunId, onRunsLoaded]);
 
   useEffect(() => {
     loadRuns(initialRunId);
-  }, [task.id, initialRunId, loadRuns]);
+  }, [task.id, initialRunId, refreshTrigger, loadRuns]);
+
+  // WebSocket debounced reload (300 ms) on changed runs or tasks
+  useEffect(() => {
+    const unsub = api.subscribeWebSocket((msg) => {
+      const isChangedAreas =
+        msg.type === 'changed' &&
+        Array.isArray(msg.areas) &&
+        (msg.areas.includes('runs') || msg.areas.includes('tasks'));
+
+      const isRunEvent =
+        msg.type === 'run_cancelled' ||
+        msg.type === 'task_delivered' ||
+        msg.type === 'verdict_applied' ||
+        msg.type === 'tasks_changed' ||
+        msg.type === 'task_transitioned';
+
+      if (isChangedAreas || isRunEvent) {
+        if (wsDebounceTimerRef.current) clearTimeout(wsDebounceTimerRef.current);
+        wsDebounceTimerRef.current = setTimeout(() => {
+          loadRuns();
+        }, 300);
+      }
+    });
+
+    return () => {
+      if (wsDebounceTimerRef.current) clearTimeout(wsDebounceTimerRef.current);
+      unsub();
+    };
+  }, [loadRuns]);
 
   const selectedRun = runs.find((r) => r.run_id === selectedRunId) || null;
 
-  // Poll logs and run status when a run is active
+  // Incremental log fetching with deduplication by offset
+  const fetchLogs = useCallback(async (runId: string) => {
+    if (isFetchingLogsRef.current) return;
+    isFetchingLogsRef.current = true;
+
+    const storedOffset = nextOffsetsRef.current[runId] || 0;
+    try {
+      const res = await api.getRunLogs(runId, { since_offset: storedOffset });
+      if (!res || !res.ok) return;
+
+      // Reset when first_available_offset > stored offset (log buffer wrapped)
+      if (typeof res.first_available_offset === 'number' && res.first_available_offset > storedOffset) {
+        nextOffsetsRef.current[runId] = res.next_offset || 0;
+        const baseOffset = res.first_available_offset;
+        const eventsWithOffset = (res.events || []).map((e, idx) => ({
+          ...e,
+          offset: typeof e.offset === 'number' ? e.offset : baseOffset + idx,
+        }));
+        setLogs(eventsWithOffset);
+        return;
+      }
+
+      if (res.events && res.events.length > 0) {
+        const baseOffset = storedOffset;
+        const newEvents = res.events.map((e, idx) => ({
+          ...e,
+          offset: typeof e.offset === 'number' ? e.offset : baseOffset + idx,
+        }));
+
+        setLogs((prev) => {
+          // React StrictMode double effects must not double-append (dedupe by offset)
+          const seenOffsets = new Set<number>();
+          for (const item of prev) {
+            if (typeof item.offset === 'number') {
+              seenOffsets.add(item.offset);
+            }
+          }
+          const filteredNew = newEvents.filter((item) => {
+            if (typeof item.offset === 'number') {
+              if (seenOffsets.has(item.offset)) return false;
+              seenOffsets.add(item.offset);
+              return true;
+            }
+            return true;
+          });
+
+          if (filteredNew.length === 0) return prev;
+          return [...prev, ...filteredNew];
+        });
+      }
+
+      if (typeof res.next_offset === 'number') {
+        nextOffsetsRef.current[runId] = Math.max(storedOffset, res.next_offset);
+      }
+    } catch {
+      // non-blocking
+    } finally {
+      isFetchingLogsRef.current = false;
+      setLogsLoading(false);
+    }
+  }, []);
+
+  // Reset and fetch logs when selected run changes
   useEffect(() => {
+    if (!selectedRunId) {
+      setLogs([]);
+      prevRunIdRef.current = null;
+      return;
+    }
+
+    // Reset when run id changes
+    if (prevRunIdRef.current !== selectedRunId) {
+      setLogs([]);
+      nextOffsetsRef.current[selectedRunId] = 0;
+      prevRunIdRef.current = selectedRunId;
+      setLogsLoading(true);
+    }
+
+    fetchLogs(selectedRunId);
+  }, [selectedRunId, fetchLogs]);
+
+  // Poll GET /api/runs/{id} every 2 s while any run of the open task is starting|running
+  useEffect(() => {
+    const hasActiveRun = runs.some((r) => r.status === 'running' || r.status === 'starting');
+    if (!hasActiveRun) {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+      return;
+    }
+
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
     }
 
-    if (!selectedRun) {
-      setLogs([]);
-      setLogOffset(0);
-      return;
-    }
+    pollIntervalRef.current = setInterval(async () => {
+      const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'starting');
+      let statusChanged = false;
 
-    // Reset log state on selected run change
-    setLogs([]);
-    setLogOffset(0);
-    logOffsetRef.current = 0;
-    setLogsLoading(true);
-
-    const fetchLogsOnce = async (runId: string, since: number) => {
-      try {
-        const res = await api.getRunLogs(runId, { since_offset: since });
-        if (res.events && res.events.length > 0) {
-          setLogs((prev) => [...prev, ...res.events]);
-        }
-        if (typeof res.next_offset === 'number') {
-          setLogOffset(res.next_offset);
-          logOffsetRef.current = res.next_offset;
-        }
-      } catch {
-        // non-blocking
-      } finally {
-        setLogsLoading(false);
-      }
-    };
-
-    const isRunning = selectedRun.status === 'running' || selectedRun.status === 'starting';
-
-    // Initial fetch
-    fetchLogsOnce(selectedRun.run_id, 0);
-
-    if (isRunning) {
-      pollIntervalRef.current = setInterval(async () => {
-        await fetchLogsOnce(selectedRun.run_id, logOffsetRef.current);
-
-        // Also check if status changed
+      for (const ar of activeRuns) {
         try {
-          const updated = await api.getRun(selectedRun.run_id);
+          const updated = await api.getRun(ar.run_id);
           if (updated && updated.run) {
-            setRuns((prev) =>
-              prev.map((r) => (r.run_id === updated.run.run_id ? updated.run : r))
-            );
+            setRuns((prev) => {
+              const next = prev.map((item) => (item.run_id === updated.run.run_id ? updated.run : item));
+              onRunsLoaded?.(next);
+              return next;
+            });
             if (updated.run.status !== 'running' && updated.run.status !== 'starting') {
-              if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-              }
-              onRefreshTask?.();
+              statusChanged = true;
             }
           }
-        } catch {}
-      }, 2000);
-    }
+        } catch {
+          // non-blocking
+        }
+      }
+
+      // Fetch logs for selected run if active
+      if (selectedRunId) {
+        const cur = runs.find((r) => r.run_id === selectedRunId);
+        if (cur && (cur.status === 'running' || cur.status === 'starting')) {
+          await fetchLogs(selectedRunId);
+        }
+      }
+
+      if (statusChanged) {
+        onRefreshTask?.();
+      }
+    }, 2000);
 
     return () => {
       if (pollIntervalRef.current) {
@@ -179,7 +283,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
         pollIntervalRef.current = null;
       }
     };
-  }, [selectedRunId, selectedRun?.status, onRefreshTask]);
+  }, [runs, selectedRunId, fetchLogs, onRefreshTask, onRunsLoaded]);
 
   // Autoscroll logs container
   useEffect(() => {
@@ -187,86 +291,6 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
   }, [logs, autoScroll]);
-
-  // Cancel action
-  const handleCancelRun = async (runId: string) => {
-    setActionLoading(`cancel_${runId}`);
-    setActionError(null);
-    try {
-      await api.cancelRun(runId);
-      await loadRuns(runId);
-      onRefreshTask?.();
-    } catch (e: any) {
-      setActionError(e?.data?.error || e?.message || String(e));
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  // Mark delivered action (R6 gate)
-  const handleMarkDelivered = async (run: RunRecord) => {
-    setActionLoading(`deliver_${run.run_id}`);
-    setActionError(null);
-    const bundleHash = task.bundle_sha256 || task.task_bundle_sha256;
-    try {
-      await api.markDeliveredRun(run.run_id, {
-        expect_task_hash: bundleHash,
-      });
-      await loadRuns(run.run_id);
-      onRefreshTask?.();
-    } catch (e: any) {
-      setActionError(e?.data?.error || e?.message || String(e));
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  // Apply verdict action
-  const handleApplyVerdict = async (run: RunRecord) => {
-    setActionLoading(`verdict_${run.run_id}`);
-    setActionError(null);
-    const bundleHash = task.bundle_sha256 || task.task_bundle_sha256;
-    try {
-      await api.applyVerdictRun(run.run_id, {
-        expect_task_hash: bundleHash,
-        panel_id: run.panel_id || undefined,
-      });
-      await loadRuns(run.run_id);
-      onRefreshTask?.();
-    } catch (e: any) {
-      setActionError(e?.data?.error || e?.message || String(e));
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  // Continue run action
-  const handleOpenContinue = () => {
-    setContinueInstructions('');
-    setContinueError(null);
-    setContinueModalOpen(true);
-  };
-
-  const handleApplyContinue = async () => {
-    if (!selectedRun) return;
-    setContinuing(true);
-    setContinueError(null);
-    try {
-      const res = await api.continueRun(selectedRun.run_id, {
-        instructions: continueInstructions.trim() || undefined,
-        expect_plan_hash: selectedRun.plan_hash,
-      });
-      if (res && res.run_id) {
-        setContinueModalOpen(false);
-        await loadRuns(res.run_id);
-        onRefreshTask?.();
-      }
-    } catch (e: any) {
-      setContinueError(e?.data?.error || e?.message || String(e));
-    } finally {
-      setContinuing(false);
-    }
-  };
 
   // Cleanup action
   const handleOpenCleanup = async (run: RunRecord) => {
@@ -507,7 +531,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
                     {/* Cancel for active runs */}
                     {(selectedRun.status === 'running' || selectedRun.status === 'starting') && (
                       <button
-                        onClick={() => handleCancelRun(selectedRun.run_id)}
+                        onClick={() => setCancelConfirm(selectedRun)}
                         disabled={actionLoading === `cancel_${selectedRun.run_id}`}
                         style={{
                           display: 'flex',
@@ -540,7 +564,10 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
                       selectedRun.worktree_path &&
                       selectedRun.worktree_removed !== true && (
                         <button
-                          onClick={handleOpenContinue}
+                          onClick={() => {
+                            setContinueInstructions('');
+                            setContinueConfirm(selectedRun);
+                          }}
                           style={{
                             display: 'flex',
                             alignItems: 'center',
@@ -568,7 +595,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
                       task.state !== 'verified' &&
                       task.state !== 'done' && (
                         <button
-                          onClick={() => handleMarkDelivered(selectedRun)}
+                          onClick={() => setDeliverConfirm(selectedRun)}
                           disabled={actionLoading === `deliver_${selectedRun.run_id}`}
                           title="Verify invariants and transition task to delivered"
                           style={{
@@ -737,7 +764,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
 
                       {selectedRun.verdict && task.state === 'delivered' && (
                         <button
-                          onClick={() => handleApplyVerdict(selectedRun)}
+                          onClick={() => setVerdictConfirm(selectedRun)}
                           disabled={actionLoading === `verdict_${selectedRun.run_id}`}
                           style={{
                             display: 'flex',
@@ -943,119 +970,198 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
         </div>
       )}
 
-      {/* Continue Modal */}
-      {continueModalOpen && selectedRun && (
-        <div
-          style={{
-            position: 'fixed',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            backgroundColor: 'rgba(0, 0, 0, 0.75)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-            padding: '1.5rem',
+      {/* Cancel Confirm Dialog */}
+      {cancelConfirm && (
+        <ConfirmDialog
+          isOpen={true}
+          title={`Cancel Run ${cancelConfirm.run_id}`}
+          summary={[
+            `### Cancel Run Summary`,
+            `- **Run ID**: \`${cancelConfirm.run_id}\``,
+            `- **Tool / Mode**: ${cancelConfirm.tool} · ${cancelConfirm.mode}`,
+            `- **Current Status**: **${cancelConfirm.status.toUpperCase()}**`,
+            ``,
+            `#### Effect on Task State`,
+            `Terminates the active agent process and transitions run status to **cancelled**.`,
+            `Task **${task.id}** state remains **${task.state}**. The worktree and branch are retained for inspection or cleanup.`,
+          ].join('\n')}
+          applyButtonText="Confirm & Cancel Run"
+          danger={true}
+          onApply={async () => {
+            setActionLoading(`cancel_${cancelConfirm.run_id}`);
+            setActionError(null);
+            try {
+              await api.cancelRun(cancelConfirm.run_id);
+              setCancelConfirm(null);
+              await loadRuns(cancelConfirm.run_id);
+              onRefreshTask?.();
+            } catch (e: any) {
+              setActionError(e?.data?.error || e?.message || String(e));
+              throw e;
+            } finally {
+              setActionLoading(null);
+            }
+          }}
+          onCancel={() => setCancelConfirm(null)}
+        />
+      )}
+
+      {/* Mark Delivered Confirm Dialog */}
+      {deliverConfirm && (
+        <ConfirmDialog
+          isOpen={true}
+          title={`Mark Task Delivered via Run ${deliverConfirm.run_id}`}
+          summary={[
+            `### Mark Delivered Summary`,
+            `- **Run ID**: \`${deliverConfirm.run_id}\``,
+            `- **Tool / Mode**: ${deliverConfirm.tool} · ${deliverConfirm.mode}`,
+            `- **Branch**: \`${deliverConfirm.branch || 'none'}\``,
+            `- **Commits After Base**: **+${deliverConfirm.commits_after_base ?? 0}**`,
+            `- **Final Commit**: \`${deliverConfirm.final_commit ? deliverConfirm.final_commit.slice(0, 7) : 'none'}\``,
+            ``,
+            `#### Effect on Task State`,
+            `Verifies invariants and transitions task **${task.id}** from **${task.state}** to **delivered** (needs verification).`,
+            `The worktree is retained for independent verification.`,
+          ].join('\n')}
+          applyButtonText="Confirm & Mark Delivered"
+          danger={false}
+          onApply={async () => {
+            setActionLoading(`deliver_${deliverConfirm.run_id}`);
+            setActionError(null);
+            try {
+              const bundleHash = task.bundle_sha256 || task.task_bundle_sha256;
+              await api.markDeliveredRun(deliverConfirm.run_id, {
+                expect_task_hash: bundleHash,
+              });
+              setDeliverConfirm(null);
+              await loadRuns(deliverConfirm.run_id);
+              onRefreshTask?.();
+            } catch (e: any) {
+              setActionError(e?.data?.error || e?.message || String(e));
+              throw e;
+            } finally {
+              setActionLoading(null);
+            }
+          }}
+          onCancel={() => setDeliverConfirm(null)}
+        />
+      )}
+
+      {/* Apply Verdict Confirm Dialog */}
+      {verdictConfirm && (
+        <ConfirmDialog
+          isOpen={true}
+          title={`Apply Verification Verdict for ${verdictConfirm.run_id}`}
+          summary={[
+            `### Verification Verdict Summary`,
+            `- **Run ID**: \`${verdictConfirm.run_id}\``,
+            `- **Tool / Mode**: ${verdictConfirm.tool} · ${verdictConfirm.mode}`,
+            `- **Verdict**: **${verdictConfirm.verdict?.verdict ? verdictConfirm.verdict.verdict.toUpperCase() : 'UNKNOWN'}**`,
+            `- **Resulting Task State**: **${verdictConfirm.verdict?.verdict === 'verified' ? 'verified' : 'open'}**`,
+            ``,
+            `#### Findings (${verdictConfirm.verdict?.findings?.length || 0})`,
+            verdictConfirm.verdict?.findings && verdictConfirm.verdict.findings.length > 0
+              ? verdictConfirm.verdict.findings
+                  .map((f) => `- **[${f.severity.toUpperCase()}]** \`${f.id}\`: ${f.text}`)
+                  .join('\n')
+              : `_No defects found. All verification checks passed successfully._`,
+            ``,
+            `#### Effect on Task State`,
+            `Transitions task **${task.id}** from **${task.state}** to **${verdictConfirm.verdict?.verdict === 'verified' ? 'verified' : 'open'}**.`,
+            verdictConfirm.verdict?.verdict === 'verified'
+              ? `The task is approved and ready for closing (done).`
+              : `The task is rejected and returned to open for executor rework.`,
+          ].join('\n')}
+          applyButtonText={
+            verdictConfirm.verdict?.verdict === 'verified'
+              ? 'Approve (Verified)'
+              : 'Bounce Task (Open)'
+          }
+          danger={verdictConfirm.verdict?.verdict === 'bounced'}
+          onApply={async () => {
+            setActionLoading(`verdict_${verdictConfirm.run_id}`);
+            setActionError(null);
+            try {
+              const bundleHash = task.bundle_sha256 || task.task_bundle_sha256;
+              await api.applyVerdictRun(verdictConfirm.run_id, {
+                expect_task_hash: bundleHash,
+                panel_id: verdictConfirm.panel_id || undefined,
+              });
+              setVerdictConfirm(null);
+              await loadRuns(verdictConfirm.run_id);
+              onRefreshTask?.();
+            } catch (e: any) {
+              setActionError(e?.data?.error || e?.message || String(e));
+              throw e;
+            } finally {
+              setActionLoading(null);
+            }
+          }}
+          onCancel={() => setVerdictConfirm(null)}
+        />
+      )}
+
+      {/* Continue Confirm Dialog */}
+      {continueConfirm && (
+        <ConfirmDialog
+          isOpen={true}
+          title={`Continue Run Session for ${continueConfirm.run_id}`}
+          summary={[
+            `### Continue Session Summary`,
+            `- **Run ID**: \`${continueConfirm.run_id}\``,
+            `- **Tool / Mode**: ${continueConfirm.tool} · ${continueConfirm.mode}`,
+            `- **Session ID**: \`${continueConfirm.session_id || 'none'}\``,
+            `- **Worktree**: \`${continueConfirm.worktree_path || 'none'}\``,
+            ``,
+            `#### Effect on Task State`,
+            `Resumes the agent session in the existing worktree with new instructions. Task **${task.id}** state remains or transitions to **in progress**.`,
+          ].join('\n')}
+          hash={continueConfirm.plan_hash}
+          applyButtonText="Confirm & Continue Run"
+          danger={false}
+          onApply={async (hash?: string) => {
+            try {
+              const res = await api.continueRun(continueConfirm.run_id, {
+                instructions: continueInstructions.trim() || undefined,
+                expect_plan_hash: hash || continueConfirm.plan_hash,
+              });
+              setContinueConfirm(null);
+              setContinueInstructions('');
+              if (res && res.run_id) {
+                await loadRuns(res.run_id);
+                onRefreshTask?.();
+              }
+            } catch (e: any) {
+              throw e;
+            }
+          }}
+          onCancel={() => {
+            setContinueConfirm(null);
+            setContinueInstructions('');
           }}
         >
-          <div
-            style={{
-              backgroundColor: '#1e293b',
-              borderRadius: '0.5rem',
-              border: '1px solid #334155',
-              width: '100%',
-              maxWidth: '520px',
-              padding: '1.25rem',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '1rem',
-            }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontWeight: 600, fontSize: '1rem', color: '#f8fafc' }}>
-                <RotateCcw size={18} color="#818cf8" />
-                <span>Continue Run Session</span>
-              </div>
-              <button
-                onClick={() => setContinueModalOpen(false)}
-                style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer' }}
-              >
-                <X size={18} />
-              </button>
-            </div>
-
-            <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>
-              Continuing run <code style={{ color: '#818cf8' }}>{selectedRun.run_id}</code>. Task, tool, model, cwd, and session ID are locked.
-            </div>
-
-            {continueError && (
-              <div style={{ padding: '0.5rem 0.75rem', backgroundColor: '#451a1a', border: '1px solid #ef4444', borderRadius: '0.25rem', color: '#fca5a5', fontSize: '0.8rem' }}>
-                {continueError}
-              </div>
-            )}
-
-            <div>
-              <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '0.35rem' }}>
-                Continuation Instructions
-              </label>
-              <textarea
-                value={continueInstructions}
-                onChange={(e) => setContinueInstructions(e.target.value)}
-                rows={3}
-                placeholder="Explain what the agent should do next..."
-                style={{
-                  width: '100%',
-                  boxSizing: 'border-box',
-                  padding: '0.5rem 0.75rem',
-                  borderRadius: '0.375rem',
-                  border: '1px solid #334155',
-                  backgroundColor: '#0f172a',
-                  color: '#f8fafc',
-                  fontSize: '0.85rem',
-                }}
-              />
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-              <button
-                onClick={() => setContinueModalOpen(false)}
-                style={{
-                  padding: '0.4rem 0.8rem',
-                  borderRadius: '0.375rem',
-                  border: '1px solid #475569',
-                  backgroundColor: 'transparent',
-                  color: '#cbd5e1',
-                  fontSize: '0.85rem',
-                  cursor: 'pointer',
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleApplyContinue}
-                disabled={continuing}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.3rem',
-                  padding: '0.4rem 0.9rem',
-                  borderRadius: '0.375rem',
-                  border: 'none',
-                  backgroundColor: '#4f46e5',
-                  color: '#fff',
-                  fontSize: '0.85rem',
-                  fontWeight: 600,
-                  cursor: continuing ? 'not-allowed' : 'pointer',
-                }}
-              >
-                {continuing ? <Loader2 size={14} className="spin" /> : <Play size={14} />}
-                <span>Continue Run</span>
-              </button>
-            </div>
+          <div style={{ marginTop: '0.25rem' }}>
+            <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '0.35rem' }}>
+              Continuation Instructions (Optional)
+            </label>
+            <textarea
+              value={continueInstructions}
+              onChange={(e) => setContinueInstructions(e.target.value)}
+              rows={3}
+              placeholder="Explain what the agent should do next..."
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                padding: '0.5rem 0.75rem',
+                borderRadius: '0.375rem',
+                border: '1px solid #334155',
+                backgroundColor: '#0f172a',
+                color: '#f8fafc',
+                fontSize: '0.85rem',
+              }}
+            />
           </div>
-        </div>
+        </ConfirmDialog>
       )}
 
       {/* Cleanup Confirm Dialog */}

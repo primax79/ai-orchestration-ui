@@ -52,6 +52,60 @@ export const RunsTab: React.FC<RunsTabProps> = ({
     loadAllRuns();
   }, [loadAllRuns, refreshKey]);
 
+  // Poll active runs every 2s while any run is starting or running
+  useEffect(() => {
+    const hasActiveRun = runs.some((r) => r.status === 'running' || r.status === 'starting');
+    if (!hasActiveRun) return;
+
+    const interval = setInterval(async () => {
+      const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'starting');
+      for (const ar of activeRuns) {
+        try {
+          const updated = await api.getRun(ar.run_id);
+          if (updated && updated.run) {
+            setRuns((prev) =>
+              prev.map((item) => (item.run_id === updated.run.run_id ? updated.run : item))
+            );
+          }
+        } catch {
+          // non-blocking
+        }
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [runs]);
+
+  // WebSocket live reload debounced 300ms on changed runs or tasks
+  useEffect(() => {
+    let timer: any = null;
+    const unsub = api.subscribeWebSocket((msg) => {
+      const isChangedAreas =
+        msg.type === 'changed' &&
+        Array.isArray(msg.areas) &&
+        (msg.areas.includes('runs') || msg.areas.includes('tasks'));
+
+      const isRunEvent =
+        msg.type === 'run_cancelled' ||
+        msg.type === 'task_delivered' ||
+        msg.type === 'verdict_applied' ||
+        msg.type === 'tasks_changed' ||
+        msg.type === 'task_transitioned';
+
+      if (isChangedAreas || isRunEvent) {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          loadAllRuns();
+        }, 300);
+      }
+    });
+
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsub();
+    };
+  }, [loadAllRuns]);
+
   // Map task IDs to TaskItem objects
   const taskMap = useMemo(() => {
     const map = new Map<string, TaskItem>();

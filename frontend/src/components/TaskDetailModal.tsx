@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   X,
   CheckCircle,
@@ -16,7 +16,7 @@ import {
   Trash2,
   Send,
 } from 'lucide-react';
-import { TaskItem, QuestionItem, AskQuestionPayload } from '../types';
+import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord } from '../types';
 import { api } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
@@ -41,6 +41,11 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   onRequestSyncIndex,
   onNavigateToDecisions,
 }) => {
+  const [currentTask, setCurrentTask] = useState<TaskItem>(task);
+  const [taskRuns, setTaskRuns] = useState<RunRecord[]>([]);
+  const [runsRefreshTrigger, setRunsRefreshTrigger] = useState<number>(0);
+  const [activeRunId, setActiveRunId] = useState<string | undefined>(initialRunId);
+
   const [loading, setLoading] = useState(false);
   const [detail, setDetail] = useState<any>(null);
   const [bounceReason, setBounceReason] = useState('');
@@ -49,6 +54,11 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [transitionError, setTransitionError] = useState<string | null>(null);
   const [indexOutOfSync, setIndexOutOfSync] = useState(false);
   const [showRunDialog, setShowRunDialog] = useState(false);
+
+  // Sync currentTask when incoming prop changes
+  useEffect(() => {
+    setCurrentTask(task);
+  }, [task]);
 
   // Questions section state
   const [taskQuestions, setTaskQuestions] = useState<QuestionItem[]>([]);
@@ -67,10 +77,73 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [askSubmitting, setAskSubmitting] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
 
-  useEffect(() => {
-    loadDetail();
-    loadQuestions();
+  const reloadTaskDetailAndState = useCallback(async () => {
+    try {
+      const data = await api.getTaskDetail(task.id);
+      setDetail(data);
+    } catch (e: any) {
+      setTransitionError(`Failed to load task specification: ${e.message}`);
+    }
+
+    try {
+      const res = await api.getTasks();
+      const all = res?.all_tasks || res?.emergent_tasks || [];
+      const updated = all.find((t: TaskItem) => t.id === task.id);
+      if (updated) {
+        setCurrentTask(updated);
+      }
+    } catch {
+      // non-blocking
+    }
   }, [task.id]);
+
+  const loadTaskRuns = useCallback(async () => {
+    try {
+      const res = await api.listRuns({ task: task.id });
+      setTaskRuns(res.runs || []);
+      return res.runs || [];
+    } catch {
+      return [];
+    }
+  }, [task.id]);
+
+  useEffect(() => {
+    reloadTaskDetailAndState();
+    loadTaskRuns();
+    loadQuestions();
+  }, [task.id, reloadTaskDetailAndState, loadTaskRuns]);
+
+  // WebSocket listener debounced 300ms on changed runs or tasks
+  useEffect(() => {
+    let timer: any = null;
+    const unsub = api.subscribeWebSocket((msg) => {
+      const isChangedAreas =
+        msg.type === 'changed' &&
+        Array.isArray(msg.areas) &&
+        (msg.areas.includes('runs') || msg.areas.includes('tasks'));
+
+      const isTaskRunEvent =
+        msg.type === 'tasks_changed' ||
+        msg.type === 'task_transitioned' ||
+        msg.type === 'task_delivered' ||
+        msg.type === 'run_cancelled' ||
+        msg.type === 'verdict_applied';
+
+      if (isChangedAreas || isTaskRunEvent) {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          reloadTaskDetailAndState();
+          loadTaskRuns();
+          setRunsRefreshTrigger((k) => k + 1);
+        }, 300);
+      }
+    });
+
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsub();
+    };
+  }, [reloadTaskDetailAndState, loadTaskRuns]);
 
   const loadQuestions = async () => {
     setQuestionsLoading(true);
@@ -175,21 +248,12 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       setAskRecommended('-');
       setAskOpenAnswer(true);
       await loadQuestions();
-      await loadDetail();
+      await reloadTaskDetailAndState();
       onActionComplete();
     } catch (err: any) {
       setAskError(err?.message || String(err));
     } finally {
       setAskSubmitting(false);
-    }
-  };
-
-  const loadDetail = async () => {
-    try {
-      const data = await api.getTaskDetail(task.id);
-      setDetail(data);
-    } catch (e: any) {
-      setTransitionError(`Failed to load task specification: ${e.message}`);
     }
   };
 
@@ -202,6 +266,9 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         setIndexOutOfSync(true);
         onIndexOutOfSync?.();
       }
+      await reloadTaskDetailAndState();
+      await loadTaskRuns();
+      setRunsRefreshTrigger((k) => k + 1);
       onActionComplete();
       onClose();
     } catch (e: any) {
@@ -212,8 +279,8 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   };
 
   const copyHandoff = () => {
-    if (task.handoff) {
-      navigator.clipboard.writeText(task.handoff);
+    if (currentTask.handoff) {
+      navigator.clipboard.writeText(currentTask.handoff);
       setCopiedHandoff(true);
       setTimeout(() => setCopiedHandoff(false), 2000);
     }
@@ -260,12 +327,12 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 fontWeight: 700,
                 padding: '0.15rem 0.4rem',
                 borderRadius: '0.25rem',
-                backgroundColor: task.priority === 'P0' ? '#ef4444' : task.priority === 'P1' ? '#f59e0b' : '#64748b',
+                backgroundColor: currentTask.priority === 'P0' ? '#ef4444' : currentTask.priority === 'P1' ? '#f59e0b' : '#64748b',
                 color: '#fff',
               }}>
-                {task.priority}
+                {currentTask.priority}
               </span>
-              <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#818cf8' }}>{task.id}</span>
+              <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#818cf8' }}>{currentTask.id}</span>
               <span style={{
                 fontSize: '0.75rem',
                 padding: '0.15rem 0.5rem',
@@ -273,10 +340,10 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 backgroundColor: '#334155',
                 color: '#cbd5e1',
               }}>
-                {task.state}
+                {currentTask.state}
               </span>
             </div>
-            <h2 style={{ fontSize: '1.2rem', fontWeight: 600, color: '#f8fafc' }}>{task.title}</h2>
+            <h2 style={{ fontSize: '1.2rem', fontWeight: 600, color: '#f8fafc' }}>{currentTask.title}</h2>
           </div>
           <button
             onClick={onClose}
@@ -341,24 +408,24 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           }}>
             <div>
               <div style={{ color: '#64748b', fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 600 }}>Assignee / Executor</div>
-              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{task.executor || 'self'}</div>
+              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{currentTask.executor || 'self'}</div>
             </div>
             <div>
               <div style={{ color: '#64748b', fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 600 }}>Role Profile</div>
-              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{task.profile || 'bulk-execution'}</div>
+              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{currentTask.profile || 'bulk-execution'}</div>
             </div>
             <div>
               <div style={{ color: '#64748b', fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 600 }}>Verification Mode</div>
-              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{task.verification_mode || 'independent-session'}</div>
+              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{currentTask.verification_mode || 'independent-session'}</div>
             </div>
             <div>
               <div style={{ color: '#64748b', fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 600 }}>Category</div>
-              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{task.category}</div>
+              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{currentTask.category}</div>
             </div>
           </div>
 
           {/* Handoff prompt box */}
-          {task.handoff && (
+          {currentTask.handoff && (
             <div style={{
               backgroundColor: '#0f172a',
               border: '1px solid #334155',
@@ -386,7 +453,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 </button>
               </div>
               <code style={{ fontSize: '0.8rem', color: '#e2e8f0', fontFamily: 'monospace', display: 'block', wordBreak: 'break-all' }}>
-                {task.handoff}
+                {currentTask.handoff}
               </code>
             </div>
           )}
@@ -917,10 +984,13 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
 
           {/* Agent Runs Panel */}
           <TaskRunsPanel
-            task={task}
-            initialRunId={initialRunId}
-            onRefreshTask={() => {
-              loadDetail();
+            task={currentTask}
+            initialRunId={activeRunId || initialRunId}
+            refreshTrigger={runsRefreshTrigger}
+            onRunsLoaded={(loadedRuns) => setTaskRuns(loadedRuns)}
+            onRefreshTask={async () => {
+              await reloadTaskDetailAndState();
+              await loadTaskRuns();
               onActionComplete();
             }}
             onNavigateToDecisions={onNavigateToDecisions}
@@ -957,17 +1027,17 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           borderTop: '1px solid #334155',
         }}>
           <div style={{ fontSize: '0.8rem', color: '#64748b' }}>
-            Current State: <strong style={{ color: '#cbd5e1' }}>{task.state}</strong>
+            Current State: <strong style={{ color: '#cbd5e1' }}>{currentTask.state}</strong>
           </div>
 
           <div style={{ display: 'flex', gap: '0.5rem' }}>
             {/* Run button for emergent tasks in active states */}
-            {(task.kind === 'emergent' || task.id.startsWith('T')) &&
-              task.state !== 'open' &&
-              task.state !== 'done' &&
-              task.state !== 'done with a caveat' &&
-              task.state !== 'dropped' &&
-              task.state !== 'verified' && (
+            {(currentTask.kind === 'emergent' || currentTask.id.startsWith('T')) &&
+              currentTask.state !== 'open' &&
+              currentTask.state !== 'done' &&
+              currentTask.state !== 'done with a caveat' &&
+              currentTask.state !== 'dropped' &&
+              currentTask.state !== 'verified' && (
                 <button
                   onClick={() => setShowRunDialog(true)}
                   disabled={loading}
@@ -989,8 +1059,8 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 </button>
               )}
 
-            {task.state === 'open' && (
-              task.kind === 'emergent' || task.id.startsWith('T') ? (
+            {currentTask.state === 'open' && (
+              currentTask.kind === 'emergent' || currentTask.id.startsWith('T') ? (
                 <button
                   onClick={() => setShowRunDialog(true)}
                   disabled={loading}
@@ -1033,7 +1103,8 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               )
             )}
 
-            {task.state === 'in progress' && (
+            {/* R6: Generic delivered transition is HIDDEN when task has runs */}
+            {currentTask.state === 'in progress' && taskRuns.length === 0 && (
               <button
                 onClick={() => handleTransition('delivered')}
                 disabled={loading}
@@ -1055,7 +1126,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               </button>
             )}
 
-            {task.state === 'delivered' && (
+            {currentTask.state === 'delivered' && (
               <>
                 <button
                   onClick={() => setShowBounceInput(true)}
@@ -1099,7 +1170,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               </>
             )}
 
-            {task.state === 'verified' && (
+            {currentTask.state === 'verified' && (
               <button
                 onClick={() => handleTransition('done', undefined, 'Completed and integrated')}
                 disabled={loading}
@@ -1128,10 +1199,13 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       {showRunDialog && (
         <RunDialog
           isOpen={true}
-          task={task}
+          task={currentTask}
           onClose={() => setShowRunDialog(false)}
-          onRunStarted={() => {
-            loadDetail();
+          onRunStarted={async (newRunId) => {
+            setActiveRunId(newRunId);
+            await loadTaskRuns();
+            await reloadTaskDetailAndState();
+            setRunsRefreshTrigger((k) => k + 1);
             onActionComplete();
           }}
         />

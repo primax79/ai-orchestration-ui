@@ -50,7 +50,9 @@ export const vscode = isVsCode && window.acquireVsCodeApi ? window.acquireVsCode
 
 let messageSeq = 0;
 const pendingRequests = new Map<string, { resolve: (val: any) => void; reject: (err: any) => void }>();
-let globalWsListener: ((msg: any) => void) | null = null;
+const wsMessageListeners = new Set<(msg: any) => void>();
+const wsStatusListeners = new Set<(status: 'connected' | 'disconnected') => void>();
+let currentWsStatus: 'connected' | 'disconnected' = 'disconnected';
 
 if (typeof window !== 'undefined') {
   window.addEventListener('message', (event) => {
@@ -64,10 +66,14 @@ if (typeof window !== 'undefined') {
         const errStatus = status || (typeof error === 'string' && error.includes('409') ? 409 : 500);
         reject(new ApiError(error || 'VS Code message failed', errStatus, data));
       }
-    } else if (type === 'tasks_changed' && globalWsListener) {
-      globalWsListener({ type: 'tasks_changed' });
-    } else if (type === 'changed' && globalWsListener) {
-      globalWsListener(event.data);
+    } else if (type === 'tasks_changed') {
+      wsMessageListeners.forEach((l) => {
+        try { l({ type: 'tasks_changed' }); } catch {}
+      });
+    } else if (type === 'changed') {
+      wsMessageListeners.forEach((l) => {
+        try { l(event.data); } catch {}
+      });
     }
   });
 }
@@ -648,97 +654,134 @@ export const api = {
     onMessage: (msg: any) => void,
     onStatusChange?: (status: 'connected' | 'disconnected') => void
   ): () => void {
+    wsMessageListeners.add(onMessage);
+    if (onStatusChange) {
+      wsStatusListeners.add(onStatusChange);
+      if (isVsCode) {
+        onStatusChange('connected');
+      } else {
+        onStatusChange(currentWsStatus);
+      }
+    }
+
     if (isVsCode) {
-      globalWsListener = onMessage;
-      onStatusChange?.('connected');
       return () => {
-        globalWsListener = null;
+        wsMessageListeners.delete(onMessage);
+        if (onStatusChange) {
+          wsStatusListeners.delete(onStatusChange);
+        }
       };
     }
 
-    let ws: WebSocket | null = null;
-    let pingInterval: any = null;
-    let reconnectTimeout: any = null;
-    let isDisposed = false;
-    let backoffMs = 1000;
-    let hasConnectedOnce = false;
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host || 'localhost:8780';
-    const token = getApiToken();
-    const wsUrl = token
-      ? `${protocol}//${host}/ws?token=${encodeURIComponent(token)}`
-      : `${protocol}//${host}/ws`;
-
-    function scheduleReconnect() {
-      if (isDisposed || reconnectTimeout) return;
-      onStatusChange?.('disconnected');
-      const delay = backoffMs;
-      backoffMs = Math.min(30000, Math.round(backoffMs * 1.5));
-      reconnectTimeout = setTimeout(() => {
-        reconnectTimeout = null;
-        connect();
-      }, delay);
-    }
-
-    function connect() {
-      if (isDisposed) return;
-      try {
-        ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {
-          backoffMs = 1000;
-          onStatusChange?.('connected');
-          if (hasConnectedOnce) {
-            // Signal a reconnection so the app can reload state
-            onMessage({ type: 'reconnected' });
-          }
-          hasConnectedOnce = true;
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            if (data.type === 'connected') {
-              onStatusChange?.('connected');
-            }
-            onMessage(data);
-          } catch {}
-        };
-
-        ws.onerror = () => {
-          scheduleReconnect();
-        };
-
-        ws.onclose = () => {
-          scheduleReconnect();
-        };
-      } catch {
-        scheduleReconnect();
-      }
-    }
-
-    connect();
-
-    pingInterval = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send('ping');
-        } catch {}
-      }
-    }, 15000);
+    // Shared WebSocket management for browser
+    ensureBrowserWs();
 
     return () => {
-      isDisposed = true;
-      if (pingInterval) clearInterval(pingInterval);
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (ws) {
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onerror = null;
-        ws.onclose = null;
-        ws.close();
+      wsMessageListeners.delete(onMessage);
+      if (onStatusChange) {
+        wsStatusListeners.delete(onStatusChange);
       }
     };
   },
+
+  subscribeWebSocket(onMessage: (msg: any) => void): () => void {
+    return this.connectWebSocket(onMessage);
+  },
 };
+
+let sharedWs: WebSocket | null = null;
+let sharedWsPingInterval: any = null;
+let sharedWsReconnectTimeout: any = null;
+let sharedWsDisposed = false;
+let sharedWsBackoffMs = 1000;
+let sharedWsHasConnectedOnce = false;
+
+function broadcastWsStatus(status: 'connected' | 'disconnected') {
+  currentWsStatus = status;
+  wsStatusListeners.forEach((fn) => {
+    try {
+      fn(status);
+    } catch {}
+  });
+}
+
+function broadcastWsMessage(msg: any) {
+  wsMessageListeners.forEach((fn) => {
+    try {
+      fn(msg);
+    } catch {}
+  });
+}
+
+function scheduleSharedWsReconnect() {
+  if (sharedWsDisposed || sharedWsReconnectTimeout) return;
+  broadcastWsStatus('disconnected');
+  const delay = sharedWsBackoffMs;
+  sharedWsBackoffMs = Math.min(30000, Math.round(sharedWsBackoffMs * 1.5));
+  sharedWsReconnectTimeout = setTimeout(() => {
+    sharedWsReconnectTimeout = null;
+    initSharedWs();
+  }, delay);
+}
+
+function initSharedWs() {
+  if (isVsCode || typeof window === 'undefined' || sharedWsDisposed) return;
+  if (sharedWs && (sharedWs.readyState === WebSocket.OPEN || sharedWs.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.host || 'localhost:8780';
+  const token = getApiToken();
+  const wsUrl = token
+    ? `${protocol}//${host}/ws?token=${encodeURIComponent(token)}`
+    : `${protocol}//${host}/ws`;
+
+  try {
+    sharedWs = new WebSocket(wsUrl);
+
+    sharedWs.onopen = () => {
+      sharedWsBackoffMs = 1000;
+      broadcastWsStatus('connected');
+      if (sharedWsHasConnectedOnce) {
+        broadcastWsMessage({ type: 'reconnected' });
+      }
+      sharedWsHasConnectedOnce = true;
+    };
+
+    sharedWs.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'connected') {
+          broadcastWsStatus('connected');
+        }
+        broadcastWsMessage(data);
+      } catch {}
+    };
+
+    sharedWs.onerror = () => {
+      scheduleSharedWsReconnect();
+    };
+
+    sharedWs.onclose = () => {
+      scheduleSharedWsReconnect();
+    };
+  } catch {
+    scheduleSharedWsReconnect();
+  }
+
+  if (!sharedWsPingInterval) {
+    sharedWsPingInterval = setInterval(() => {
+      if (sharedWs && sharedWs.readyState === WebSocket.OPEN) {
+        try {
+          sharedWs.send('ping');
+        } catch {}
+      }
+    }, 15000);
+  }
+}
+
+function ensureBrowserWs() {
+  sharedWsDisposed = false;
+  initSharedWs();
+}

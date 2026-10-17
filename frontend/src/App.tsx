@@ -130,6 +130,14 @@ export const App: React.FC = () => {
     try {
       const data = await api.getTasks();
       setTasksData(data);
+      if (data && data.all_tasks) {
+        const allTasks = data.all_tasks;
+        setModalTaskAndRun((prev) => {
+          if (!prev) return null;
+          const updated = allTasks.find((t: TaskItem) => t.id === prev.task.id);
+          return updated ? { ...prev, task: updated } : prev;
+        });
+      }
     } catch (e: any) {
       setTasksError(e.message || String(e));
     } finally {
@@ -210,38 +218,22 @@ export const App: React.FC = () => {
       pendingAreas.current.clear();
       debounceTimer.current = null;
 
-      const now = Date.now();
       if (toReload.has('tasks')) {
-        const lastAction = ownActionTimestamps.current['tasks'] || 0;
-        if (now - lastAction > 800) {
-          loadTasks();
-        }
+        loadTasks();
       }
       if (toReload.has('runs')) {
-        const lastAction = ownActionTimestamps.current['runs'] || 0;
-        if (now - lastAction > 800) {
-          loadActiveRunsCount();
-          setRunsRefreshKey((k) => k + 1);
-        }
+        loadActiveRunsCount();
+        setRunsRefreshKey((k) => k + 1);
       }
       if (toReload.has('questions')) {
-        const lastAction = ownActionTimestamps.current['questions'] || 0;
-        if (now - lastAction > 800) {
-          loadQuestionsCount();
-          setQuestionsRefreshKey((k) => k + 1);
-        }
+        loadQuestionsCount();
+        setQuestionsRefreshKey((k) => k + 1);
       }
       if (toReload.has('config')) {
-        const lastAction = ownActionTimestamps.current['config'] || 0;
-        if (now - lastAction > 800) {
-          loadConfig();
-        }
+        loadConfig();
       }
       if (toReload.has('env')) {
-        const lastAction = ownActionTimestamps.current['env'] || 0;
-        if (now - lastAction > 800) {
-          loadEnv();
-        }
+        loadEnv();
       }
     }, 300);
   }, [loadTasks, loadActiveRunsCount, loadQuestionsCount, loadConfig, loadEnv]);
