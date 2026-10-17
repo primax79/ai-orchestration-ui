@@ -671,29 +671,41 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         border: '1px solid #334155',
         borderLeft: '4px solid #10b981',
         borderRadius: '0.5rem',
-        padding: '0.85rem 1rem',
+        padding: '1rem 1.25rem',
         display: 'flex',
-        alignItems: 'center',
+        flexDirection: 'column',
         gap: '0.5rem',
       }}>
-        <CheckCircle2 size={17} color="#10b981" />
-        <div>
-          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e2e8f0' }}>
-            Claude headless permissions:{' '}
-            <span style={{ color: '#10b981', fontWeight: 500 }}>
-              {isClaudeAllowedToolsConfigured ? 'custom allow-list' : 'built-in per-mode allow-list'}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <CheckCircle2 size={18} color="#10b981" />
+            <span style={{ fontSize: '0.9rem', fontWeight: 600, color: '#f8fafc' }}>
+              Claude Headless Permission Policy (Safe Autonomous Execution)
             </span>
           </div>
-          <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: '0.15rem' }}>
-            {isClaudeAllowedToolsConfigured ? (
-              <span>Allowed tools: <code>{claudeAllowedTools?.join(', ')}</code></span>
-            ) : (
-              <span>
-                Each run mode (execute, verify, orchestrate) gets its own default tool list (decision Q001). Set{' '}
-                <code>allowed_tools</code> under <code>[tools.claude.headless]</code> only to override it.
-              </span>
-            )}
-          </div>
+          <span style={{
+            fontSize: '0.72rem',
+            padding: '0.15rem 0.5rem',
+            borderRadius: '0.25rem',
+            backgroundColor: '#064e3b',
+            color: '#34d399',
+            fontWeight: 600,
+          }}>
+            {isClaudeAllowedToolsConfigured ? 'Custom Allow-List Active' : 'Automatic Built-in Allow-List (Decision Q001)'}
+          </span>
+        </div>
+
+        <div style={{ fontSize: '0.8rem', color: '#cbd5e1', lineHeight: 1.5 }}>
+          When delegating background tasks to Claude Code CLI, safe tool execution is enforced without dangerous overrides (<code>--dangerously-skip-permissions</code> is forbidden).
+          {isClaudeAllowedToolsConfigured ? (
+            <div style={{ marginTop: '0.35rem', color: '#93c5fd' }}>
+              Custom tools configured: <code>{claudeAllowedTools?.join(', ')}</code>
+            </div>
+          ) : (
+            <div style={{ marginTop: '0.35rem', color: '#94a3b8' }}>
+              Each run mode receives an automated, safe allow-list by default: <strong>implementation</strong> gets code editing & worktree bash; <strong>verification</strong> gets read-only test runners; <strong>orchestration</strong> gets git tools. Set <code>allowed_tools</code> under <code>[tools.claude.headless]</code> only if you wish to apply additional custom restrictions.
+            </div>
+          )}
         </div>
       </div>
 
@@ -750,7 +762,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
             <div style={{ flex: 1 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <span style={{ fontWeight: 600, fontSize: '0.88rem', color: selectedScope === 'global' ? '#f8fafc' : '#cbd5e1' }}>
-                  Global Scope
+                  Global Scope (Machine-Wide)
                 </span>
                 <span style={{
                   fontSize: '0.7rem',
@@ -762,7 +774,10 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
                   {meta.global_config_exists ? 'Configured' : 'Default'}
                 </span>
               </div>
-              <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '0.25rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+              <p style={{ fontSize: '0.75rem', color: '#94a3b8', margin: '0.2rem 0 0 0' }}>
+                Machine-wide defaults for all repositories. Saved in user config.
+              </p>
+              <div style={{ fontSize: '0.72rem', color: '#64748b', marginTop: '0.35rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
                 {meta.global_config_path}
               </div>
             </div>
@@ -787,7 +802,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
             <div style={{ flex: 1 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <span style={{ fontWeight: 600, fontSize: '0.88rem', color: selectedScope === 'project' ? '#f8fafc' : '#cbd5e1' }}>
-                  Project-Local Scope
+                  Project-Local Scope (Unversioned)
                 </span>
                 <span style={{
                   fontSize: '0.7rem',
@@ -799,7 +814,10 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
                   {meta.project_config_exists ? 'Active Override' : 'Inherits Global'}
                 </span>
               </div>
-              <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '0.25rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+              <p style={{ fontSize: '0.75rem', color: '#94a3b8', margin: '0.2rem 0 0 0' }}>
+                Local overrides for this repo only. Stored in <code>~/.config/</code> (never committed to Git).
+              </p>
+              <div style={{ fontSize: '0.72rem', color: '#64748b', marginTop: '0.35rem', fontFamily: 'monospace', wordBreak: 'break-all' }}>
                 {meta.project_config_path || '(will be created on save)'}
               </div>
             </div>
