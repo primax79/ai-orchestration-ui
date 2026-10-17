@@ -15,7 +15,7 @@ import {
   Eye,
   EyeOff,
 } from 'lucide-react';
-import { TaskItem, TaskListResponse } from '../types';
+import { TaskItem, TaskListResponse, TaskState } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { api } from '../api';
@@ -37,6 +37,29 @@ const getStoredView = (): BacklogView => {
   return 'queue';
 };
 
+const TREE_STATES_KEY = 'ai-orch:tree-visible-states';
+const ALL_STATES: TaskState[] = [
+  'open', 'in progress', 'bounced', 'waiting', 'blocked',
+  'delivered', 'verified', 'done', 'done with a caveat', 'dropped',
+];
+const CLOSED_STATES: TaskState[] = ['done', 'done with a caveat', 'dropped'];
+const DEFAULT_TREE_STATES = ALL_STATES.filter((st) => !CLOSED_STATES.includes(st));
+
+const getStoredTreeStates = (): TaskState[] => {
+  try {
+    const raw = localStorage.getItem(TREE_STATES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((st): st is TaskState => ALL_STATES.includes(st));
+      }
+    }
+  } catch {
+    // Ignore storage/parse errors
+  }
+  return DEFAULT_TREE_STATES;
+};
+
 const getStoredShowDone = (): boolean => {
   try {
     return localStorage.getItem(KANBAN_SHOW_DONE_KEY) === 'true';
@@ -54,6 +77,7 @@ interface BacklogManagerProps {
 export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh }) => {
   const [viewMode, setViewMode] = useState<BacklogView>(getStoredView);
   const [showDone, setShowDone] = useState<boolean>(getStoredShowDone);
+  const [treeStates, setTreeStates] = useState<TaskState[]>(getStoredTreeStates);
   const [selectedTask, setSelectedTask] = useState<TaskItem | null>(null);
   const [syncingIndex, setSyncingIndex] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -169,6 +193,21 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
       setTimeout(() => setCopiedId(null), 2000);
     }
   };
+
+  const updateTreeStates = (next: TaskState[]) => {
+    setTreeStates(next);
+    try {
+      localStorage.setItem(TREE_STATES_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
+  const toggleTreeState = (st: TaskState) => {
+    updateTreeStates(treeStates.includes(st) ? treeStates.filter((x) => x !== st) : [...treeStates, st]);
+  };
+
+  const treeTasks = tasks.filter((t) => treeStates.includes(t.state));
 
   const handleToggleShowDone = () => {
     setShowDone((prev) => {
@@ -832,6 +871,58 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
             </div>
           )}
 
+          {/* State filter (multi-select) */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.75rem', color: '#94a3b8', marginRight: '0.25rem' }}>Visible states:</span>
+            {ALL_STATES.map((st) => {
+              const count = tasks.filter((t) => t.state === st).length;
+              const active = treeStates.includes(st);
+              return (
+                <button
+                  key={st}
+                  onClick={() => toggleTreeState(st)}
+                  aria-pressed={active}
+                  style={{
+                    fontSize: '0.72rem',
+                    padding: '0.15rem 0.5rem',
+                    borderRadius: '1rem',
+                    border: `1px solid ${active ? '#6366f1' : '#334155'}`,
+                    backgroundColor: active ? '#312e81' : 'transparent',
+                    color: active ? '#e0e7ff' : count > 0 ? '#94a3b8' : '#475569',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {st} ({count})
+                </button>
+              );
+            })}
+            <span style={{ color: '#334155' }}>|</span>
+            {[
+              { label: 'Not closed', states: DEFAULT_TREE_STATES },
+              { label: 'All', states: ALL_STATES },
+              { label: 'None', states: [] as TaskState[] },
+            ].map((preset) => (
+              <button
+                key={preset.label}
+                onClick={() => updateTreeStates(preset.states)}
+                style={{
+                  fontSize: '0.72rem',
+                  padding: '0.15rem 0.5rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #334155',
+                  backgroundColor: '#0f172a',
+                  color: '#cbd5e1',
+                  cursor: 'pointer',
+                }}
+              >
+                {preset.label}
+              </button>
+            ))}
+            <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: 'auto' }}>
+              Showing {treeTasks.length} of {tasks.length}
+            </span>
+          </div>
+
           {/* All Tasks Table */}
           <div style={{ backgroundColor: '#1e293b', borderRadius: '0.5rem', border: '1px solid #334155', overflow: 'hidden' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
@@ -847,7 +938,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                 </tr>
               </thead>
               <tbody>
-                {tasks.map((t) => (
+                {treeTasks.map((t) => (
                   <tr
                     key={t.id}
                     onClick={() => setSelectedTask(t)}
