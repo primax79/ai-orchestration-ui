@@ -23,6 +23,7 @@ import re
 import secrets
 import signal
 import sys
+import tempfile
 from typing import Any, AsyncGenerator
 from urllib.parse import parse_qs
 
@@ -43,6 +44,12 @@ def get_ai_orch_bin() -> pathlib.Path:
     if "AI_ORCH_BIN" in os.environ and os.environ["AI_ORCH_BIN"].strip():
         return pathlib.Path(os.environ["AI_ORCH_BIN"]).expanduser().resolve()
     sibling = UI_ROOT.parent / "ai-orchestration" / "bin" / "ai-orch"
+    if sibling.is_file():
+        return sibling
+    for parent in UI_ROOT.parents:
+        cand = parent / "ai-orchestration" / "bin" / "ai-orch"
+        if cand.is_file():
+            return cand
     return sibling
 
 
@@ -305,7 +312,7 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
 
     err_str = ""
     if isinstance(data, dict):
-        if data.get("error") == "stale-task":
+        if data.get("error") in ("stale-task", "lock-timeout"):
             return 409
         err_val = data.get("error") or data.get("message") or ""
         err_str = str(err_val).lower()
@@ -316,6 +323,9 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         "hash mismatch" in err_str
         or "plan hash mismatch" in err_str
         or "stale" in err_str
+        or "lock-timeout" in err_str
+        or "task-write lock" in err_str
+        or "timed out waiting for task-write lock" in err_str
         or "refusing to apply" in err_str
         or "workspace has no project config" in err_str
         or "no project config" in err_str
@@ -331,6 +341,10 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "validation" in err_str
         or "illegal transition" in err_str
         or "cannot transition" in err_str
+        or "waiting invariant" in err_str
+        or "must end with" in err_str
+        or "exceeds 160" in err_str
+        or "single line" in err_str
     ):
         return 400
 
@@ -423,10 +437,16 @@ def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) ->
     if tasks_dir.is_dir():
         try:
             mtimes[f"tasks:{tasks_dir}"] = tasks_dir.stat().st_mtime
+            questions_dir = tasks_dir / "questions"
+            if questions_dir.is_dir():
+                mtimes[f"questions:{questions_dir}"] = questions_dir.stat().st_mtime
             for p in tasks_dir.rglob("*.md"):
                 try:
                     if p.is_file():
-                        mtimes[f"tasks:{p}"] = p.stat().st_mtime
+                        if "questions" in p.parts:
+                            mtimes[f"questions:{p}"] = p.stat().st_mtime
+                        else:
+                            mtimes[f"tasks:{p}"] = p.stat().st_mtime
                 except OSError:
                     pass
         except OSError:
@@ -450,6 +470,9 @@ async def _polling_watcher_loop() -> None:
                 if last_snapshot.get(k) != current_snapshot.get(k):
                     if k.startswith("config:"):
                         changed_areas.add("config")
+                    elif k.startswith("questions:"):
+                        changed_areas.add("questions")
+                        changed_areas.add("tasks")
                     elif k.startswith("tasks:"):
                         changed_areas.add("tasks")
 
@@ -460,6 +483,9 @@ async def _polling_watcher_loop() -> None:
                     if debounce_snapshot.get(k) != current_snapshot.get(k):
                         if k.startswith("config:"):
                             changed_areas.add("config")
+                        elif k.startswith("questions:"):
+                            changed_areas.add("questions")
+                            changed_areas.add("tasks")
                         elif k.startswith("tasks:"):
                             changed_areas.add("tasks")
                 last_snapshot = debounce_snapshot
@@ -486,8 +512,12 @@ async def _watchfiles_watcher_loop() -> None:
             p = pathlib.Path(path_str)
             if p.name in ("orchestration.toml", ".ai-orchestration.local.toml"):
                 areas.add("config")
-            elif p.suffix == ".md" and "tasks" in p.parts:
-                areas.add("tasks")
+            elif "tasks" in p.parts:
+                if "questions" in p.parts:
+                    areas.add("questions")
+                    areas.add("tasks")
+                elif p.suffix == ".md" or p == (state.workspace / "tasks"):
+                    areas.add("tasks")
         if areas:
             await state.broadcast({"type": "changed", "areas": sorted(list(areas))})
 
@@ -577,6 +607,8 @@ async def api_transition_task(request: Request) -> JSONResponse:
         cmd.extend(["--reason", str(body["reason"])])
     if body.get("expect_task_hash"):
         cmd.extend(["--expect-task-hash", str(body["expect_task_hash"])])
+    if body.get("force_unblock"):
+        cmd.append("--force-unblock")
 
     code, data = await run_ai_orch(cmd)
     if code == 0:
@@ -649,6 +681,180 @@ async def api_get_task_detail(request: Request) -> JSONResponse:
         "content": content,
         "progress_content": progress_content,
     })
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints: Blocking Questions (08.3)
+# ---------------------------------------------------------------------------
+
+QUESTION_ID_RE = re.compile(r"^Q\d{3,}$")
+
+
+async def api_list_questions(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "list", "--tasks-dir", str(tasks_dir), "--json"]
+    status = request.query_params.get("status")
+    if status:
+        cmd.extend(["--status", status])
+    blocks = request.query_params.get("blocks")
+    if blocks:
+        cmd.extend(["--blocks", blocks])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_question(request: Request) -> JSONResponse:
+    question_id = request.path_params["question_id"]
+    if not QUESTION_ID_RE.match(question_id):
+        return JSONResponse({"error": f"Invalid question ID {question_id!r}, must match ^Q\\d{{3,}}$"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "show", question_id, "--tasks-dir", str(tasks_dir), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("message") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    return JSONResponse(data if isinstance(data, dict) else {"question": data})
+
+
+async def api_ask_question(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "ask", "--tasks-dir", str(tasks_dir), "--json"]
+
+    if body.get("from_task"):
+        cmd.extend(["--from-task", str(body["from_task"])])
+    if body.get("question"):
+        cmd.extend(["--question", str(body["question"])])
+    if body.get("recommended"):
+        cmd.extend(["--recommended", str(body["recommended"])])
+    if body.get("open_answer") is not None:
+        oa = body["open_answer"]
+        oa_str = "yes" if oa is True else ("no" if oa is False else str(oa))
+        cmd.extend(["--open-answer", oa_str])
+    if body.get("blocks"):
+        blocks = body["blocks"]
+        if isinstance(blocks, list):
+            cmd.extend(["--blocks", ", ".join(str(b) for b in blocks)])
+        else:
+            cmd.extend(["--blocks", str(blocks)])
+    if body.get("decider"):
+        cmd.extend(["--decider", str(body["decider"])])
+    if body.get("asked_by"):
+        cmd.extend(["--asked-by", str(body["asked_by"])])
+    if body.get("origin_run"):
+        cmd.extend(["--origin-run", str(body["origin_run"])])
+
+    for opt in body.get("options", []):
+        if isinstance(opt, dict):
+            label = str(opt.get("label", "")).strip()
+            title = str(opt.get("title", "")).strip()
+            consequence = opt.get("consequence")
+            if consequence and str(consequence).strip():
+                opt_arg = f"{label}={title}: {str(consequence).strip()}"
+            elif title:
+                opt_arg = f"{label}={title}"
+            else:
+                opt_arg = label
+            cmd.extend(["--option", opt_arg])
+        elif isinstance(opt, str):
+            cmd.extend(["--option", opt])
+
+    temp_ctx_file: str | None = None
+    context = body.get("context")
+    try:
+        if context is not None:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".md") as f:
+                f.write(str(context))
+                temp_ctx_file = f.name
+            cmd.extend(["--context-file", temp_ctx_file])
+
+        code, data = await run_ai_orch(cmd)
+    finally:
+        if temp_ctx_file:
+            try:
+                os.remove(temp_ctx_file)
+            except OSError:
+                pass
+
+    if code == 0:
+        q_id = data.get("id") if isinstance(data, dict) else None
+        await state.broadcast({"type": "question_asked", "question_id": q_id})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_answer_question(request: Request) -> JSONResponse:
+    question_id = request.path_params["question_id"]
+    if not QUESTION_ID_RE.match(question_id):
+        return JSONResponse({"error": f"Invalid question ID {question_id!r}, must match ^Q\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    choice = body.get("choice")
+    if not choice:
+        return JSONResponse({"error": "choice is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "answer", question_id, "--choice", str(choice), "--tasks-dir", str(tasks_dir), "--json"]
+
+    text = body.get("text")
+    if text is not None:
+        text_str = str(text)
+        if len(text_str.encode("utf-8")) > 32 * 1024:
+            return JSONResponse({"error": "Answer text exceeds 32 KB limit"}, status_code=400)
+        cmd.extend(["--text", text_str])
+
+    if body.get("by"):
+        cmd.extend(["--by", str(body["by"])])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "question_answered", "question_id": question_id, "choice": str(choice)})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_withdraw_question(request: Request) -> JSONResponse:
+    question_id = request.path_params["question_id"]
+    if not QUESTION_ID_RE.match(question_id):
+        return JSONResponse({"error": f"Invalid question ID {question_id!r}, must match ^Q\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    reason = body.get("reason")
+    if not reason or not str(reason).strip():
+        return JSONResponse({"error": "reason is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "withdraw", question_id, "--reason", str(reason).strip(), "--tasks-dir", str(tasks_dir), "--json"]
+    if body.get("by"):
+        cmd.extend(["--by", str(body["by"])])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "question_withdrawn", "question_id": question_id})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1282,11 @@ routes = [
     Route("/api/tasks/sync-index/preview", api_preview_sync_index, methods=["GET"]),
     Route("/api/tasks/sync-index", api_sync_index, methods=["POST"]),
     Route("/api/tasks/{task_id}", api_get_task_detail, methods=["GET"]),
+    Route("/api/questions", api_list_questions, methods=["GET"]),
+    Route("/api/questions", api_ask_question, methods=["POST"]),
+    Route("/api/questions/{question_id}", api_get_question, methods=["GET"]),
+    Route("/api/questions/{question_id}/answer", api_answer_question, methods=["POST"]),
+    Route("/api/questions/{question_id}/withdraw", api_withdraw_question, methods=["POST"]),
     Route("/api/env/status", api_env_status, methods=["GET"]),
     Route("/api/env/install-skills/preview", api_preview_install_skills, methods=["POST"]),
     Route("/api/env/install-skills", api_install_skills, methods=["POST"]),

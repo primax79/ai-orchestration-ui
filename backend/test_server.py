@@ -739,3 +739,329 @@ def test_render_agents_md_preview_and_apply(monkeypatch, tmp_path):
         assert (tmp_path / "AGENTS.md").is_file()
     finally:
         state.workspace = old_ws
+
+
+def _create_sample_task(workspace: pathlib.Path, task_id: str = "T001", state_str: str = "in progress") -> pathlib.Path:
+    tasks_dir = workspace / "tasks"
+    cat_dir = tasks_dir / "features"
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    task_file = cat_dir / f"{task_id}-sample-task.md"
+    task_content = (
+        f"# {task_id} Sample Task\n\n"
+        f"- id: {task_id}\n"
+        f"- state: {state_str}\n"
+        "- priority: P1\n"
+        "- assignee: self\n"
+        "- profile: bulk-execution\n"
+        "- verifier: -\n"
+        "- decider: -\n"
+        "- plan-hash: -\n\n"
+        "## Goal\nSample goal\n\n"
+        "## Steps\n1. Step 1\n\n"
+        "## Verification\nSample verification\n"
+    )
+    task_file.write_text(task_content, encoding="utf-8")
+    return task_file
+
+
+def test_questions_ask_list_answer_restore_roundtrip(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    task_file = _create_sample_task(tmp_path, task_id="T001", state_str="in progress")
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # 1. Ask a question blocking T001
+        ask_payload = {
+            "question": "Which architecture pattern should we adopt?",
+            "context": "Context paragraph 1: overview.\nContext paragraph 2: trade-offs.",
+            "options": [
+                {"label": "A", "title": "Pattern Alpha", "consequence": "Fast and modular"},
+                {"label": "B", "title": "Pattern Beta", "consequence": "Simpler but monolith"}
+            ],
+            "recommended": "A",
+            "open_answer": True,
+            "blocks": ["T001"],
+            "decider": "owner"
+        }
+        res_ask = client.post(
+            "/api/questions",
+            headers={"X-AI-Orch-Token": token},
+            json=ask_payload,
+        )
+        assert res_ask.status_code == 200
+        ask_data = res_ask.json()
+        assert ask_data.get("ok") is True
+        q_id = ask_data.get("id")
+        assert q_id == "Q001"
+
+        # Verify task file state transitioned to 'waiting' and decider set to Q001
+        content_after_ask = task_file.read_text(encoding="utf-8")
+        assert "- state: waiting" in content_after_ask
+        assert "- decider: Q001" in content_after_ask
+
+        # 2. List questions shows the newly asked question
+        res_list = client.get(
+            "/api/questions",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert res_list.status_code == 200
+        list_data = res_list.json()
+        assert list_data.get("ok") is True
+        questions = list_data.get("questions", [])
+        assert len(questions) == 1
+        assert questions[0]["id"] == "Q001"
+        assert questions[0]["status"] == "open"
+        assert "T001" in questions[0]["blocks"]
+
+        # Filter by status and blocks
+        res_filtered = client.get(
+            "/api/questions?status=open&blocks=T001",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert res_filtered.status_code == 200
+        assert len(res_filtered.json().get("questions", [])) == 1
+
+        res_none = client.get(
+            "/api/questions?status=answered",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert res_none.status_code == 200
+        assert len(res_none.json().get("questions", [])) == 0
+
+        # 3. Get single question by ID
+        res_show = client.get(
+            f"/api/questions/{q_id}",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert res_show.status_code == 200
+        show_data = res_show.json()
+        assert show_data.get("ok") is True
+        assert show_data["question"]["id"] == "Q001"
+        assert show_data["question"]["recommended"] == "A"
+        assert show_data["question"]["open_answer"] == "yes"
+
+        # 4. Answer question with multi-line text
+        multi_line_text = (
+            "Line 1: Proceed with Pattern Alpha.\n"
+            "Line 2: Ensure proper interfaces are defined.\n"
+            "Line 3: Verified by engineering."
+        )
+        res_ans = client.post(
+            f"/api/questions/{q_id}/answer",
+            headers={"X-AI-Orch-Token": token},
+            json={"choice": "A", "text": multi_line_text, "by": "owner"},
+        )
+        assert res_ans.status_code == 200
+        ans_data = res_ans.json()
+        assert ans_data.get("ok") is True
+        assert ans_data.get("choice") == "A"
+        assert "T001" in ans_data.get("unblocked_tasks", [])
+
+        # 5. Verify task file restored to 'in progress' and decider restored to '-'
+        content_after_ans = task_file.read_text(encoding="utf-8")
+        assert "- state: in progress" in content_after_ans
+        assert "- decider: -" in content_after_ans
+
+        # Verify question status is now 'answered'
+        res_show_after = client.get(
+            f"/api/questions/{q_id}",
+            headers={"X-AI-Orch-Token": token},
+        )
+        assert res_show_after.status_code == 200
+        assert res_show_after.json()["question"]["status"] == "answered"
+    finally:
+        state.workspace = old_ws
+
+
+def test_questions_invalid_answer_unknown_choice(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    _create_sample_task(tmp_path, task_id="T001", state_str="in progress")
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Ask question
+        res_ask = client.post(
+            "/api/questions",
+            headers={"X-AI-Orch-Token": token},
+            json={
+                "question": "Choice test question?",
+                "context": "Context for choice test.",
+                "options": [
+                    {"label": "A", "title": "Option A", "consequence": "Cons A"},
+                    {"label": "B", "title": "Option B", "consequence": "Cons B"}
+                ],
+                "blocks": ["T001"],
+            },
+        )
+        assert res_ask.status_code == 200
+        q_id = res_ask.json()["id"]
+
+        # 1. Unknown choice -> 400 with message
+        res_bad_choice = client.post(
+            f"/api/questions/{q_id}/answer",
+            headers={"X-AI-Orch-Token": token},
+            json={"choice": "Z"},
+        )
+        assert res_bad_choice.status_code == 400
+        assert "invalid choice" in res_bad_choice.json().get("error", "").lower()
+
+        # 2. Missing choice field -> 400
+        res_no_choice = client.post(
+            f"/api/questions/{q_id}/answer",
+            headers={"X-AI-Orch-Token": token},
+            json={},
+        )
+        assert res_no_choice.status_code == 400
+        assert "choice is required" in res_no_choice.json().get("error", "")
+
+        # 3. Answer text exceeding 32 KB limit -> 400
+        huge_text = "x" * (33 * 1024)
+        res_huge = client.post(
+            f"/api/questions/{q_id}/answer",
+            headers={"X-AI-Orch-Token": token},
+            json={"choice": "A", "text": huge_text},
+        )
+        assert res_huge.status_code == 400
+        assert "exceeds 32 kb" in res_huge.json().get("error", "").lower()
+    finally:
+        state.workspace = old_ws
+
+
+def test_questions_withdraw_requires_reason(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    task_file = _create_sample_task(tmp_path, task_id="T001", state_str="in progress")
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Ask question
+        res_ask = client.post(
+            "/api/questions",
+            headers={"X-AI-Orch-Token": token},
+            json={
+                "question": "Withdraw test question?",
+                "context": "Context for withdraw test.",
+                "options": [
+                    {"label": "A", "title": "Option A", "consequence": "Cons A"},
+                    {"label": "B", "title": "Option B", "consequence": "Cons B"}
+                ],
+                "blocks": ["T001"],
+            },
+        )
+        assert res_ask.status_code == 200
+        q_id = res_ask.json()["id"]
+        assert "- state: waiting" in task_file.read_text(encoding="utf-8")
+
+        # 1. Withdraw without reason -> 400
+        res_no_reason = client.post(
+            f"/api/questions/{q_id}/withdraw",
+            headers={"X-AI-Orch-Token": token},
+            json={},
+        )
+        assert res_no_reason.status_code == 400
+        assert "reason is required" in res_no_reason.json().get("error", "")
+
+        # 2. Withdraw with whitespace reason -> 400
+        res_blank_reason = client.post(
+            f"/api/questions/{q_id}/withdraw",
+            headers={"X-AI-Orch-Token": token},
+            json={"reason": "   "},
+        )
+        assert res_blank_reason.status_code == 400
+        assert "reason is required" in res_blank_reason.json().get("error", "")
+
+        # 3. Withdraw with valid reason -> 200, task restored
+        res_ok_withdraw = client.post(
+            f"/api/questions/{q_id}/withdraw",
+            headers={"X-AI-Orch-Token": token},
+            json={"reason": "Requirements changed, question moot.", "by": "owner"},
+        )
+        assert res_ok_withdraw.status_code == 200
+        assert res_ok_withdraw.json().get("ok") is True
+
+        content_after = task_file.read_text(encoding="utf-8")
+        assert "- state: in progress" in content_after
+        assert "- decider: -" in content_after
+
+        # Question shows as withdrawn
+        res_show = client.get(f"/api/questions/{q_id}", headers={"X-AI-Orch-Token": token})
+        assert res_show.status_code == 200
+        assert res_show.json()["question"]["status"] == "withdrawn"
+    finally:
+        state.workspace = old_ws
+
+
+def test_questions_bad_id_format():
+    token = get_or_create_token()
+
+    # Bad ID format checks: must match ^Q\d{3,}$
+    for bad_id in ["invalid", "Q1", "Q12", "T001", "q001", "Q001-slug"]:
+        res_get = client.get(f"/api/questions/{bad_id}", headers={"X-AI-Orch-Token": token})
+        assert res_get.status_code == 400
+        assert "Invalid question ID" in res_get.json().get("error", "")
+
+        res_ans = client.post(f"/api/questions/{bad_id}/answer", headers={"X-AI-Orch-Token": token}, json={"choice": "A"})
+        assert res_ans.status_code == 400
+        assert "Invalid question ID" in res_ans.json().get("error", "")
+
+        res_with = client.post(f"/api/questions/{bad_id}/withdraw", headers={"X-AI-Orch-Token": token}, json={"reason": "foo"})
+        assert res_with.status_code == 400
+        assert "Invalid question ID" in res_with.json().get("error", "")
+
+    # Non-existent valid question ID -> 404
+    res_not_found = client.get("/api/questions/Q999", headers={"X-AI-Orch-Token": token})
+    assert res_not_found.status_code == 404
+
+
+def test_questions_auth_enforced():
+    # Endpoints without token -> 401
+    assert client.get("/api/questions").status_code == 401
+    assert client.get("/api/questions/Q001").status_code == 401
+    assert client.post("/api/questions", json={}).status_code == 401
+    assert client.post("/api/questions/Q001/answer", json={"choice": "A"}).status_code == 401
+    assert client.post("/api/questions/Q001/withdraw", json={"reason": "foo"}).status_code == 401
+
+    # Endpoints with bad token -> 401
+    bad_headers = {"X-AI-Orch-Token": "bad-token"}
+    assert client.get("/api/questions", headers=bad_headers).status_code == 401
+    assert client.get("/api/questions/Q001", headers=bad_headers).status_code == 401
+    assert client.post("/api/questions", headers=bad_headers, json={}).status_code == 401
+    assert client.post("/api/questions/Q001/answer", headers=bad_headers, json={"choice": "A"}).status_code == 401
+    assert client.post("/api/questions/Q001/withdraw", headers=bad_headers, json={"reason": "foo"}).status_code == 401
+
+
+def test_watcher_broadcasts_on_question_file_change(monkeypatch):
+    token = get_or_create_token()
+    monkeypatch.setenv("AI_ORCH_WATCH_POLLING", "1")
+    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.5")
+
+    with tempfile.TemporaryDirectory() as tmp_ws:
+        ws_path = pathlib.Path(tmp_ws)
+        questions_dir = ws_path / "tasks" / "questions"
+        questions_dir.mkdir(parents=True)
+        q_file = questions_dir / "Q001-test.md"
+        q_file.write_text("initial question content", encoding="utf-8")
+
+        old_ws = state.workspace
+        state.workspace = ws_path
+
+        try:
+            with TestClient(app) as test_client:
+                with test_client.websocket_connect(f"/ws?token={token}") as ws:
+                    init_msg = ws.receive_json()
+                    assert init_msg.get("type") == "connected"
+
+                    # Touch question file
+                    time.sleep(0.1)
+                    q_file.write_text("modified question content", encoding="utf-8")
+
+                    # Wait for changed broadcast within 2 seconds
+                    broadcast_msg = ws.receive_json()
+                    assert broadcast_msg.get("type") == "changed"
+                    areas = broadcast_msg.get("areas", [])
+                    assert "questions" in areas
+                    assert "tasks" in areas
+        finally:
+            state.workspace = old_ws

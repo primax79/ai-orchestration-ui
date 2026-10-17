@@ -122,6 +122,13 @@ For all mutating environment commands, the API provides preview/apply endpoint p
 - `GET /api/config/render-agents-md/preview` — Preview unified diff of `AGENTS.md` (`{diff, hash, warnings}`).
 - `POST /api/config/render-agents-md/apply` — Apply `AGENTS.md` updates, requiring `{expect_hash, allow_global_routing?: bool}`. Stale hash or missing project config without `allow_global_routing` returns `HTTP 409`.
 
+### 4. Blocking Questions (08.3)
+- `GET /api/questions` — List blocking questions with optional filters `status` (`open|answered|withdrawn|all`) and `blocks` (`T###`).
+- `GET /api/questions/{id}` — Retrieve full details of a blocking question by ID (validated `^Q\d{3,}$`).
+- `POST /api/questions` — Ask a blocking question (`question`, `context`, `options`, `recommended`, `open_answer`, `blocks`, `decider`, `asked_by`, `origin_run`). Context is passed safely via `--context-file`. Blocked tasks move to `waiting`.
+- `POST /api/questions/{id}/answer` — Answer a blocking question (`choice`, optional `text` capped at 32 KB, `by`). Once all questions for a task are resolved, restores the task to its prior state.
+- `POST /api/questions/{id}/withdraw` — Withdraw a blocking question (`reason` required, optional `by`), restoring blocked tasks.
+
 ---
 
 ## Development
@@ -149,7 +156,7 @@ python -m pytest backend/test_server.py
 
 - **Backend:** Python 3.11+ / Starlette + Uvicorn (zero heavy dependencies), consuming `ai-orchestration/bin/ai-orch --json`.
 - **Frontend:** React 18, TypeScript, Vite, Lucide Icons, pure responsive CSS.
-- **State Synchronization:** Background file watcher (via `watchfiles` or stdlib mtime polling) with 300 ms debounce broadcasts `{"type":"changed","areas":[...]}` over `/ws` whenever `tasks/**/*.md` or configuration TOML files change.
+- **State Synchronization:** Background file watcher (via `watchfiles` or stdlib mtime polling) with 300 ms debounce broadcasts `{"type":"changed","areas":[...]}` over `/ws` whenever `tasks/**/*.md` (with `areas:["questions","tasks"]` for `tasks/questions/**`) or configuration TOML files change.
 - **VS Code Compatibility:** `frontend/src/api.ts` detects `window.acquireVsCodeApi()` and seamlessly routes requests through `vscode.postMessage` when running in the extension.
 
 ## License
