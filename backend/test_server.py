@@ -73,6 +73,7 @@ def test_serve_frontend_index_and_meta_token():
     assert "object-src 'none'" in csp
     assert "base-uri 'none'" in csp
     assert "frame-ancestors 'none'" in csp
+    assert "img-src 'self' data: blob:" in csp
     # Script-src must never allow 'unsafe-inline'
     script_part = [part for part in csp.split(";") if "script-src" in part][0]
     assert "'unsafe-inline'" not in script_part
@@ -1355,3 +1356,335 @@ def test_runs_auth_enforced():
     assert client.post("/api/runs/20261017-123456-T001-kilo-1234/mark-delivered", json={}).status_code == 401
     assert client.post("/api/runs/20261017-123456-T001-kilo-1234/apply-verdict", json={}).status_code == 401
     assert client.post("/api/runs/20261017-123456-T001-kilo-1234/cleanup", json={}).status_code == 401
+
+
+def make_test_png(width: int = 2, height: int = 2) -> bytes:
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = b"\x00\xff\x00\x00\x00\xff\x00\x00\x00\xff\x00\x00\x00\xff"
+    idat = zlib.compress(raw)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def test_inbox_auth_enforced():
+    # Endpoints without token -> 401
+    assert client.get("/api/inbox").status_code == 401
+    assert client.post("/api/inbox", json={}).status_code == 401
+    assert client.get("/api/inbox/N001").status_code == 401
+    assert client.post("/api/inbox/N001", json={}).status_code == 401
+    assert client.post("/api/inbox/N001/attachments").status_code == 401
+    assert client.get("/api/inbox/N001/attachments/01-test.png").status_code == 401
+    assert client.delete("/api/inbox/N001/attachments/01-test.png").status_code == 401
+    assert client.post("/api/inbox/N001/resolve", json={}).status_code == 401
+    assert client.post("/api/inbox/N001/discard", json={}).status_code == 401
+    assert client.post("/api/inbox/N001/reopen").status_code == 401
+    assert client.post("/api/inbox/N001/to-task", json={}).status_code == 401
+
+    # Endpoints with bad token -> 401
+    bad_headers = {"X-AI-Orch-Token": "bad-token"}
+    assert client.get("/api/inbox", headers=bad_headers).status_code == 401
+    assert client.post("/api/inbox", headers=bad_headers, json={}).status_code == 401
+    assert client.get("/api/inbox/N001", headers=bad_headers).status_code == 401
+    assert client.post("/api/inbox/N001", headers=bad_headers, json={}).status_code == 401
+    assert client.post("/api/inbox/N001/attachments", headers=bad_headers).status_code == 401
+    assert client.get("/api/inbox/N001/attachments/01-test.png", headers=bad_headers).status_code == 401
+    assert client.delete("/api/inbox/N001/attachments/01-test.png", headers=bad_headers).status_code == 401
+    assert client.post("/api/inbox/N001/resolve", headers=bad_headers, json={}).status_code == 401
+    assert client.post("/api/inbox/N001/discard", headers=bad_headers, json={}).status_code == 401
+    assert client.post("/api/inbox/N001/reopen", headers=bad_headers).status_code == 401
+    assert client.post("/api/inbox/N001/to-task", headers=bad_headers, json={}).status_code == 401
+
+
+def test_inbox_crud_attachments_resolve_totask_flow(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # 1. Initial list -> empty
+        res_list0 = client.get("/api/inbox", headers=headers)
+        assert res_list0.status_code == 200
+        assert res_list0.json()["notes"] == []
+
+        # 2. Add note
+        add_payload = {
+            "title": "Bug in parser",
+            "kind": "bug",
+            "about": "backend/server.py",
+            "body": "# Parsing bug\nDetails of the issue.",
+            "status": "draft",
+        }
+        res_add = client.post("/api/inbox", headers=headers, json=add_payload)
+        assert res_add.status_code == 200
+        add_data = res_add.json()
+        assert add_data["ok"] is True
+        note_id = add_data["id"]
+        assert note_id == "N001"
+        initial_hash = add_data["bundle_sha256"]
+
+        # 3. List notes -> 1 note
+        res_list = client.get("/api/inbox", headers=headers)
+        assert res_list.status_code == 200
+        notes = res_list.json()["notes"]
+        assert len(notes) == 1
+        assert notes[0]["id"] == "N001"
+        assert notes[0]["status"] == "draft"
+
+        # List with status filter
+        res_draft = client.get("/api/inbox?status=draft", headers=headers)
+        assert len(res_draft.json()["notes"]) == 1
+        res_ready = client.get("/api/inbox?status=ready", headers=headers)
+        assert len(res_ready.json()["notes"]) == 0
+
+        # 4. Get note detail
+        res_show = client.get(f"/api/inbox/{note_id}", headers=headers)
+        assert res_show.status_code == 200
+        note_data = res_show.json()["note"]
+        assert note_data["id"] == "N001"
+        assert note_data["title"] == "Bug in parser"
+        assert note_data["body"] == "# Parsing bug\nDetails of the issue."
+
+        # 5. Edit note with stale expect_hash -> 409
+        res_stale = client.post(
+            f"/api/inbox/{note_id}",
+            headers=headers,
+            json={"title": "Updated", "expect_hash": "deadbeef" * 8},
+        )
+        assert res_stale.status_code == 409
+        assert "stale" in res_stale.json().get("error", "").lower()
+
+        # 6. Edit note with matching expect_hash -> 200
+        res_edit = client.post(
+            f"/api/inbox/{note_id}",
+            headers=headers,
+            json={"title": "Bug in parser (verified)", "status": "ready", "expect_hash": initial_hash},
+        )
+        assert res_edit.status_code == 200
+        edit_data = res_edit.json()
+        assert edit_data["status"] == "ready"
+        updated_hash = edit_data["bundle_sha256"]
+        assert updated_hash != initial_hash
+
+        # 7. Upload real 2x2 PNG
+        png_data = make_test_png(2, 2)
+        res_upload = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("screenshot.png", png_data, "image/png")},
+        )
+        assert res_upload.status_code == 200
+        att_data = res_upload.json()
+        assert att_data["ok"] is True
+        att_filename = att_data["attachment"]
+        assert att_filename.endswith(".png")
+        assert "markdown" in att_data
+
+        # 8. Serve attachment back -> image/png, nosniff, cache-control
+        res_att = client.get(f"/api/inbox/{note_id}/attachments/{att_filename}", headers=headers)
+        assert res_att.status_code == 200
+        assert res_att.content == png_data
+        assert res_att.headers["content-type"] == "image/png"
+        assert res_att.headers["x-content-type-options"] == "nosniff"
+        assert "private" in res_att.headers["cache-control"]
+        assert "max-age=60" in res_att.headers["cache-control"]
+
+        # 9. Upload text file named fake.png -> refused with 415
+        fake_png_data = b"This is plain text pretending to be a png."
+        res_fake = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("fake.png", fake_png_data, "image/png")},
+        )
+        assert res_fake.status_code in (415, 400)
+
+        # 10. Upload 11 MB file -> 413 without writing
+        big_data = b"P" * (11 * 1024 * 1024)
+        res_big = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("big.png", big_data, "image/png")},
+        )
+        assert res_big.status_code == 413
+        # Ensure big file was not written to note's attachments dir
+        note_folder = pathlib.Path(client.get(f"/api/inbox/{note_id}", headers=headers).json()["note"]["folder_path"])
+        att_files = list((note_folder / "attachments").glob("*"))
+        assert len(att_files) == 1
+        assert att_files[0].name == att_filename
+
+        # 11. Traversal names -> 400 or 404
+        for bad_name in ["..%2F..%2Fetc", "a/b", ".hidden"]:
+            res_trav_get = client.get(f"/api/inbox/{note_id}/attachments/{bad_name}", headers=headers)
+            assert res_trav_get.status_code in (400, 404)
+            res_trav_del = client.delete(f"/api/inbox/{note_id}/attachments/{bad_name}", headers=headers)
+            assert res_trav_del.status_code in (400, 404)
+
+        # 12. Resolve note -> moves folder to analyzed/
+        res_res = client.post(
+            f"/api/inbox/{note_id}/resolve",
+            headers=headers,
+            json={"produced": "T001", "by": "owner"},
+        )
+        assert res_res.status_code == 200
+        res_data = res_res.json()
+        assert res_data["status"] == "processed"
+        assert res_data["produced"] == "T001"
+
+        # Served URL STILL works through the new location in analyzed/
+        res_att_after = client.get(f"/api/inbox/{note_id}/attachments/{att_filename}", headers=headers)
+        assert res_att_after.status_code == 200
+        assert res_att_after.content == png_data
+        assert res_att_after.headers["content-type"] == "image/png"
+
+        # 13. Reopen note -> moves back to to-analyze/ as ready
+        res_reop = client.post(f"/api/inbox/{note_id}/reopen", headers=headers)
+        assert res_reop.status_code == 200
+        assert res_reop.json()["status"] == "ready"
+
+        # 14. Convert to task (to-task)
+        (tasks_dir / "features").mkdir(parents=True, exist_ok=True)
+        res_totask = client.post(
+            f"/api/inbox/{note_id}/to-task",
+            headers=headers,
+            json={"category": "features", "title": "Implement parser bugfix", "priority": "P1"},
+        )
+        assert res_totask.status_code == 200
+        task_data = res_totask.json()
+        assert task_data["ok"] is True
+        created_task_id = task_data["id"]
+        assert created_task_id == "T001"
+
+        # Verify created task is valid
+        res_val = client.get("/api/tasks/validate", headers=headers)
+        assert res_val.status_code == 200
+        assert res_val.json()["ok"] is True
+        assert len(res_val.json().get("errors", [])) == 0
+
+        # 15. Discard note -> status discarded in analyzed/
+        res_disc = client.post(
+            f"/api/inbox/{note_id}/discard",
+            headers=headers,
+            json={"reason": "Completed and task created"},
+        )
+        assert res_disc.status_code == 200
+        assert res_disc.json()["status"] == "discarded"
+
+        # Served attachment still works even after discard
+        res_att_disc = client.get(f"/api/inbox/{note_id}/attachments/{att_filename}", headers=headers)
+        assert res_att_disc.status_code == 200
+        assert res_att_disc.content == png_data
+    finally:
+        state.workspace = old_ws
+
+
+def test_inbox_bad_ids_and_input_validation(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Invalid ID formats
+        for bad_id in ["invalid", "N1", "N12", "T001", "n001", "N001-slug"]:
+            assert client.get(f"/api/inbox/{bad_id}", headers=headers).status_code == 400
+            assert client.post(f"/api/inbox/{bad_id}", headers=headers, json={"title": "foo"}).status_code == 400
+            assert client.post(f"/api/inbox/{bad_id}/attachments", headers=headers).status_code == 400
+            assert client.get(f"/api/inbox/{bad_id}/attachments/01-test.png", headers=headers).status_code == 400
+            assert client.delete(f"/api/inbox/{bad_id}/attachments/01-test.png", headers=headers).status_code == 400
+            assert client.post(f"/api/inbox/{bad_id}/resolve", headers=headers, json={"produced": "T1"}).status_code == 400
+            assert client.post(f"/api/inbox/{bad_id}/discard", headers=headers, json={"reason": "foo"}).status_code == 400
+            assert client.post(f"/api/inbox/{bad_id}/reopen", headers=headers).status_code == 400
+            assert client.post(f"/api/inbox/{bad_id}/to-task", headers=headers, json={"category": "c", "title": "t"}).status_code == 400
+
+        # Valid ID format but not found -> 404
+        assert client.get("/api/inbox/N999", headers=headers).status_code == 404
+        assert client.post("/api/inbox/N999", headers=headers, json={"title": "foo"}).status_code == 404
+        assert client.get("/api/inbox/N999/attachments/01-test.png", headers=headers).status_code == 404
+        assert client.delete("/api/inbox/N999/attachments/01-test.png", headers=headers).status_code == 404
+        assert client.post("/api/inbox/N999/resolve", headers=headers, json={"produced": "T1"}).status_code == 404
+        assert client.post("/api/inbox/N999/discard", headers=headers, json={"reason": "foo"}).status_code == 404
+        assert client.post("/api/inbox/N999/reopen", headers=headers).status_code == 404
+        assert client.post("/api/inbox/N999/to-task", headers=headers, json={"category": "c", "title": "t"}).status_code == 404
+
+        # Add note missing title -> 400
+        res_no_title = client.post("/api/inbox", headers=headers, json={})
+        assert res_no_title.status_code == 400
+
+        # Create a note for testing detach & other validations
+        res_add = client.post("/api/inbox", headers=headers, json={"title": "Note for validation"})
+        assert res_add.status_code == 200
+        note_id = res_add.json()["id"]
+
+        # Discard missing reason -> 400
+        assert client.post(f"/api/inbox/{note_id}/discard", headers=headers, json={}).status_code == 400
+        assert client.post(f"/api/inbox/{note_id}/discard", headers=headers, json={"reason": "  "}).status_code == 400
+
+        # Resolve missing produced -> 400
+        assert client.post(f"/api/inbox/{note_id}/resolve", headers=headers, json={}).status_code == 400
+
+        # To-task missing category/title -> 400
+        assert client.post(f"/api/inbox/{note_id}/to-task", headers=headers, json={"title": "foo"}).status_code == 400
+        assert client.post(f"/api/inbox/{note_id}/to-task", headers=headers, json={"category": "cat"}).status_code == 400
+
+        # Attach image, then detach
+        png_data = make_test_png(2, 2)
+        res_up = client.post(
+            f"/api/inbox/{note_id}/attachments",
+            headers=headers,
+            files={"file": ("to_detach.png", png_data, "image/png")},
+        )
+        assert res_up.status_code == 200
+        att_name = res_up.json()["attachment"]
+
+        res_det = client.delete(f"/api/inbox/{note_id}/attachments/{att_name}", headers=headers)
+        assert res_det.status_code == 200
+        assert res_det.json()["detached"] == att_name
+
+        # Detach non-existent attachment -> 404
+        res_det_missing = client.delete(f"/api/inbox/{note_id}/attachments/notfound.png", headers=headers)
+        assert res_det_missing.status_code == 404
+    finally:
+        state.workspace = old_ws
+
+
+def test_inbox_watcher_broadcasts_on_inbox_change(monkeypatch):
+    token = get_or_create_token()
+    monkeypatch.setenv("AI_ORCH_WATCH_POLLING", "1")
+    monkeypatch.setenv("AI_ORCH_WATCH_INTERVAL", "0.5")
+
+    with tempfile.TemporaryDirectory() as tmp_ws:
+        ws_path = pathlib.Path(tmp_ws)
+        inbox_dir = ws_path / "tasks" / "_inbox" / "to-analyze" / "20261017-000000-sample-note"
+        inbox_dir.mkdir(parents=True)
+        note_file = inbox_dir / "note.md"
+        note_file.write_text("initial note content", encoding="utf-8")
+
+        old_ws = state.workspace
+        state.workspace = ws_path
+
+        try:
+            with TestClient(app) as test_client:
+                with test_client.websocket_connect(f"/ws?token={token}") as ws:
+                    init_msg = ws.receive_json()
+                    assert init_msg.get("type") == "connected"
+
+                    time.sleep(0.1)
+                    note_file.write_text("modified note content", encoding="utf-8")
+
+                    broadcast_msg = ws.receive_json()
+                    assert broadcast_msg.get("type") == "changed"
+                    areas = broadcast_msg.get("areas", [])
+                    assert "inbox" in areas
+                    assert "tasks" not in areas
+        finally:
+            state.workspace = old_ws

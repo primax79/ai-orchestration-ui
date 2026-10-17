@@ -28,6 +28,7 @@ from typing import Any, AsyncGenerator
 from urllib.parse import parse_qs
 
 from starlette.applications import Starlette
+from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -317,9 +318,10 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
     err_str = ""
     if isinstance(data, dict):
         reason = str(data.get("reason") or "").lower()
-        err_val = str(data.get("error") or data.get("message") or "").lower()
-        if data.get("error") in ("stale-task", "lock-timeout") or reason in (
+        err_val = f"{data.get('error', '')} {data.get('message', '')}".lower()
+        if data.get("error") in ("stale-task", "lock-timeout", "stale-note") or reason in (
             "stale-task",
+            "stale-note",
             "lock-timeout",
             "plan-hash-mismatch",
             "task-hash-mismatch",
@@ -330,6 +332,10 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
             "active-chain-run",
         ):
             return 409
+        if data.get("error") == "invalid-image-type" or reason == "invalid-image-type":
+            return 415
+        if data.get("error") == "size-limit-exceeded" or reason == "size-limit-exceeded":
+            return 413
         err_str = f"{reason} {err_val}"
     elif isinstance(data, str):
         err_str = data.lower()
@@ -338,6 +344,7 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         "hash mismatch" in err_str
         or "plan hash mismatch" in err_str
         or "stale" in err_str
+        or "stale-note" in err_str
         or "lock-timeout" in err_str
         or "task-write lock" in err_str
         or "timed out waiting for task-write lock" in err_str
@@ -352,6 +359,12 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "references the same worktree" in err_str
     ):
         return 409
+
+    if "invalid-image-type" in err_str or "magic bytes do not match" in err_str:
+        return 415
+
+    if "size-limit-exceeded" in err_str:
+        return 413
 
     if (
         "required" in err_str
@@ -384,7 +397,7 @@ CSP_HEADER = (
     "default-src 'self'; "
     "script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data:; "
+    "img-src 'self' data: blob:; "
     "connect-src 'self' ws://127.0.0.1:* ws://localhost:*; "
     "object-src 'none'; "
     "base-uri 'none'; "
@@ -463,11 +476,21 @@ def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) ->
             questions_dir = tasks_dir / "questions"
             if questions_dir.is_dir():
                 mtimes[f"questions:{questions_dir}"] = questions_dir.stat().st_mtime
+            inbox_dir = tasks_dir / "_inbox"
+            if inbox_dir.is_dir():
+                mtimes[f"inbox:{inbox_dir}"] = inbox_dir.stat().st_mtime
+                for p in inbox_dir.rglob("*"):
+                    try:
+                        mtimes[f"inbox:{p}"] = p.stat().st_mtime
+                    except OSError:
+                        pass
             for p in tasks_dir.rglob("*.md"):
                 try:
                     if p.is_file():
                         if "questions" in p.parts:
                             mtimes[f"questions:{p}"] = p.stat().st_mtime
+                        elif "_inbox" in p.parts:
+                            pass
                         else:
                             mtimes[f"tasks:{p}"] = p.stat().st_mtime
                 except OSError:
@@ -511,6 +534,8 @@ async def _polling_watcher_loop() -> None:
                     elif k.startswith("questions:"):
                         changed_areas.add("questions")
                         changed_areas.add("tasks")
+                    elif k.startswith("inbox:"):
+                        changed_areas.add("inbox")
                     elif k.startswith("tasks:"):
                         changed_areas.add("tasks")
                     elif k.startswith("runs:"):
@@ -526,6 +551,8 @@ async def _polling_watcher_loop() -> None:
                         elif k.startswith("questions:"):
                             changed_areas.add("questions")
                             changed_areas.add("tasks")
+                        elif k.startswith("inbox:"):
+                            changed_areas.add("inbox")
                         elif k.startswith("tasks:"):
                             changed_areas.add("tasks")
                         elif k.startswith("runs:"):
@@ -558,6 +585,8 @@ async def _watchfiles_watcher_loop() -> None:
                 if "questions" in p.parts:
                     areas.add("questions")
                     areas.add("tasks")
+                elif "_inbox" in p.parts:
+                    areas.add("inbox")
                 elif p.suffix == ".md" or p == (state.workspace / "tasks"):
                     areas.add("tasks")
             elif ".ai-orchestration" in p.parts and "runs" in p.parts and (p.name == "run.json" or p.name == "runs"):
@@ -1573,6 +1602,462 @@ async def api_cleanup_run(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# REST Endpoints: Inbox Notes & Attachments (09.2)
+# ---------------------------------------------------------------------------
+
+NOTE_ID_RE = re.compile(r"^N\d{3,}$")
+ATTACHMENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def sniff_image_media_type(data: bytes) -> str | None:
+    """Sniff media type from magic bytes (png, jpeg, gif, webp only)."""
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(data) >= 6 and (data[:6] == b"GIF87a" or data[:6] == b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+async def api_list_inbox_notes(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "list", "--tasks-dir", str(tasks_dir), "--json"]
+    status = request.query_params.get("status")
+    if status:
+        cmd.extend(["--status", status])
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_inbox_note(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "show", note_id, "--tasks-dir", str(tasks_dir), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    return JSONResponse(data if isinstance(data, dict) else {"note": data})
+
+
+async def api_add_inbox_note(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    title = body.get("title")
+    if not title or not str(title).strip():
+        return JSONResponse({"error": "title is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "add", "--title", str(title).strip(), "--tasks-dir", str(tasks_dir), "--json"]
+
+    if body.get("kind"):
+        cmd.extend(["--kind", str(body["kind"])])
+    if body.get("about"):
+        cmd.extend(["--about", str(body["about"])])
+    if body.get("author"):
+        cmd.extend(["--author", str(body["author"])])
+    if body.get("status"):
+        cmd.extend(["--status", str(body["status"])])
+
+    temp_body_file: str | None = None
+    body_text = body.get("body")
+    try:
+        if body_text is not None:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".md") as f:
+                f.write(str(body_text))
+                temp_body_file = f.name
+            cmd.extend(["--body-file", temp_body_file])
+
+        code, data = await run_ai_orch(cmd)
+    finally:
+        if temp_body_file:
+            try:
+                os.remove(temp_body_file)
+            except OSError:
+                pass
+
+    if code == 0:
+        note_id = data.get("id") if isinstance(data, dict) else None
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_edit_inbox_note(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "edit", note_id, "--tasks-dir", str(tasks_dir), "--json"]
+
+    if "title" in body:
+        cmd.extend(["--title", str(body["title"])])
+    if "kind" in body:
+        cmd.extend(["--kind", str(body["kind"])])
+    if "about" in body:
+        cmd.extend(["--about", str(body["about"])])
+    if "author" in body:
+        cmd.extend(["--author", str(body["author"])])
+    if "status" in body:
+        cmd.extend(["--status", str(body["status"])])
+    if "expect_hash" in body:
+        cmd.extend(["--expect-hash", str(body["expect_hash"])])
+
+    temp_body_file: str | None = None
+    body_text = body.get("body")
+    try:
+        if body_text is not None:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".md") as f:
+                f.write(str(body_text))
+                temp_body_file = f.name
+            cmd.extend(["--body-file", temp_body_file])
+
+        code, data = await run_ai_orch(cmd)
+    finally:
+        if temp_body_file:
+            try:
+                os.remove(temp_body_file)
+            except OSError:
+                pass
+
+    if code == 0:
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+    else:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_upload_inbox_attachment(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    content_type = request.headers.get("content-type", "")
+    if not content_type.startswith("multipart/form-data"):
+        return JSONResponse({"error": "Content-Type must be multipart/form-data"}, status_code=400)
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_ATTACHMENT_SIZE + 512 * 1024:
+                return JSONResponse({"error": "Attachment exceeds 10 MB limit"}, status_code=413)
+        except ValueError:
+            pass
+
+    try:
+        form = await request.form()
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid multipart form: {exc}"}, status_code=400)
+
+    upload_file = form.get("file")
+    if not upload_file or not hasattr(upload_file, "read"):
+        return JSONResponse({"error": "file field is required in multipart form"}, status_code=400)
+
+    temp_path: pathlib.Path | None = None
+    suffix = pathlib.Path(upload_file.filename).suffix if getattr(upload_file, "filename", None) else ".tmp"
+    try:
+        with tempfile.NamedTemporaryFile("wb", delete=False, suffix=suffix) as temp_f:
+            temp_path = pathlib.Path(temp_f.name)
+            total_read = 0
+            while True:
+                chunk = await upload_file.read(65536)
+                if not chunk:
+                    break
+                total_read += len(chunk)
+                if total_read > MAX_ATTACHMENT_SIZE:
+                    temp_f.close()
+                    temp_path.unlink(missing_ok=True)
+                    temp_path = None
+                    return JSONResponse({"error": "Attachment exceeds 10 MB limit"}, status_code=413)
+                temp_f.write(chunk)
+
+        tasks_dir = state.workspace / "tasks"
+        cmd = ["inbox", "attach", note_id, "--file", str(temp_path), "--tasks-dir", str(tasks_dir), "--json"]
+        if getattr(upload_file, "filename", None):
+            stem = pathlib.Path(upload_file.filename).stem
+            if stem:
+                cmd.extend(["--name", stem])
+
+        code, data = await run_ai_orch(cmd)
+        if code == 0:
+            await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+            return JSONResponse(data, status_code=200)
+
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "not-found" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    finally:
+        if temp_path:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def api_delete_inbox_attachment(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    name = request.path_params["name"]
+    if not ATTACHMENT_NAME_RE.match(name):
+        return JSONResponse({"error": f"Invalid attachment name {name!r}"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "detach", note_id, "--name", name, "--tasks-dir", str(tasks_dir), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+        return JSONResponse(data, status_code=200)
+
+    err_str = ""
+    if isinstance(data, dict):
+        err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+    elif isinstance(data, str):
+        err_str = data.lower()
+    if "not found" in err_str or "not-found" in err_str:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_inbox_attachment(request: Request) -> Response:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    name = request.path_params["name"]
+    if not ATTACHMENT_NAME_RE.match(name):
+        return JSONResponse({"error": f"Invalid attachment name {name!r}"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    code, data = await run_ai_orch(["inbox", "show", note_id, "--tasks-dir", str(tasks_dir), "--json"])
+    if code != 0 or not isinstance(data, dict) or not data.get("ok"):
+        return JSONResponse({"error": f"Note {note_id} not found"}, status_code=404)
+
+    folder_path_str = data.get("note", {}).get("folder_path")
+    if not folder_path_str:
+        return JSONResponse({"error": f"Note {note_id} folder not found"}, status_code=404)
+
+    folder_path = pathlib.Path(folder_path_str).resolve()
+    attachments_dir = (folder_path / "attachments").resolve()
+    target_file = (attachments_dir / name).resolve()
+
+    try:
+        target_file.relative_to(attachments_dir)
+    except ValueError:
+        return JSONResponse({"error": "Path traversal detected"}, status_code=400)
+
+    if not target_file.is_file():
+        return JSONResponse({"error": f"Attachment {name!r} not found"}, status_code=404)
+
+    file_bytes = target_file.read_bytes()
+    media_type = sniff_image_media_type(file_bytes)
+    if not media_type:
+        return JSONResponse({"error": "Unsupported image format"}, status_code=415)
+
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, max-age=60",
+    }
+    return Response(file_bytes, media_type=media_type, headers=headers)
+
+
+async def api_resolve_inbox_note(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    produced = body.get("produced")
+    if not produced or not str(produced).strip():
+        return JSONResponse({"error": "produced is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "resolve", note_id, "--produced", str(produced).strip(), "--tasks-dir", str(tasks_dir), "--json"]
+    if body.get("by"):
+        cmd.extend(["--by", str(body["by"])])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+        return JSONResponse(data, status_code=200)
+
+    err_str = ""
+    if isinstance(data, dict):
+        err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+    elif isinstance(data, str):
+        err_str = data.lower()
+    if "not found" in err_str or "not-found" in err_str:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_discard_inbox_note(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    reason = body.get("reason")
+    if not reason or not str(reason).strip():
+        return JSONResponse({"error": "reason is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "discard", note_id, "--reason", str(reason).strip(), "--tasks-dir", str(tasks_dir), "--json"]
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+        return JSONResponse(data, status_code=200)
+
+    err_str = ""
+    if isinstance(data, dict):
+        err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+    elif isinstance(data, str):
+        err_str = data.lower()
+    if "not found" in err_str or "not-found" in err_str:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_reopen_inbox_note(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["inbox", "reopen", note_id, "--tasks-dir", str(tasks_dir), "--json"]
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+        return JSONResponse(data, status_code=200)
+
+    err_str = ""
+    if isinstance(data, dict):
+        err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+    elif isinstance(data, str):
+        err_str = data.lower()
+    if "not found" in err_str or "not-found" in err_str:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_inbox_to_task(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    category = body.get("category") or body.get("parent")
+    if not category or not str(category).strip():
+        return JSONResponse({"error": "category is required"}, status_code=400)
+
+    title = body.get("title")
+    if not title or not str(title).strip():
+        return JSONResponse({"error": "title is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = [
+        "tasks", "new",
+        "--from-note", note_id,
+        "--category", str(category).strip(),
+        "--title", str(title).strip(),
+        "--tasks-dir", str(tasks_dir),
+        "--json",
+    ]
+    if body.get("priority"):
+        cmd.extend(["--priority", str(body["priority"])])
+    if body.get("priority_reason"):
+        cmd.extend(["--priority-reason", str(body["priority_reason"])])
+    if body.get("executor"):
+        cmd.extend(["--executor", str(body["executor"])])
+    if body.get("next_up"):
+        cmd.extend(["--next-up", str(body["next_up"])])
+    if body.get("depends_on"):
+        cmd.extend(["--depends-on", str(body["depends_on"])])
+    if body.get("decider"):
+        cmd.extend(["--decider", str(body["decider"])])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        task_id = data.get("id") if isinstance(data, dict) else None
+        await state.broadcast({"type": "task_created", "task_id": task_id, "from_note": note_id})
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+        return JSONResponse(data, status_code=200)
+
+    err_str = ""
+    if isinstance(data, dict):
+        err_str = f"{data.get('error', '')} {data.get('message', '')} {data.get('reason', '')}".lower()
+    elif isinstance(data, str):
+        err_str = data.lower()
+    if "not found" in err_str or "not-found" in err_str:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket Endpoint: Live File & State Updates
 # ---------------------------------------------------------------------------
 
@@ -1638,6 +2123,17 @@ routes = [
     Route("/api/runs/{id}/mark-delivered", api_mark_delivered_run, methods=["POST"]),
     Route("/api/runs/{id}/apply-verdict", api_apply_verdict_run, methods=["POST"]),
     Route("/api/runs/{id}/cleanup", api_cleanup_run, methods=["POST"]),
+    Route("/api/inbox", api_list_inbox_notes, methods=["GET"]),
+    Route("/api/inbox", api_add_inbox_note, methods=["POST"]),
+    Route("/api/inbox/{id}", api_get_inbox_note, methods=["GET"]),
+    Route("/api/inbox/{id}", api_edit_inbox_note, methods=["POST"]),
+    Route("/api/inbox/{id}/attachments", api_upload_inbox_attachment, methods=["POST"]),
+    Route("/api/inbox/{id}/attachments/{name:path}", api_get_inbox_attachment, methods=["GET"]),
+    Route("/api/inbox/{id}/attachments/{name:path}", api_delete_inbox_attachment, methods=["DELETE"]),
+    Route("/api/inbox/{id}/resolve", api_resolve_inbox_note, methods=["POST"]),
+    Route("/api/inbox/{id}/discard", api_discard_inbox_note, methods=["POST"]),
+    Route("/api/inbox/{id}/reopen", api_reopen_inbox_note, methods=["POST"]),
+    Route("/api/inbox/{id}/to-task", api_inbox_to_task, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ]
 

@@ -142,6 +142,19 @@ For all mutating environment commands, the API provides preview/apply endpoint p
 - `POST /api/runs/{id}/apply-verdict` — Apply verification verdict (`verified` or `bounced`) to transition the task (`expect_task_hash` and `panel_id` supported).
 - `POST /api/runs/{id}/cleanup` — Remove worktree and branch for terminal runs (`discard` and `dry_run` supported).
 
+### 6. Inbox Notes & Attachments (09.2)
+- `GET /api/inbox` — List inbox notes with optional status filter (`status=draft|ready|processing|processed|discarded|all`).
+- `GET /api/inbox/{id}` — Retrieve full details of an inbox note by ID (validated `^N\d{3,}$`).
+- `POST /api/inbox` — Create a new note (`title`, `kind`, `about`, `body` streamed safely via `--body-file`, optional `author`, `status`).
+- `POST /api/inbox/{id}` — Edit an inbox note (`title`, `kind`, `about`, `status`, `body`, and precondition `expect_hash` mapping stale edits to `HTTP 409`).
+- `POST /api/inbox/{id}/attachments` — Upload an image attachment via multipart form with hard 10 MB streaming size cap (returns `HTTP 413` if exceeded; magic-byte check returns `HTTP 415/400`).
+- `DELETE /api/inbox/{id}/attachments/{name}` — Detach an attachment from a note.
+- `GET /api/inbox/{id}/attachments/{name}` — Serve attachment image with magic-byte verified `Content-Type` (`image/png`, `image/jpeg`, `image/gif`, `image/webp`), `X-Content-Type-Options: nosniff`, and `Cache-Control: private, max-age=60`. Traversal attempts return `HTTP 400/404`.
+- `POST /api/inbox/{id}/resolve` — Mark a note processed (`produced`, optional `by`), moving its folder to `analyzed/`.
+- `POST /api/inbox/{id}/discard` — Discard an inbox note (`reason` required), moving its folder to `analyzed/`.
+- `POST /api/inbox/{id}/reopen` — Reopen an inbox note back to `to-analyze/` with status `ready`.
+- `POST /api/inbox/{id}/to-task` — Convert note to an emergent task (`category`, `title`, optional `priority`, `parent`) via `tasks new --from-note`.
+
 ---
 
 ## Development
