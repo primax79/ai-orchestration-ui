@@ -410,6 +410,7 @@ export const App: React.FC = () => {
                   recordOwnAction('config');
                   loadConfig();
                 }}
+                onNavigateToDecisions={() => setActiveTab('decisions')}
               />
             )}
           </div>

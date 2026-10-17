@@ -146,7 +146,28 @@ export interface OrchestrationConfigResponse {
     };
     tools: Record<string, any>;
     project?: Record<string, any>;
+    agents_md?: Record<string, any>;
+    schema_version?: number;
+    last_verified?: string;
   };
+}
+
+export interface ConfigPreviewResponse {
+  ok: boolean;
+  path: string;
+  diff: string;
+  hash: string;
+  changed: boolean;
+  warnings?: string[];
+  error?: string;
+}
+
+export interface ConfigApplyResponse {
+  ok: boolean;
+  path: string;
+  hash?: string;
+  warnings?: string[];
+  error?: string;
 }
 
 export interface QuestionOption {

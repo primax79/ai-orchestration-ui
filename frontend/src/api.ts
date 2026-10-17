@@ -3,6 +3,8 @@ import {
   WorkspaceInfo,
   EnvStatusResponse,
   OrchestrationConfigResponse,
+  ConfigPreviewResponse,
+  ConfigApplyResponse,
   QuestionListResponse,
   QuestionItem,
   AskQuestionPayload,
@@ -442,11 +444,11 @@ export const api = {
     effort?: string,
     basis?: string,
     scope: 'global' | 'project' = 'global'
-  ): Promise<any> {
+  ): Promise<ConfigPreviewResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewSetProfile', { tool, profile, model, variant, effort, basis, scope });
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewSetProfile', { tool, profile, model, variant, effort, basis, scope });
     }
-    return apiFetch('/api/config/set-profile/preview', {
+    return apiFetch<ConfigPreviewResponse>('/api/config/set-profile/preview', {
       method: 'POST',
       body: JSON.stringify({ tool, profile, model, variant, effort, basis, scope }),
     });
@@ -461,11 +463,11 @@ export const api = {
     effort?: string,
     basis?: string,
     scope: 'global' | 'project' = 'global'
-  ): Promise<any> {
+  ): Promise<ConfigApplyResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('setProfile', { tool, profile, model, expectHash, variant, effort, basis, scope });
+      return sendVsCodeMessage<ConfigApplyResponse>('setProfile', { tool, profile, model, expectHash, variant, effort, basis, scope });
     }
-    return apiFetch('/api/config/set-profile', {
+    return apiFetch<ConfigApplyResponse>('/api/config/set-profile', {
       method: 'POST',
       body: JSON.stringify({ tool, profile, model, expect_hash: expectHash, variant, effort, basis, scope }),
     });
@@ -477,11 +479,11 @@ export const api = {
     executor?: string,
     defaultProfile?: string,
     verificationMode?: string
-  ): Promise<any> {
+  ): Promise<ConfigPreviewResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewSetRouting', { scope, orchestrator, executor, defaultProfile, verificationMode });
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewSetRouting', { scope, orchestrator, executor, defaultProfile, verificationMode });
     }
-    return apiFetch('/api/config/set-routing/preview', {
+    return apiFetch<ConfigPreviewResponse>('/api/config/set-routing/preview', {
       method: 'POST',
       body: JSON.stringify({
         scope,
@@ -500,11 +502,11 @@ export const api = {
     executor?: string,
     defaultProfile?: string,
     verificationMode?: string
-  ): Promise<any> {
+  ): Promise<ConfigApplyResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('setRouting', { expectHash, scope, orchestrator, executor, defaultProfile, verificationMode });
+      return sendVsCodeMessage<ConfigApplyResponse>('setRouting', { expectHash, scope, orchestrator, executor, defaultProfile, verificationMode });
     }
-    return apiFetch('/api/config/set-routing', {
+    return apiFetch<ConfigApplyResponse>('/api/config/set-routing', {
       method: 'POST',
       body: JSON.stringify({
         expect_hash: expectHash,
@@ -524,18 +526,18 @@ export const api = {
     return apiFetch('/api/config/render-agents-md');
   },
 
-  async previewAgentsMd(): Promise<any> {
+  async previewAgentsMd(): Promise<ConfigPreviewResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewAgentsMd');
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewAgentsMd');
     }
-    return apiFetch('/api/config/render-agents-md/preview');
+    return apiFetch<ConfigPreviewResponse>('/api/config/render-agents-md/preview');
   },
 
-  async applyAgentsMd(expectHash: string, allowGlobalRouting = false): Promise<any> {
+  async applyAgentsMd(expectHash: string, allowGlobalRouting = false): Promise<ConfigApplyResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('applyAgentsMd', { expectHash, allowGlobalRouting });
+      return sendVsCodeMessage<ConfigApplyResponse>('applyAgentsMd', { expectHash, allowGlobalRouting });
     }
-    return apiFetch('/api/config/render-agents-md/apply', {
+    return apiFetch<ConfigApplyResponse>('/api/config/render-agents-md/apply', {
       method: 'POST',
       body: JSON.stringify({ expect_hash: expectHash, allow_global_routing: allowGlobalRouting }),
     });
