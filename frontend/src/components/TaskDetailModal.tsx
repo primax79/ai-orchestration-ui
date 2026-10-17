@@ -32,6 +32,40 @@ interface TaskDetailModalProps {
   onNavigateToDecisions?: (questionId: string) => void;
 }
 
+type TaskDocView = 'structured' | 'raw';
+const TASK_DOC_VIEW_KEY = 'ai-orch:task-doc-view';
+
+// Header fields shown elsewhere in the modal (title bar, state footer, handoff box).
+const HIDDEN_HEADER_FIELDS = new Set(['id', 'title', 'state', 'handoff', 'priority']);
+
+/** Split a task file into its `- key: value` header and the remaining body (H1 dropped). */
+export function splitTaskDoc(content: string): { fields: Array<[string, string]>; body: string } {
+  const lines = content.split('\n');
+  let i = 0;
+  while (i < lines.length && lines[i].trim() === '') i++;
+  if (i < lines.length && /^#\s+/.test(lines[i])) i++;
+  while (i < lines.length && lines[i].trim() === '') i++;
+  const fields: Array<[string, string]> = [];
+  while (i < lines.length) {
+    const m = /^-\s+([a-z][a-z0-9-]*):\s?(.*)$/.exec(lines[i]);
+    if (!m) break;
+    fields.push([m[1], m[2].trim()]);
+    i++;
+  }
+  if (fields.length === 0) {
+    return { fields, body: content };
+  }
+  return { fields, body: lines.slice(i).join('\n').replace(/^\s+/, '') };
+}
+
+const getStoredDocView = (): TaskDocView => {
+  try {
+    return localStorage.getItem(TASK_DOC_VIEW_KEY) === 'raw' ? 'raw' : 'structured';
+  } catch {
+    return 'structured';
+  }
+};
+
 export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   task,
   initialRunId,
@@ -51,6 +85,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [bounceReason, setBounceReason] = useState('');
   const [showBounceInput, setShowBounceInput] = useState(false);
   const [copiedHandoff, setCopiedHandoff] = useState(false);
+  const [docView, setDocView] = useState<TaskDocView>(getStoredDocView);
   const [transitionError, setTransitionError] = useState<string | null>(null);
   const [indexOutOfSync, setIndexOutOfSync] = useState(false);
   const [showRunDialog, setShowRunDialog] = useState(false);
@@ -458,26 +493,101 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             </div>
           )}
 
-          {/* Markdown Content */}
-          {detail ? (
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#94a3b8', fontSize: '0.8rem', marginBottom: '0.5rem' }}>
-                <FileText size={14} />
-                <span>{detail.relative_path}</span>
+          {/* Task document: structured (fields + body) or raw (file source) */}
+          {detail ? (() => {
+            const { fields, body } = splitTaskDoc(String(detail.content || ''));
+            const extraFields = fields.filter(([k]) => !HIDDEN_HEADER_FIELDS.has(k));
+            const chooseView = (v: TaskDocView) => {
+              setDocView(v);
+              try {
+                localStorage.setItem(TASK_DOC_VIEW_KEY, v);
+              } catch {
+                // Ignore storage errors
+              }
+            };
+            return (
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#94a3b8', fontSize: '0.8rem' }}>
+                    <FileText size={14} />
+                    <span>{detail.relative_path}</span>
+                  </div>
+                  <div style={{ display: 'flex', backgroundColor: '#1e293b', padding: '0.15rem', borderRadius: '0.3rem', border: '1px solid #334155' }}>
+                    {(['structured', 'raw'] as const).map((v) => (
+                      <button
+                        key={v}
+                        onClick={() => chooseView(v)}
+                        style={{
+                          padding: '0.2rem 0.6rem',
+                          borderRadius: '0.2rem',
+                          border: 'none',
+                          backgroundColor: docView === v ? '#4f46e5' : 'transparent',
+                          color: docView === v ? '#fff' : '#94a3b8',
+                          cursor: 'pointer',
+                          fontSize: '0.75rem',
+                          fontWeight: 500,
+                        }}
+                      >
+                        {v === 'structured' ? 'Structured' : 'Raw'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {docView === 'raw' ? (
+                  <pre style={{
+                    backgroundColor: '#0f172a',
+                    border: '1px solid #334155',
+                    borderRadius: '0.5rem',
+                    padding: '1rem',
+                    fontSize: '0.8rem',
+                    color: '#e2e8f0',
+                    lineHeight: 1.5,
+                    fontFamily: 'monospace',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    margin: 0,
+                  }}>
+                    {String(detail.content || '')}
+                  </pre>
+                ) : (
+                  <>
+                    {extraFields.length > 0 && (
+                      <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'minmax(110px, max-content) 1fr',
+                        columnGap: '1rem',
+                        rowGap: '0.35rem',
+                        padding: '0.75rem 1rem',
+                        backgroundColor: '#0f172a',
+                        border: '1px solid #334155',
+                        borderRadius: '0.5rem',
+                        marginBottom: '0.75rem',
+                        fontSize: '0.8rem',
+                      }}>
+                        {extraFields.map(([k, v]) => (
+                          <React.Fragment key={k}>
+                            <div style={{ color: '#64748b', textTransform: 'uppercase', fontSize: '0.7rem', fontWeight: 600, paddingTop: '0.1rem' }}>{k}</div>
+                            <div style={{ color: v === '-' ? '#475569' : '#e2e8f0', overflowWrap: 'anywhere' }}>{v || '-'}</div>
+                          </React.Fragment>
+                        ))}
+                      </div>
+                    )}
+                    <div style={{
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #334155',
+                      borderRadius: '0.5rem',
+                      padding: '1rem',
+                      fontSize: '0.85rem',
+                      color: '#cbd5e1',
+                      lineHeight: 1.6,
+                    }}>
+                      <SafeMarkdown content={body} />
+                    </div>
+                  </>
+                )}
               </div>
-              <div style={{
-                backgroundColor: '#0f172a',
-                border: '1px solid #334155',
-                borderRadius: '0.5rem',
-                padding: '1rem',
-                fontSize: '0.85rem',
-                color: '#cbd5e1',
-                lineHeight: 1.6,
-              }}>
-                <SafeMarkdown content={detail.content} />
-              </div>
-            </div>
-          ) : (
+            );
+          })() : (
             <div style={{ color: '#94a3b8', fontSize: '0.85rem' }}>Loading task specification...</div>
           )}
 
