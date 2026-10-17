@@ -248,7 +248,54 @@ async def _cleanup_process_group(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
+# Guards against CLI process bursts (several panels polling the same list): identical
+# read-only calls already in flight share one process, and at most MAX_CLI_PROCESSES run.
+MAX_CLI_PROCESSES = 4
+_READ_ONLY_PREFIXES = {
+    ("tasks", "list"), ("tasks", "validate"), ("questions", "list"), ("questions", "show"),
+    ("inbox", "list"), ("inbox", "show"), ("config", "show"), ("env", "status"),
+    ("run", "list"), ("run", "show"), ("run", "logs"), ("run", "options"),
+}
+# Per event loop: asyncio primitives cannot be shared across loops (tests run several).
+_cli_semaphores: dict[int, asyncio.Semaphore] = {}
+_inflight_reads: dict[tuple[Any, ...], asyncio.Future] = {}
+
+
+def _is_read_only(args: list[str]) -> bool:
+    if any(a in ("--check", "--dry-run", "--diff") for a in args):
+        return True
+    return tuple(args[:2]) in _READ_ONLY_PREFIXES
+
+
 async def run_ai_orch(args: list[str], timeout: float | None = None) -> tuple[int, dict[str, Any] | str]:
+    """Run the CLI with the process guards; see _run_ai_orch_process for the execution."""
+    loop_id = id(asyncio.get_running_loop())
+    sem = _cli_semaphores.get(loop_id)
+    if sem is None:
+        sem = _cli_semaphores[loop_id] = asyncio.Semaphore(MAX_CLI_PROCESSES)
+
+    async def run_limited() -> tuple[int, dict[str, Any] | str]:
+        async with sem:
+            return await _run_ai_orch_process(args, timeout)
+
+    if not _is_read_only(args):
+        return await run_limited()
+    key = (loop_id, *args, f"timeout={timeout}")
+    existing = _inflight_reads.get(key)
+    if existing is not None:
+        return await asyncio.shield(existing)
+    fut: asyncio.Future = asyncio.ensure_future(run_limited())
+    _inflight_reads[key] = fut
+    try:
+        return await asyncio.shield(fut)
+    finally:
+        if _inflight_reads.get(key) is fut and fut.done():
+            _inflight_reads.pop(key, None)
+        else:
+            fut.add_done_callback(lambda _f, k=key: _inflight_reads.pop(k, None) if _inflight_reads.get(k) is _f else None)
+
+
+async def _run_ai_orch_process(args: list[str], timeout: float | None = None) -> tuple[int, dict[str, Any] | str]:
     """Execute `./bin/ai-orch <args...>` asynchronously and return (exit_code, parsed_json_or_text)."""
     bin_path = get_ai_orch_bin()
     if not bin_path.is_file():

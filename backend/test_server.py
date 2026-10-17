@@ -1797,3 +1797,33 @@ def test_task_detail_for_plan_tasks(monkeypatch, tmp_path):
 
     assert client.get("/api/tasks/05.9", headers=headers).status_code == 404
     assert client.get("/api/tasks/T0*", headers=headers).status_code == 400
+
+
+def test_cli_guard_shares_identical_reads_and_caps_concurrency(monkeypatch):
+    import server as srv
+
+    running = 0
+    peak = 0
+    calls = 0
+
+    async def fake_process(args, timeout=None):
+        nonlocal running, peak, calls
+        calls += 1
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.05)
+        running -= 1
+        return 0, {"ok": True, "args": args}
+
+    monkeypatch.setattr(srv, "_run_ai_orch_process", fake_process)
+
+    async def scenario():
+        reads = [srv.run_ai_orch(["run", "list", "--json"]) for _ in range(10)]
+        writes = [srv.run_ai_orch(["tasks", "transition", f"T{i:03d}", "done"]) for i in range(10)]
+        return await asyncio.gather(*reads, *writes)
+
+    results = asyncio.run(scenario())
+    assert all(code == 0 for code, _ in results)
+    assert calls == 11  # one shared read + ten writes
+    assert peak <= srv.MAX_CLI_PROCESSES
+    assert srv._inflight_reads == {}
