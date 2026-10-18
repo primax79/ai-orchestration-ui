@@ -1305,8 +1305,24 @@ export interface PostChatResponse {
   error?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Triage Proposal Editing Types (Task 09.10)
+// ---------------------------------------------------------------------------
 
+export interface ProposedTaskEdits {
+  title?: string;
+  category?: string;
+  priority?: Priority | string;
+  priority_reason?: string;
+  goal?: string;
+  steps?: string[];
+  verification?: string;
+  kind?: string;
+  labels?: string[];
+  [key: string]: any;
+}
 
-
-
+export interface AcceptTriagePayload {
+  edits?: Record<string | number, ProposedTaskEdits>;
+}
 

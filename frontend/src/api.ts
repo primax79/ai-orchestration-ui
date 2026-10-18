@@ -1837,6 +1837,13 @@ Object.assign(api, orchestratorChatApi);
 
 export const eventsAndTriggersApi = api;
 
+// ---------------------------------------------------------------------------
+// Triage Proposal Editing API helpers (Task 09.10)
+// ---------------------------------------------------------------------------
 
-
-
+export async function acceptTriageWithEdits(
+  runId: string,
+  payload: AcceptTriagePayload,
+): Promise<AcceptTriageResponse> {
+  return api.acceptTriage(runId, payload);
+}
