@@ -942,20 +942,6 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                         >
                           {q.id}
                         </span>
-                        <span
-                          style={{
-                            fontSize: '0.8rem',
-                            color: '#94a3b8',
-                            fontWeight: 500,
-                            maxWidth: '220px',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap',
-                          }}
-                          title={q.question}
-                        >
-                          ({shortTitle(q)})
-                        </span>
                                 <span
                                   style={{
                                     fontSize: '0.8rem',

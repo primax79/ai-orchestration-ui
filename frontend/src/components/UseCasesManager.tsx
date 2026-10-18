@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Target, Play, Plus, Loader2 } from 'lucide-react';
-import { UseCaseItem, ValidationCampaignResult, shortTitle } from '../types';
+import { UseCaseItem, ValidationCampaignResult } from '../types';
 import { UseCaseDetailModal } from './UseCaseDetailModal';
 import { api } from '../api';
 
@@ -285,9 +285,6 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) =
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                       <span style={{ fontSize: '0.75rem', fontWeight: 700, padding: '0.1rem 0.35rem', borderRadius: '0.2rem', backgroundColor: '#4f46e5', color: '#fff' }}>
                         {uc.id}
-                      </span>
-                      <span style={{ fontSize: '0.72rem', color: '#94a3b8', fontWeight: 500 }} title={uc.title}>
-                        ({shortTitle(uc)})
                       </span>
                       <span style={{
                         fontSize: '0.7rem',

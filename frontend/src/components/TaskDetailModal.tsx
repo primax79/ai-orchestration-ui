@@ -1484,19 +1484,6 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                           </span>
                           <span
                             style={{
-                              fontSize: '0.72rem',
-                              color: '#94a3b8',
-                              maxWidth: '200px',
-                              overflow: 'hidden',
-                              textOverflow: 'ellipsis',
-                              whiteSpace: 'nowrap',
-                            }}
-                            title={q.question}
-                          >
-                            ({shortTitle(q)})
-                          </span>
-                          <span
-                            style={{
                               fontSize: '0.7rem',
                               fontWeight: 600,
                               padding: '0.1rem 0.35rem',

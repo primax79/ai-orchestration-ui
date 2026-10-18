@@ -24,7 +24,6 @@ import {
   Priority,
   StructurePlanItem,
   SharedFilterState,
-  shortTitle,
 } from '../types';
 import { taskStructureApi } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -659,20 +658,6 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
           >
             {node.id}
           </span>
-          <span
-            style={{
-              fontSize: '0.78rem',
-              color: '#94a3b8',
-              fontWeight: 500,
-              maxWidth: '160px',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-            title={node.title}
-          >
-            ({shortTitle(node)})
-          </span>
 
           {/* Microtag & KindBadge */}
           {node.category === 'micro' && (
@@ -1211,20 +1196,6 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
                                   }}
                                 >
                                   {t.id}
-                                </span>
-                                <span
-                                  style={{
-                                    fontSize: '0.75rem',
-                                    color: '#94a3b8',
-                                    fontWeight: 500,
-                                    maxWidth: '160px',
-                                    overflow: 'hidden',
-                                    textOverflow: 'ellipsis',
-                                    whiteSpace: 'nowrap',
-                                  }}
-                                  title={t.title}
-                                >
-                                  ({shortTitle(t)})
                                 </span>
                                 {isMicro && (
                                   <span
