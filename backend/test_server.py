@@ -3993,4 +3993,130 @@ def test_orchestrator_handoff_ordering(tmp_path):
         state.workspace = old_ws
 
 
+def test_set_short_title_endpoint_and_creation_flags(monkeypatch, tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "workspace"
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir(parents=True)
+    old_ws = state.workspace
+    state.workspace = ws
+
+    log_file = tmp_path / "cli_calls.json"
+    stub_script = tmp_path / "stub_ai_orch.py"
+    stub_script.write_text(f"""import sys, json, os
+
+call = sys.argv[1:]
+with open({repr(str(log_file))}, "a") as f:
+    f.write(json.dumps(call) + "\\n")
+
+if len(call) >= 2 and call[0] == "tasks" and call[1] == "set-short":
+    task_id = call[2]
+    words = call[3]
+    if "--dry-run" in call:
+        print(json.dumps({{"ok": True, "task_id": task_id, "short_title": words, "dry_run": True, "plan_hash": "mockplan123", "diff": "mock diff"}}))
+        sys.exit(0)
+    elif "--expect-plan-hash" in call:
+        idx = call.index("--expect-plan-hash")
+        h = call[idx + 1]
+        if h == "badhash":
+            print(json.dumps({{"error": "plan hash mismatch", "ok": False}}))
+            sys.exit(1)
+        print(json.dumps({{"ok": True, "task_id": task_id, "short_title": words, "plan_hash": h}}))
+        sys.exit(0)
+    else:
+        print(json.dumps({{"error": "missing expect-plan-hash", "ok": False}}))
+        sys.exit(1)
+
+if len(call) >= 2 and call[0] == "tasks" and call[1] == "micro":
+    print(json.dumps({{"ok": True, "id": "T999", "category": "micro"}}))
+    sys.exit(0)
+
+if len(call) >= 3 and call[0] == "tasks" and call[1] == "child" and call[2] == "add":
+    print(json.dumps({{"ok": True, "allocated_id": "01.4", "plan_hash": "hash014"}}))
+    sys.exit(0)
+
+if len(call) >= 2 and call[0] == "questions" and call[1] == "ask":
+    print(json.dumps({{"ok": True, "id": "Q099"}}))
+    sys.exit(0)
+
+print(json.dumps({{"error": f"unknown command: {{call}}"}}))
+sys.exit(2)
+""")
+    stub_script.chmod(0o755)
+    stub_bin = tmp_path / "ai-orch"
+    stub_bin.write_text(f"#!/bin/sh\nexec {sys.executable} {stub_script} \"$@\"\n")
+    stub_bin.chmod(0o755)
+
+    monkeypatch.setenv("AI_ORCH_BIN", str(stub_bin))
+
+    try:
+        # 1. Invalid task ID
+        res_bad_id = client.post("/api/tasks/invalid!!/short", headers=headers, json={"short_title": "some title"})
+        assert res_bad_id.status_code == 400
+
+        # 2. Preview via /preview route
+        res_prev = client.post("/api/tasks/T007/short/preview", headers=headers, json={"short_title": "Fix auth tokens"})
+        assert res_prev.status_code == 200
+        prev_data = res_prev.json()
+        assert prev_data.get("ok") is True
+        assert prev_data.get("dry_run") is True
+        assert prev_data.get("short_title") == "Fix auth tokens"
+        assert prev_data.get("plan_hash") == "mockplan123"
+
+        # 3. Preview via dry_run in body of /api/tasks/{id}/short
+        res_prev_body = client.post("/api/tasks/T007/short", headers=headers, json={"short_title": "Fix auth tokens", "dry_run": True})
+        assert res_prev_body.status_code == 200
+        assert res_prev_body.json().get("dry_run") is True
+
+        # 4. Apply without expect_plan_hash -> 400
+        res_apply_nohash = client.post("/api/tasks/T007/short", headers=headers, json={"short_title": "Fix auth tokens"})
+        assert res_apply_nohash.status_code == 400
+        assert "expect_plan_hash is required" in res_apply_nohash.json().get("error", "")
+
+        # 5. Apply with stale hash -> CLI error mapped
+        res_stale = client.post("/api/tasks/T007/short", headers=headers, json={"short_title": "Fix auth tokens", "expect_plan_hash": "badhash"})
+        assert res_stale.status_code != 200
+
+        # 6. Apply with correct hash -> 200 and websocket broadcast
+        with client.websocket_connect(f"/ws?token={token}") as sock:
+            init_msg = sock.receive_json()
+            assert init_msg.get("type") == "connected"
+
+            res_apply_ok = client.post("/api/tasks/T007/short", headers=headers, json={"short_title": "Fix auth tokens", "expect_plan_hash": "mockplan123"})
+            assert res_apply_ok.status_code == 200
+            assert res_apply_ok.json().get("short_title") == "Fix auth tokens"
+
+            ws_msg = sock.receive_json()
+            assert ws_msg.get("type") == "changed"
+            assert ws_msg.get("areas") == ["tasks"]
+
+        # 7. Creation commands accept --short
+        res_micro = client.post("/api/tasks/micro", headers=headers, json={"title": "Test micro", "short_title": "quick fix"})
+        assert res_micro.status_code == 201
+
+        res_child = client.post("/api/tasks/T001/child", headers=headers, json={"title": "Test child", "short_title": "sub child", "expect_plan_hash": "mockhash"})
+        assert res_child.status_code == 200
+
+        res_q = client.post("/api/questions", headers=headers, json={"question": "Which db?", "short_title": "DB choice"})
+        assert res_q.status_code == 200
+
+        calls = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
+        micro_call = [c for c in calls if c[0] == "tasks" and c[1] == "micro"][-1]
+        assert "--short" in micro_call
+        assert micro_call[micro_call.index("--short") + 1] == "quick fix"
+
+        child_call = [c for c in calls if c[0] == "tasks" and c[1] == "child"][-1]
+        assert "--short" in child_call
+        assert child_call[child_call.index("--short") + 1] == "sub child"
+
+        q_call = [c for c in calls if c[0] == "questions" and c[1] == "ask"][-1]
+        assert "--short" in q_call
+        assert q_call[q_call.index("--short") + 1] == "DB choice"
+    finally:
+        state.workspace = old_ws
+
+
+
 

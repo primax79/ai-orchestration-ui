@@ -17,6 +17,7 @@ import {
   RunOptionsResponse,
   RunPreviewResponse,
   RunPreviewPayload,
+  shortTitle,
 } from '../types';
 import { api } from '../api';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
@@ -331,8 +332,12 @@ export const RunDialog: React.FC<RunDialogProps> = ({
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
               <Play size={20} color="#818cf8" />
               <div>
-                <h2 style={{ fontSize: '1.1rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
-                  {isNote ? 'Triage Note: ' : 'Run Task: '}<span style={{ color: '#818cf8' }}>{targetId}</span>
+                <h2 style={{ fontSize: '1.1rem', fontWeight: 600, color: '#f8fafc', margin: 0, display: 'flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
+                  <span>{isNote ? 'Triage Note: ' : 'Run Task: '}</span>
+                  <span style={{ color: '#818cf8' }}>{targetId}</span>
+                  <span style={{ fontSize: '0.85rem', color: '#94a3b8', fontWeight: 500 }}>
+                    ({shortTitle(isNote ? note : task)})
+                  </span>
                 </h2>
                 <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginTop: '0.15rem' }}>
                   {targetTitle}

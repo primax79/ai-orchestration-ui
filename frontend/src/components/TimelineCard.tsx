@@ -8,7 +8,7 @@ import {
   ChevronDown,
   ArrowUpRight,
 } from 'lucide-react';
-import { TaskGraphNode, TaskSize } from '../types';
+import { TaskGraphNode, TaskSize, shortTitle } from '../types';
 import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { PromoteDialog } from './PromoteDialog';
@@ -456,6 +456,20 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
         >
           {node.id}
         </button>
+        <span
+          style={{
+            fontSize: '0.75rem',
+            color: '#94a3b8',
+            fontWeight: 500,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            maxWidth: '140px',
+          }}
+          title={node.title}
+        >
+          ({shortTitle(node)})
+        </span>
 
         {/* Priority Chip with Popover Trigger */}
         <div style={{ position: 'relative' }}>
@@ -824,10 +838,15 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
                             opacity: isDisabled ? 0.6 : 1,
                           }}
                         >
-                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                            <span style={{ fontWeight: 700, color: isDisabled ? '#a8a29e' : '#38bdf8' }}>
-                              {cand.id}
-                            </span>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.4rem' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
+                              <span style={{ fontWeight: 700, color: isDisabled ? '#a8a29e' : '#38bdf8' }}>
+                                {cand.id}
+                              </span>
+                              <span style={{ fontSize: '0.7rem', color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                ({shortTitle(cand)})
+                              </span>
+                            </div>
                             {cycleInfo?.hasCycle && (
                               <span style={{ fontSize: '0.65rem', color: '#ef4444', display: 'flex', alignItems: 'center', gap: '0.15rem' }}>
                                 <AlertTriangle size={11} />

@@ -49,6 +49,8 @@ import {
   ApplyQuestionResponse,
   OrchestratorQueueResponse,
   NotificationsResponse,
+  SetShortTitlePayload,
+  SetShortTitleResponse,
 } from './types';
 
 // Custom ApiError to carry HTTP status and response payload
@@ -262,6 +264,26 @@ export const api = {
     return apiFetch('/api/tasks/sync-index', {
       method: 'POST',
       body: JSON.stringify({ expect_hash: expectHash }),
+    });
+  },
+
+  async previewSetShortTitle(taskId: string, payload: SetShortTitlePayload): Promise<SetShortTitleResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetShortTitleResponse>('previewSetShortTitle', { taskId, ...payload });
+    }
+    return apiFetch<SetShortTitleResponse>(`/api/tasks/${encodeURIComponent(taskId)}/short/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async setShortTitle(taskId: string, payload: SetShortTitlePayload): Promise<SetShortTitleResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetShortTitleResponse>('setShortTitle', { taskId, ...payload });
+    }
+    return apiFetch<SetShortTitleResponse>(`/api/tasks/${encodeURIComponent(taskId)}/short`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
     });
   },
 
@@ -1519,8 +1541,8 @@ Object.assign(api, answerAndResumeApi);
 // ---------------------------------------------------------------------------
 
 export interface TaskStructureApiExtensions {
-  previewAddChild(parentId: string, payload: { title: string; kind?: string }): Promise<StructureActionResponse>;
-  addChild(parentId: string, payload: { title: string; kind?: string; expect_plan_hash: string }): Promise<StructureActionResponse>;
+  previewAddChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string }): Promise<StructureActionResponse>;
+  addChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string; expect_plan_hash: string }): Promise<StructureActionResponse>;
   previewExpandTask(taskId: string): Promise<StructureActionResponse>;
   expandTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse>;
   previewCollapseTask(taskId: string): Promise<StructureActionResponse>;

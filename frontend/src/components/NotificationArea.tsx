@@ -10,7 +10,7 @@ import {
   X,
   Radio,
 } from 'lucide-react';
-import { NotificationItem, OrchestrationEvent } from '../types';
+import { NotificationItem, OrchestrationEvent, shortTitle } from '../types';
 import { api } from '../api';
 
 interface NotificationAreaProps {
@@ -323,8 +323,14 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
                         </span>
                       </div>
                       {n.subject && (
-                        <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '2px' }}>
-                          Subject: <span style={{ color: '#cbd5e1', fontWeight: 600 }}>{n.subject}</span>
+                        <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                          <span>Subject:</span>
+                          <span style={{ color: '#cbd5e1', fontWeight: 600 }}>{n.subject}</span>
+                          {(n.data?.short_title || n.data?.title) && (
+                            <span style={{ color: '#94a3b8', fontSize: '0.72rem' }} title={n.data.title || n.data.short_title}>
+                              ({shortTitle(n.data)})
+                            </span>
+                          )}
                         </div>
                       )}
                     </div>
@@ -404,7 +410,16 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
                             }}
                           >
                             <span style={{ color: '#818cf8', fontWeight: 600 }}>#{ev.seq}</span>
-                            {ev.subject && <span>{ev.subject}</span>}
+                            {ev.subject && (
+                              <span>
+                                {ev.subject}
+                                {(ev.data?.short_title || ev.data?.title) && (
+                                  <span style={{ color: '#64748b', marginLeft: '0.25rem' }}>
+                                    ({shortTitle(ev.data)})
+                                  </span>
+                                )}
+                              </span>
+                            )}
                             {ev.actor && <span style={{ color: '#64748b' }}>by {ev.actor}</span>}
                           </div>
                         </div>

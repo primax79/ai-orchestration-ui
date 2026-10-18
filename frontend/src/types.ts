@@ -25,6 +25,8 @@ export interface TaskItem {
   kind: 'emergent' | 'initiative_task' | string;
   id: string;
   title: string;
+  short_title?: string;
+  short_title_source?: 'field' | 'derived';
   category: string;
   priority: Priority;
   priority_reason?: string;
@@ -220,6 +222,8 @@ export interface QuestionAnswer {
 export interface QuestionItem {
   id: string;
   question: string;
+  short_title?: string;
+  short_title_source?: 'field' | 'derived';
   status: 'open' | 'answered' | 'withdrawn' | string;
   blocks: string;
   blocks_parsed?: [string, string][];
@@ -252,6 +256,8 @@ export interface QuestionListResponse {
 
 export interface AskQuestionPayload {
   question: string;
+  short_title?: string;
+  short?: string;
   context?: string;
   options?: Array<{ label: string; title: string; consequence?: string }>;
   recommended?: string;
@@ -454,6 +460,8 @@ export interface RunRecord {
 
 export interface ProposedTask {
   title: string;
+  short_title?: string;
+  short_title_source?: 'field' | 'derived';
   category: string;
   priority: Priority | string;
   priority_reason: string;
@@ -661,6 +669,8 @@ export type UseCaseVerificationType = 'automated-probe' | 'e2e' | 'code-audit' |
 export interface UseCaseItem {
   id: string;
   title: string;
+  short_title?: string;
+  short_title_source?: 'field' | 'derived';
   actor: string;
   status: UseCaseStatus;
   priority: Priority;
@@ -710,6 +720,8 @@ export interface TaskGraphNode {
   node_type?: string;
   kind?: string;
   title: string;
+  short_title?: string;
+  short_title_source?: 'field' | 'derived';
   group: string;
   state: TaskState;
   canonical_state?: string;
@@ -806,6 +818,30 @@ export interface SetDepsPayload {
   expect_hash?: string;
 }
 
+export interface SetShortTitlePayload {
+  short_title?: string;
+  short?: string;
+  expect_plan_hash?: string;
+  expect_task_hash?: string;
+  expect_hash?: string;
+  plan_hash?: string;
+  dry_run?: boolean;
+}
+
+export interface SetShortTitleResponse {
+  ok: boolean;
+  task_id?: string;
+  short_title?: string;
+  short_title_source?: 'field' | 'derived';
+  plan_hash?: string;
+  task_hash?: string;
+  hash?: string;
+  diff?: string;
+  dry_run?: boolean;
+  error?: string;
+  [key: string]: any;
+}
+
 // ---------------------------------------------------------------------------
 // Answer and Resume Types (Task 08.6)
 // ---------------------------------------------------------------------------
@@ -856,6 +892,8 @@ export interface TreeNode {
   kind?: string;
   id: string;
   title: string;
+  short_title?: string;
+  short_title_source?: 'field' | 'derived';
   parent: string | null;
   depth: number;
   node_type: 'initiative' | 'leaf' | 'container' | 'microtask' | string;
@@ -911,6 +949,8 @@ export interface StructureActionResponse {
 export interface AddChildPayload {
   parent?: string;
   title: string;
+  short_title?: string;
+  short?: string;
   kind?: string;
   expect_plan_hash?: string;
 }
@@ -948,6 +988,8 @@ export interface LabelsResponse {
 
 export interface CreateMicrotaskPayload {
   title: string;
+  short_title?: string;
+  short?: string;
   kind?: TaskKind | string;
   priority?: Priority | string;
   paths?: string;
@@ -1452,4 +1494,56 @@ export interface ProposedTaskEdits {
 export interface AcceptTriagePayload {
   edits?: Record<string | number, ProposedTaskEdits>;
 }
+
+/**
+ * Returns item.short_title if present, or derives a compact 3-4 word short title
+ * from title/question (dropping leading articles, stripping ids, backticks, parentheticals).
+ */
+export function shortTitle(
+  item?: { short_title?: string; title?: string; question?: string; id?: string } | string | null
+): string {
+  if (!item) return '';
+
+  if (typeof item === 'object' && item.short_title && item.short_title.trim()) {
+    return item.short_title.trim();
+  }
+
+  const raw = typeof item === 'string' ? item : item.title || item.question || '';
+  if (!raw || !raw.trim()) {
+    return typeof item === 'object' && item.id ? item.id : '';
+  }
+
+  // 1. Strip backticks
+  let text = raw.replace(/`/g, '');
+
+  // 2. Strip parentheticals like (UI), (Spec 15), (T025), etc.
+  text = text.replace(/\([^)]*\)/g, ' ');
+
+  // 3. Strip leading task/question IDs or tags (e.g. "T007:", "12.16 -", "Q006: ", "[T025]", "Task 01.1:")
+  text = text.replace(/^(\[?(?:[A-Za-z]\d+(?:\.\d+)*|\d+\.\d+|INIT-[A-Za-z0-9_-]+)\]?\s*[:-]?\s*)+/i, '');
+  text = text.replace(/^(?:Task|Question)\s+[A-Za-z0-9._-]+\s*[:-]?\s*/i, '');
+
+  // 4. Strip markdown headings or bullet prefixes
+  text = text.replace(/^[#\-*:]+\s*/, '');
+
+  // 5. Tokenize into words
+  const words = text.trim().split(/\s+/).filter(Boolean);
+
+  // 6. Drop leading articles ('a', 'an', 'the')
+  while (words.length > 0 && /^(a|an|the)$/i.test(words[0])) {
+    words.shift();
+  }
+
+  if (words.length === 0) {
+    const fallbackWords = raw.replace(/[`()]/g, '').trim().split(/\s+/).filter(Boolean);
+    return fallbackWords.slice(0, 4).join(' ');
+  }
+
+  // 7. Take first 3-4 significant words (up to 4 words)
+  const picked = words.slice(0, 4).join(' ');
+
+  // 8. Trim trailing punctuation
+  return picked.replace(/[,;:\-.]+$/, '').trim();
+}
+
 

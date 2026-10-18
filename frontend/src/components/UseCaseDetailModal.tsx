@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { X, Play, Loader2, CheckCircle2, AlertTriangle } from 'lucide-react';
-import { UseCaseItem } from '../types';
+import { UseCaseItem, shortTitle } from '../types';
 import { api } from '../api';
 
 interface UseCaseDetailModalProps {
@@ -72,6 +72,9 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
               <span style={{ fontSize: '0.75rem', fontWeight: 700, padding: '0.15rem 0.4rem', borderRadius: '0.25rem', backgroundColor: '#4f46e5', color: '#fff' }}>
                 {useCase.id}
+              </span>
+              <span style={{ fontSize: '0.8rem', color: '#94a3b8', fontWeight: 500 }} title={useCase.title}>
+                ({shortTitle(useCase)})
               </span>
               <span style={{
                 fontSize: '0.75rem',

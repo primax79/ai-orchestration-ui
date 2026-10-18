@@ -14,7 +14,7 @@ import {
   Eye,
   EyeOff,
 } from 'lucide-react';
-import { TaskItem, TaskListResponse, TaskState, SharedFilterState } from '../types';
+import { TaskItem, TaskListResponse, TaskState, SharedFilterState, shortTitle } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { TimelineView } from './TimelineView';
@@ -317,7 +317,23 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
             <KindBadge kind={t.kind} size={11} />
           ) : null}
         </div>
-        <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
+          <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8', flexShrink: 0 }}>{t.id}</span>
+          <span
+            style={{
+              fontSize: '0.68rem',
+              color: '#94a3b8',
+              fontWeight: 500,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              maxWidth: '120px',
+            }}
+            title={t.title}
+          >
+            ({shortTitle(t)})
+          </span>
+        </div>
       </div>
       <div style={{
         fontSize: '0.8rem',
@@ -570,7 +586,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                     e.currentTarget.style.backgroundColor = '#1e293b';
                   }}
                 >
-                  {/* ID + Micro + Kind */}
+                  {/* ID + Short Title + Micro + Kind */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}>
                     <span
                       style={{
@@ -582,6 +598,20 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                       }}
                     >
                       {t.id}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: '0.75rem',
+                        color: '#94a3b8',
+                        fontWeight: 500,
+                        maxWidth: '160px',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title={t.title}
+                    >
+                      ({shortTitle(t)})
                     </span>
                     {t.category === 'micro' && (
                       <span
