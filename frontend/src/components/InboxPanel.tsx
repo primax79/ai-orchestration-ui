@@ -33,6 +33,8 @@ import {
   InboxToTaskPayload,
   RunRecord,
   TriageProposal,
+  ProposedTask,
+  ProposedTaskEdits,
   AttachmentDetail,
 } from '../types';
 import { api, ApiError, microtaskAndLabelsApi } from '../api';
@@ -681,6 +683,481 @@ const ConvertToTaskDialog: React.FC<ConvertToTaskDialogProps> = ({
 };
 
 // ---------------------------------------------------------------------------
+// Proposed Task Card & Editing Helper (Task 09.10)
+// ---------------------------------------------------------------------------
+
+function computeDiff(
+  original: ProposedTask,
+  current: {
+    title: string;
+    category: string;
+    priority: string;
+    priority_reason: string;
+    goal: string;
+    stepsText: string;
+    verification: string;
+  }
+): ProposedTaskEdits | null {
+  const diff: ProposedTaskEdits = {};
+
+  if (current.title.trim() !== (original.title || '').trim()) {
+    diff.title = current.title.trim();
+  }
+  if (current.category.trim() !== (original.category || '').trim()) {
+    diff.category = current.category.trim();
+  }
+  if (current.priority.trim() !== (original.priority || 'P2').trim()) {
+    diff.priority = current.priority.trim();
+  }
+  const origReason = (original.priority_reason || (original as any)['priority-reason'] || '').trim();
+  if (current.priority_reason.trim() !== origReason) {
+    diff.priority_reason = current.priority_reason.trim();
+  }
+  if (current.goal.trim() !== (original.goal || '').trim()) {
+    diff.goal = current.goal.trim();
+  }
+
+  // Steps
+  const origStepsList: string[] = Array.isArray(original.steps)
+    ? original.steps.map((s: string) => String(s).trim()).filter(Boolean)
+    : original.steps
+    ? String(original.steps).split('\n').map((s: string) => s.trim()).filter(Boolean)
+    : [];
+  const curStepsList: string[] = current.stepsText
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const stepsChanged =
+    origStepsList.length !== curStepsList.length ||
+    origStepsList.some((s, i) => s !== curStepsList[i]);
+  if (stepsChanged) {
+    diff.steps = curStepsList;
+  }
+
+  // Verification
+  const origVer = (
+    Array.isArray(original.verification)
+      ? original.verification.join('\n')
+      : original.verification || ''
+  ).trim();
+  if (current.verification.trim() !== origVer) {
+    diff.verification = current.verification.trim();
+  }
+
+  return Object.keys(diff).length > 0 ? diff : null;
+}
+
+interface ProposedTaskCardProps {
+  task: ProposedTask;
+  index: number;
+  isAccepted: boolean;
+  onToggleAccept: () => void;
+  onEditsChange: (index: number, edits: ProposedTaskEdits | null) => void;
+}
+
+const ProposedTaskCard: React.FC<ProposedTaskCardProps> = ({
+  task,
+  index,
+  isAccepted,
+  onToggleAccept,
+  onEditsChange,
+}) => {
+  const [isEditing, setIsEditing] = useState(false);
+  const [title, setTitle] = useState(task.title || '');
+  const [category, setCategory] = useState(task.category || '');
+  const [priority, setPriority] = useState(task.priority || 'P2');
+  const [priorityReason, setPriorityReason] = useState(
+    task.priority_reason || (task as any)['priority-reason'] || ''
+  );
+  const [goal, setGoal] = useState(task.goal || '');
+
+  const getStepsText = (t: ProposedTask) => {
+    if (Array.isArray(t.steps)) return t.steps.join('\n');
+    return t.steps || '';
+  };
+  const getVerificationText = (t: ProposedTask) => {
+    if (Array.isArray(t.verification)) return t.verification.join('\n');
+    return t.verification || '';
+  };
+
+  const [stepsText, setStepsText] = useState(() => getStepsText(task));
+  const [verification, setVerification] = useState(() => getVerificationText(task));
+  const lastDiffRef = useRef<string>('');
+
+  useEffect(() => {
+    setTitle(task.title || '');
+    setCategory(task.category || '');
+    setPriority(task.priority || 'P2');
+    setPriorityReason(task.priority_reason || (task as any)['priority-reason'] || '');
+    setGoal(task.goal || '');
+    setStepsText(getStepsText(task));
+    setVerification(getVerificationText(task));
+    setIsEditing(false);
+    lastDiffRef.current = '';
+  }, [task]);
+
+  const diff = computeDiff(task, {
+    title,
+    category,
+    priority,
+    priority_reason: priorityReason,
+    goal,
+    stepsText,
+    verification,
+  });
+  const isEdited = diff !== null;
+
+  useEffect(() => {
+    const diffStr = JSON.stringify(diff);
+    if (diffStr !== lastDiffRef.current) {
+      lastDiffRef.current = diffStr;
+      onEditsChange(index, diff);
+    }
+  }, [diff, index, onEditsChange]);
+
+  const handleReset = () => {
+    setTitle(task.title || '');
+    setCategory(task.category || '');
+    setPriority(task.priority || 'P2');
+    setPriorityReason(task.priority_reason || (task as any)['priority-reason'] || '');
+    setGoal(task.goal || '');
+    setStepsText(getStepsText(task));
+    setVerification(getVerificationText(task));
+    lastDiffRef.current = '';
+    onEditsChange(index, null);
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%',
+    padding: '0.4rem 0.6rem',
+    backgroundColor: '#0f172a',
+    border: '1px solid #334155',
+    borderRadius: '0.375rem',
+    color: '#f8fafc',
+    fontSize: '0.85rem',
+    boxSizing: 'border-box',
+  };
+
+  const curStepsList: string[] = stepsText
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  return (
+    <div
+      style={{
+        padding: '0.85rem 1rem',
+        backgroundColor: isAccepted ? '#0f172a' : '#141c2e',
+        border: isAccepted ? '1px solid #334155' : '1px solid #1e293b',
+        borderRadius: '0.375rem',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.65rem',
+        opacity: isAccepted ? 1 : 0.65,
+        transition: 'opacity 0.15s ease',
+      }}
+    >
+      {/* Card Top: Checkbox, Title (or Editing label), Badges, Edit/Reset, Reject Toggle */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '0.5rem',
+          flexWrap: 'wrap',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flex: 1, minWidth: '220px' }}>
+          <input
+            type="checkbox"
+            checked={isAccepted}
+            onChange={onToggleAccept}
+            id={`pt-check-${index}`}
+            style={{ cursor: 'pointer', width: '16px', height: '16px', accentColor: '#4f46e5' }}
+          />
+          <label
+            htmlFor={`pt-check-${index}`}
+            style={{
+              fontSize: '0.9rem',
+              fontWeight: 600,
+              color: isAccepted ? '#f8fafc' : '#94a3b8',
+              cursor: 'pointer',
+              textDecoration: isAccepted ? 'none' : 'line-through',
+            }}
+          >
+            {title || '(No title)'}
+          </label>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+          {/* Edited badge */}
+          {isEdited && (
+            <span
+              className="proposal-edited-badge"
+              style={{
+                padding: '0.15rem 0.45rem',
+                borderRadius: '0.25rem',
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                backgroundColor: '#854d0e',
+                color: '#fef08a',
+                border: '1px solid #a16207',
+              }}
+            >
+              edited
+            </span>
+          )}
+
+          {/* Category badge */}
+          {!isEditing && category && (
+            <span
+              style={{
+                padding: '0.15rem 0.45rem',
+                borderRadius: '0.25rem',
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                backgroundColor: '#312e81',
+                color: '#c7d2fe',
+              }}
+            >
+              {category}
+            </span>
+          )}
+
+          {/* Priority + Reason */}
+          {!isEditing && (
+            <span
+              style={{
+                padding: '0.15rem 0.45rem',
+                borderRadius: '0.25rem',
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                backgroundColor: '#1e293b',
+                color: '#cbd5e1',
+                border: '1px solid #334155',
+              }}
+              title={priorityReason ? `Reason: ${priorityReason}` : undefined}
+            >
+              {priority}
+              {priorityReason ? ` (${priorityReason})` : ''}
+            </span>
+          )}
+
+          {/* Edit toggle button */}
+          <button
+            type="button"
+            onClick={() => setIsEditing(!isEditing)}
+            title={isEditing ? 'Close edit view' : 'Edit proposed task'}
+            style={{
+              padding: '0.2rem 0.5rem',
+              borderRadius: '0.25rem',
+              border: '1px solid #334155',
+              fontSize: '0.7rem',
+              fontWeight: 600,
+              cursor: 'pointer',
+              backgroundColor: isEditing ? '#312e81' : '#1e293b',
+              color: isEditing ? '#c7d2fe' : '#cbd5e1',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.25rem',
+            }}
+          >
+            <Edit3 size={11} />
+            {isEditing ? 'Done' : 'Edit'}
+          </button>
+
+          {/* Reset button */}
+          {isEdited && (
+            <button
+              type="button"
+              onClick={handleReset}
+              title="Reset changes to original proposal"
+              style={{
+                padding: '0.2rem 0.5rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #7f1d1d',
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                cursor: 'pointer',
+                backgroundColor: '#451a1a',
+                color: '#fca5a5',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.25rem',
+              }}
+            >
+              <RotateCcw size={11} />
+              Reset
+            </button>
+          )}
+
+          {/* Reject / Accept Toggle */}
+          <button
+            type="button"
+            onClick={onToggleAccept}
+            style={{
+              padding: '0.2rem 0.5rem',
+              borderRadius: '0.25rem',
+              border: 'none',
+              fontSize: '0.7rem',
+              fontWeight: 600,
+              cursor: 'pointer',
+              backgroundColor: isAccepted ? '#451a1a' : '#064e3b',
+              color: isAccepted ? '#fca5a5' : '#6ee7b7',
+            }}
+          >
+            {isAccepted ? 'Reject' : 'Accept'}
+          </button>
+        </div>
+      </div>
+
+      {/* Editing View */}
+      {isEditing ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', marginTop: '0.25rem' }}>
+          {/* Title */}
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+              Title *
+            </label>
+            <input
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Task title"
+              style={inputStyle}
+            />
+          </div>
+
+          {/* Category & Priority */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                Category *
+              </label>
+              <input
+                type="text"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                placeholder="e.g. bugfix, feature, general"
+                style={inputStyle}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                Priority *
+              </label>
+              <select
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                style={inputStyle}
+              >
+                <option value="P0">P0 (Urgent/Blocker)</option>
+                <option value="P1">P1 (High)</option>
+                <option value="P2">P2 (Normal)</option>
+                <option value="P3">P3 (Low)</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Priority Reason */}
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+              Priority Reason *
+            </label>
+            <input
+              type="text"
+              value={priorityReason}
+              onChange={(e) => setPriorityReason(e.target.value)}
+              placeholder="Why this priority was selected"
+              style={inputStyle}
+            />
+          </div>
+
+          {/* Goal */}
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+              Goal *
+            </label>
+            <textarea
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              rows={2}
+              placeholder="Goal of the task"
+              style={{ ...inputStyle, resize: 'vertical' }}
+            />
+          </div>
+
+          {/* Steps */}
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+              Steps (one per line) *
+            </label>
+            <textarea
+              value={stepsText}
+              onChange={(e) => setStepsText(e.target.value)}
+              rows={3}
+              placeholder="One step per line"
+              style={{ ...inputStyle, resize: 'vertical' }}
+            />
+          </div>
+
+          {/* Verification */}
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+              Verification *
+            </label>
+            <textarea
+              value={verification}
+              onChange={(e) => setVerification(e.target.value)}
+              rows={2}
+              placeholder="How to verify the changes"
+              style={{ ...inputStyle, resize: 'vertical' }}
+            />
+          </div>
+        </div>
+      ) : (
+        /* Read View */
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+          {/* Goal */}
+          {goal && (
+            <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
+              <span style={{ fontWeight: 600, color: '#94a3b8', marginRight: '0.35rem' }}>Goal:</span>
+              {goal}
+            </div>
+          )}
+
+          {/* Steps */}
+          {curStepsList.length > 0 && (
+            <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
+              <span style={{ fontWeight: 600, color: '#94a3b8' }}>Steps:</span>
+              <ol style={{ margin: '0.25rem 0 0 0', paddingLeft: '1.25rem' }}>
+                {curStepsList.map((step, sIdx) => (
+                  <li key={sIdx} style={{ marginBottom: '0.15rem' }}>
+                    {step}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+
+          {/* Verification */}
+          {verification && (
+            <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
+              <span style={{ fontWeight: 600, color: '#94a3b8', marginRight: '0.35rem' }}>
+                Verification:
+              </span>
+              {verification}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
 // Note Editor Modal
 // ---------------------------------------------------------------------------
 
@@ -731,6 +1208,26 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const [isAcceptingTriage, setIsAcceptingTriage] = useState(false);
   const [triageActionError, setTriageActionError] = useState<string | null>(null);
   const [triageSuccessTasks, setTriageSuccessTasks] = useState<string[]>([]);
+  const [triageEdits, setTriageEdits] = useState<Record<number, ProposedTaskEdits>>({});
+
+  const handleCardEditsChange = useCallback((idx: number, edits: ProposedTaskEdits | null) => {
+    setTriageEdits((prev) => {
+      const existing = prev[idx];
+      if (!edits && !existing) return prev;
+      if (edits && existing && JSON.stringify(edits) === JSON.stringify(existing)) return prev;
+      const next = { ...prev };
+      if (!edits || Object.keys(edits).length === 0) {
+        delete next[idx];
+      } else {
+        next[idx] = edits;
+      }
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    setTriageEdits({});
+  }, [selectedRunProposal?.runId]);
 
   // Dialogs for discard and mark processed
   const [showDiscardPrompt, setShowDiscardPrompt] = useState(false);
@@ -924,14 +1421,25 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     setTriageActionError(null);
     try {
       const sortedIndices = Array.from(selectedTaskIndices).sort((a, b) => a - b);
-      const res = await api.acceptTriage(selectedRunProposal.runId, {
+      const payloadEdits: Record<string, ProposedTaskEdits> = {};
+      for (const idx of sortedIndices) {
+        if (triageEdits[idx] && Object.keys(triageEdits[idx]).length > 0) {
+          payloadEdits[String(idx)] = triageEdits[idx];
+        }
+      }
+      const payload: any = {
         only: sortedIndices,
         expect_note_hash: currentHash,
-      });
+      };
+      if (Object.keys(payloadEdits).length > 0) {
+        payload.edits = payloadEdits;
+      }
+      const res = await api.acceptTriage(selectedRunProposal.runId, payload);
 
       if (res && res.tasks_created) {
         setTriageSuccessTasks(res.tasks_created);
         setCreatedTasks((prev) => Array.from(new Set([...prev, ...res.tasks_created])));
+        setTriageEdits({});
         await handleReloadConflict();
         await loadTriageRuns();
         onSaved();
@@ -2247,137 +2755,16 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
 
                     {/* Proposed Tasks Cards */}
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                      {selectedRunProposal.proposal.tasks.map((pt, idx) => {
-                        const isAccepted = selectedTaskIndices.has(idx);
-                        return (
-                          <div
-                            key={idx}
-                            style={{
-                              padding: '0.85rem 1rem',
-                              backgroundColor: isAccepted ? '#0f172a' : '#141c2e',
-                              border: isAccepted ? '1px solid #334155' : '1px solid #1e293b',
-                              borderRadius: '0.375rem',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              gap: '0.5rem',
-                              opacity: isAccepted ? 1 : 0.65,
-                              transition: 'opacity 0.15s ease',
-                            }}
-                          >
-                            {/* Card Top: Checkbox, Title, Badges, Reject Toggle */}
-                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem', flexWrap: 'wrap' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                                <input
-                                  type="checkbox"
-                                  checked={isAccepted}
-                                  onChange={() => toggleTaskAccept(idx)}
-                                  id={`pt-check-${idx}`}
-                                  style={{ cursor: 'pointer', width: '16px', height: '16px', accentColor: '#4f46e5' }}
-                                />
-                                <label
-                                  htmlFor={`pt-check-${idx}`}
-                                  style={{
-                                    fontSize: '0.9rem',
-                                    fontWeight: 600,
-                                    color: isAccepted ? '#f8fafc' : '#94a3b8',
-                                    cursor: 'pointer',
-                                    textDecoration: isAccepted ? 'none' : 'line-through',
-                                  }}
-                                >
-                                  {pt.title}
-                                </label>
-                              </div>
-
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                                {/* Category badge */}
-                                <span
-                                  style={{
-                                    padding: '0.15rem 0.45rem',
-                                    borderRadius: '0.25rem',
-                                    fontSize: '0.7rem',
-                                    fontWeight: 600,
-                                    backgroundColor: '#312e81',
-                                    color: '#c7d2fe',
-                                  }}
-                                >
-                                  {pt.category}
-                                </span>
-
-                                {/* Priority + Reason */}
-                                <span
-                                  style={{
-                                    padding: '0.15rem 0.45rem',
-                                    borderRadius: '0.25rem',
-                                    fontSize: '0.7rem',
-                                    fontWeight: 600,
-                                    backgroundColor: '#1e293b',
-                                    color: '#cbd5e1',
-                                    border: '1px solid #334155',
-                                  }}
-                                  title={pt.priority_reason ? `Reason: ${pt.priority_reason}` : undefined}
-                                >
-                                  {pt.priority}
-                                  {pt.priority_reason ? ` (${pt.priority_reason})` : ''}
-                                </span>
-
-                                {/* Reject / Accept Toggle */}
-                                <button
-                                  type="button"
-                                  onClick={() => toggleTaskAccept(idx)}
-                                  style={{
-                                    padding: '0.2rem 0.5rem',
-                                    borderRadius: '0.25rem',
-                                    border: 'none',
-                                    fontSize: '0.7rem',
-                                    fontWeight: 600,
-                                    cursor: 'pointer',
-                                    backgroundColor: isAccepted ? '#451a1a' : '#064e3b',
-                                    color: isAccepted ? '#fca5a5' : '#6ee7b7',
-                                  }}
-                                >
-                                  {isAccepted ? 'Reject' : 'Accept'}
-                                </button>
-                              </div>
-                            </div>
-
-                            {/* Goal */}
-                            {pt.goal && (
-                              <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
-                                <span style={{ fontWeight: 600, color: '#94a3b8', marginRight: '0.35rem' }}>Goal:</span>
-                                {pt.goal}
-                              </div>
-                            )}
-
-                            {/* Steps */}
-                            {pt.steps && (
-                              <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
-                                <span style={{ fontWeight: 600, color: '#94a3b8' }}>Steps:</span>
-                                {Array.isArray(pt.steps) ? (
-                                  <ol style={{ margin: '0.25rem 0 0 0', paddingLeft: '1.25rem' }}>
-                                    {pt.steps.map((step, sIdx) => (
-                                      <li key={sIdx} style={{ marginBottom: '0.15rem' }}>
-                                        {step}
-                                      </li>
-                                    ))}
-                                  </ol>
-                                ) : (
-                                  <div style={{ whiteSpace: 'pre-wrap', marginTop: '0.2rem' }}>{pt.steps}</div>
-                                )}
-                              </div>
-                            )}
-
-                            {/* Verification */}
-                            {pt.verification && (
-                              <div style={{ fontSize: '0.8rem', color: '#cbd5e1' }}>
-                                <span style={{ fontWeight: 600, color: '#94a3b8', marginRight: '0.35rem' }}>
-                                  Verification:
-                                </span>
-                                {pt.verification}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
+                      {selectedRunProposal.proposal.tasks.map((pt, idx) => (
+                        <ProposedTaskCard
+                          key={idx}
+                          task={pt}
+                          index={idx}
+                          isAccepted={selectedTaskIndices.has(idx)}
+                          onToggleAccept={() => toggleTaskAccept(idx)}
+                          onEditsChange={handleCardEditsChange}
+                        />
+                      ))}
                     </div>
 
                     {/* Updates (read-only) */}

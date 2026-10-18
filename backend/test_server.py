@@ -2346,6 +2346,152 @@ def test_runs_accept_triage_endpoint_and_broadcast(monkeypatch, tmp_path):
         state.workspace = old_ws
 
 
+def test_runs_accept_triage_with_edits(monkeypatch, tmp_path):
+    import server as srv
+
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+
+    valid_run_id = "20261017-150000-N001-kilo-abcd"
+    last_cmd: list[str] = []
+    cli_return_code = 0
+    cli_return_data: dict = {
+        "ok": True,
+        "run_id": valid_run_id,
+        "note_id": "N001",
+        "proposal_status": "accepted",
+        "tasks_created": ["T010"],
+    }
+    captured_edits_content = None
+    captured_edits_file_path = None
+
+    async def fake_run_ai_orch(cmd, timeout=None):
+        nonlocal last_cmd, captured_edits_content, captured_edits_file_path
+        last_cmd = list(cmd)
+        if "--edits-file" in cmd:
+            captured_edits_file_path = cmd[cmd.index("--edits-file") + 1]
+            p = pathlib.Path(captured_edits_file_path)
+            if p.is_file():
+                captured_edits_content = p.read_text(encoding="utf-8")
+        return cli_return_code, cli_return_data
+
+    monkeypatch.setattr(srv, "run_ai_orch", fake_run_ai_orch)
+
+    try:
+        # 1. No edits -> unchanged behavior, --edits-file not passed
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"only": [0]},
+        )
+        assert res.status_code == 200
+        assert "--edits-file" not in last_cmd
+        assert last_cmd[0:3] == ["run", "accept-triage", valid_run_id]
+
+        # 2. Unknown field refused with 400
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={
+                "only": [0],
+                "edits": {
+                    "0": {
+                        "title": "Valid title",
+                        "unknown_field": "bogus",
+                    }
+                },
+            },
+        )
+        assert res.status_code == 400
+        assert "Unknown field 'unknown_field'" in res.json().get("error", "")
+
+        # 3. Invalid edits types and indices
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"edits": "not-an-object"},
+        )
+        assert res.status_code == 400
+
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"edits": {"-1": {"title": "negative index"}}},
+        )
+        assert res.status_code == 400
+
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"edits": {"abc": {"title": "non-int index"}}},
+        )
+        assert res.status_code == 400
+
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"edits": {"0": "not-a-dict"}},
+        )
+        assert res.status_code == 400
+
+        # 4. Valid edits forwarded and written to temp file in workspace/.ai-orchestration/tmp/
+        expected_edits = {
+            "0": {
+                "title": "Edited Task Title",
+                "category": "cli",
+                "priority": "P1",
+                "priority_reason": "Urgent bug",
+                "goal": "Refactor CLI runner",
+                "steps": ["Step 1", "Step 2"],
+                "verification": "pytest backend",
+            }
+        }
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"only": [0], "edits": expected_edits},
+        )
+        assert res.status_code == 200
+        assert "--edits-file" in last_cmd
+        edits_path_arg = last_cmd[last_cmd.index("--edits-file") + 1]
+        assert str(state.workspace / ".ai-orchestration" / "tmp") in edits_path_arg
+        assert captured_edits_content is not None
+        assert json.loads(captured_edits_content) == expected_edits
+        # Assert temp file is deleted after the call in finally
+        assert not pathlib.Path(edits_path_arg).exists()
+
+        # 5. Engine errors mapped to 400
+        cli_return_code = 1
+        cli_return_data = {
+            "ok": False,
+            "reason": "invalid-edits-file",
+            "error": "Failed to parse edits file JSON",
+        }
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"edits": {"0": {"title": "T"}}},
+        )
+        assert res.status_code == 400
+        assert res.json().get("error") == "Failed to parse edits file JSON"
+
+        cli_return_data = {
+            "ok": False,
+            "reason": "invalid-edit",
+            "error": "Invalid priority 'P9' in edits for task index 0",
+        }
+        res = client.post(
+            f"/api/runs/{valid_run_id}/accept-triage",
+            headers=headers,
+            json={"edits": {"0": {"title": "T"}}},
+        )
+        assert res.status_code == 400
+        assert "Invalid priority" in res.json().get("error", "")
+
+    finally:
+        state.workspace = old_ws
 
 
 def make_test_pdf() -> bytes:

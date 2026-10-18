@@ -3392,6 +3392,19 @@ async def api_get_triage_proposal(request: Request) -> JSONResponse:
     })
 
 
+KNOWN_TRIAGE_EDIT_FIELDS = {
+    "title",
+    "category",
+    "priority",
+    "priority_reason",
+    "goal",
+    "steps",
+    "verification",
+    "kind",
+    "labels",
+}
+
+
 async def api_accept_triage_run(request: Request) -> JSONResponse:
     run_id = request.path_params["id"]
     if not RUN_ID_RE.match(run_id):
@@ -3411,20 +3424,78 @@ async def api_accept_triage_run(request: Request) -> JSONResponse:
     if expect_note_hash:
         cmd.extend(["--expect-note-hash", str(expect_note_hash).strip()])
 
-    code, data = await run_ai_orch(cmd)
-    if code != 0:
-        err_str = ""
-        if isinstance(data, dict):
-            err_str = str(data.get("error") or data.get("reason") or "").lower()
-        elif isinstance(data, str):
-            err_str = data.lower()
-        if "not found" in err_str or "not-found" in err_str:
-            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
-        status_code = map_cli_status(code, data)
-        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    edits = body.get("edits")
+    edits_file_path: str | None = None
+    if edits is not None:
+        if not isinstance(edits, dict):
+            return JSONResponse({"error": "edits must be a JSON object"}, status_code=400)
+        for raw_k, task_edits in edits.items():
+            try:
+                idx = int(raw_k)
+                if idx < 0:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                return JSONResponse(
+                    {"error": f"Invalid edit index {raw_k!r} (must be non-negative integer)"},
+                    status_code=400,
+                )
+            if not isinstance(task_edits, dict):
+                return JSONResponse(
+                    {"error": f"Edits for task index {raw_k} must be an object"},
+                    status_code=400,
+                )
+            for field in task_edits:
+                if field not in KNOWN_TRIAGE_EDIT_FIELDS:
+                    return JSONResponse(
+                        {"error": f"Unknown field {field!r} in edits for task index {raw_k}"},
+                        status_code=400,
+                    )
 
-    await state.broadcast({"type": "changed", "areas": ["inbox", "tasks"]})
-    return JSONResponse(data if isinstance(data, dict) else {"ok": True, "run_id": run_id, "proposal_status": "accepted"})
+        tmp_dir = state.workspace / ".ai-orchestration" / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            dir=str(tmp_dir),
+            delete=False,
+            encoding="utf-8",
+        ) as tf:
+            json.dump(edits, tf)
+            edits_file_path = tf.name
+        cmd.extend(["--edits-file", edits_file_path])
+
+    try:
+        code, data = await run_ai_orch(cmd)
+        if code != 0:
+            err_str = ""
+            reason = ""
+            if isinstance(data, dict):
+                err_str = str(data.get("error") or data.get("reason") or data.get("message") or "").lower()
+                reason = str(data.get("reason") or "").lower()
+            elif isinstance(data, str):
+                err_str = data.lower()
+            if (
+                reason in ("invalid-edits-file", "invalid-edit", "edits-file-not-found")
+                or "invalid-edits-file" in err_str
+                or "invalid-edit" in err_str
+                or "edits-file" in err_str
+            ):
+                return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=400)
+            if "not found" in err_str or "not-found" in err_str:
+                return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+            status_code = map_cli_status(code, data)
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+        await state.broadcast({"type": "changed", "areas": ["inbox", "tasks"]})
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True, "run_id": run_id, "proposal_status": "accepted"})
+    finally:
+        if edits_file_path:
+            try:
+                p = pathlib.Path(edits_file_path)
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
