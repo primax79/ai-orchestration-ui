@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Bot,
   Send,
@@ -12,7 +12,7 @@ import {
   Copy,
   Check,
   AlertTriangle,
-  Info,
+  AlertCircle,
   Loader2,
   RefreshCw,
   Zap,
@@ -25,13 +25,28 @@ import {
   OrchestratorTurn,
   ProposedAction,
 } from '../types';
-import { api, orchestratorChatApi } from '../api';
+import { api, orchestratorChatApi, proposedActionsApi } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { ConfirmDialog } from './ConfirmDialog';
 
 interface OrchestratorChatPanelProps {
   onNavigateTab?: (tab: string) => void;
 }
+
+const sortTurnsChronologically = (list: OrchestratorTurn[]): OrchestratorTurn[] => {
+  return [...list].sort((a, b) => {
+    const timeA = (a.created_at || (a as any).queued_at || (a as any).started_at || (a as any).ended_at || '').trim();
+    const timeB = (b.created_at || (b as any).queued_at || (b as any).started_at || (b as any).ended_at || '').trim();
+    if (timeA && timeB && timeA !== timeB) {
+      return timeA.localeCompare(timeB);
+    }
+    if (timeA && !timeB) return -1;
+    if (!timeA && timeB) return 1;
+    const seqA = typeof a.turn_seq === 'number' ? a.turn_seq : parseInt(String(a.turn_id).split('-')[0], 10) || 0;
+    const seqB = typeof b.turn_seq === 'number' ? b.turn_seq : parseInt(String(b.turn_id).split('-')[0], 10) || 0;
+    return seqA - seqB;
+  });
+};
 
 export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ onNavigateTab: _onNavigateTab }) => {
   const [status, setStatus] = useState<OrchestratorStatus | null>(null);
@@ -43,6 +58,10 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
   const [inputMessage, setInputMessage] = useState('');
   const [copiedSession, setCopiedSession] = useState(false);
   const [showProposedActions, setShowProposedActions] = useState(false);
+  const [confirmProposal, setConfirmProposal] = useState<ProposedAction | null>(null);
+  const [rejectProposal, setRejectProposal] = useState<ProposedAction | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+  const [proposalActionStatus, setProposalActionStatus] = useState<Record<string, { loading?: boolean; error?: string; success?: string }>>({});
   const [rotateDialogOpen, setRotateDialogOpen] = useState(false);
   const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
   const [turnToCancel, setTurnToCancel] = useState<string | null>(null);
@@ -61,7 +80,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
         api.getProposedActions(),
       ]);
       setStatus(stRes);
-      setTurns(convRes.turns || []);
+      setTurns(sortTurnsChronologically(convRes.turns || []));
       setProposedActions(propRes.proposed_actions || []);
     } catch {
       // Ignored on poll
@@ -145,7 +164,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
       prompt_text: trimmed,
       created_at: new Date().toISOString(),
     };
-    setTurns((prev) => [...prev, optimisticTurn]);
+    setTurns((prev) => sortTurnsChronologically([...prev, optimisticTurn]));
 
     try {
       await orchestratorChatApi.postOrchestratorChat(trimmed);
@@ -211,6 +230,73 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     }
   };
 
+  const handleConfirmProposal = async () => {
+    if (!confirmProposal) return;
+    const act = confirmProposal;
+    setProposalActionStatus((prev) => ({
+      ...prev,
+      [act.action_id]: { loading: true },
+    }));
+    try {
+      const res = await proposedActionsApi.confirmProposedAction(act.action_id, {
+        expect_hash: act.action_hash,
+      });
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          success: res.message || 'Action confirmed and executed successfully',
+        },
+      }));
+      setConfirmProposal(null);
+      const propRes = await api.getProposedActions();
+      setProposedActions(propRes.proposed_actions || []);
+    } catch (err: any) {
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          error: err.message || 'Failed to confirm action',
+        },
+      }));
+      setConfirmProposal(null);
+    }
+  };
+
+  const handleRejectProposal = async () => {
+    if (!rejectProposal || !rejectReason.trim()) return;
+    const act = rejectProposal;
+    setProposalActionStatus((prev) => ({
+      ...prev,
+      [act.action_id]: { loading: true },
+    }));
+    try {
+      const res = await proposedActionsApi.rejectProposedAction(act.action_id, {
+        reason: rejectReason.trim(),
+      });
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          success: res.message || 'Action rejected',
+        },
+      }));
+      setRejectProposal(null);
+      setRejectReason('');
+      const propRes = await api.getProposedActions();
+      setProposedActions(propRes.proposed_actions || []);
+    } catch (err: any) {
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          error: err.message || 'Failed to reject action',
+        },
+      }));
+      setRejectProposal(null);
+    }
+  };
+
   const copySessionId = () => {
     if (status?.session_id) {
       navigator.clipboard.writeText(status.session_id);
@@ -231,9 +317,15 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     contextBarColor = '#f59e0b'; // amber
   }
 
+  const pendingCount = useMemo(
+    () => proposedActions.filter((a) => a.status === 'pending' || a.status === 'pending_confirmation').length,
+    [proposedActions]
+  );
+  const sortedTurns = useMemo(() => sortTurnsChronologically(turns), [turns]);
+
   // Active running or queued turns
-  const runningTurn = turns.find((t) => t.state === 'running');
-  const queuedTurns = turns.filter((t) => t.state === 'queued' || t.state === 'claimed');
+  const runningTurn = sortedTurns.find((t) => t.state === 'running');
+  const queuedTurns = sortedTurns.filter((t) => t.state === 'queued' || t.state === 'claimed');
 
   return (
     <div
@@ -419,7 +511,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
               }}
             >
               <Zap size={14} />
-              <span>Proposals ({proposedActions.length})</span>
+              <span>Proposals ({pendingCount > 0 ? pendingCount : proposedActions.length})</span>
               {showProposedActions ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
             </button>
           )}
@@ -540,115 +632,184 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
             </span>
           </div>
 
-          <div
-            style={{
-              padding: '0.4rem 0.6rem',
-              backgroundColor: '#0f172a',
-              borderRadius: '0.375rem',
-              border: '1px solid #475569',
-              marginBottom: '0.6rem',
-              fontSize: '0.75rem',
-              color: '#94a3b8',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.4rem',
-            }}
-          >
-            <Info size={13} color="#38bdf8" />
-            <span>
-              Engine CLI confirm/reject commands not yet available (T024 in progress); proposed actions are displayed read-only.
-            </span>
-          </div>
-
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-            {proposedActions.map((act) => (
-              <div
-                key={act.action_id}
-                style={{
-                  padding: '0.65rem 0.85rem',
-                  backgroundColor: '#0f172a',
-                  borderRadius: '0.375rem',
-                  border: '1px solid #334155',
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  gap: '1rem',
-                }}
-              >
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.2rem' }}>
-                    <span
-                      style={{
-                        fontSize: '0.7rem',
-                        fontWeight: 600,
-                        padding: '0.1rem 0.35rem',
-                        borderRadius: '0.25rem',
-                        backgroundColor: '#3b82f6',
-                        color: '#fff',
-                        textTransform: 'uppercase',
-                      }}
-                    >
-                      {act.type}
-                    </span>
-                    <strong style={{ fontSize: '0.82rem', color: '#f8fafc' }}>{act.rule || act.action_id}</strong>
-                    <span style={{ fontSize: '0.7rem', color: '#64748b' }}>
-                      {new Date(act.created_at).toLocaleTimeString()}
-                    </span>
+            {proposedActions.map((act) => {
+              const isPending = act.status === 'pending' || act.status === 'pending_confirmation';
+              const statusItem = proposalActionStatus[act.action_id];
+              return (
+                <div
+                  key={act.action_id}
+                  style={{
+                    padding: '0.65rem 0.85rem',
+                    backgroundColor: '#0f172a',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #334155',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.4rem',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '1rem',
+                    }}
+                  >
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.2rem', flexWrap: 'wrap' }}>
+                        <span
+                          style={{
+                            fontSize: '0.7rem',
+                            fontWeight: 600,
+                            padding: '0.1rem 0.35rem',
+                            borderRadius: '0.25rem',
+                            backgroundColor: '#3b82f6',
+                            color: '#fff',
+                            textTransform: 'uppercase',
+                          }}
+                        >
+                          {act.type}
+                        </span>
+                        <strong style={{ fontSize: '0.82rem', color: '#f8fafc' }}>{act.rule || act.action_id}</strong>
+                        <span
+                          style={{
+                            fontSize: '0.7rem',
+                            fontWeight: 700,
+                            padding: '0.05rem 0.35rem',
+                            borderRadius: '4px',
+                            backgroundColor:
+                              act.status === 'confirmed'
+                                ? '#065f46'
+                                : act.status === 'rejected'
+                                ? '#4c0519'
+                                : '#fbbf2415',
+                            color:
+                              act.status === 'confirmed'
+                                ? '#34d399'
+                                : act.status === 'rejected'
+                                ? '#f43f5e'
+                                : '#fbbf24',
+                            border:
+                              act.status === 'confirmed'
+                                ? '1px solid #059669'
+                                : act.status === 'rejected'
+                                ? '1px solid #e11d48'
+                                : '1px solid #fbbf2430',
+                          }}
+                        >
+                          {act.status}
+                        </span>
+                        <span style={{ fontSize: '0.7rem', color: '#64748b' }}>
+                          {new Date(act.created_at).toLocaleTimeString()}
+                        </span>
+                        {act.run_id && (
+                          <span style={{ fontSize: '0.72rem', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                            Run: <code style={{ color: '#38bdf8' }}>{act.run_id}</code>
+                          </span>
+                        )}
+                      </div>
+                      {act.reason && (
+                        <div style={{ fontSize: '0.75rem', color: '#cbd5e1', marginBottom: '0.25rem' }}>
+                          {act.status === 'rejected' ? <strong style={{ color: '#fca5a5' }}>Rejection reason: </strong> : null}
+                          {act.reason}
+                        </div>
+                      )}
+                      {act.command && (
+                        <code style={{ fontSize: '0.72rem', color: '#818cf8', wordBreak: 'break-all', display: 'block' }}>
+                          {Array.isArray(act.command) ? act.command.join(' ') : String(act.command)}
+                        </code>
+                      )}
+                      {act.run_params && (
+                        <pre style={{ fontSize: '0.7rem', color: '#cbd5e1', margin: '0.2rem 0 0 0', padding: '0.3rem', backgroundColor: '#1e293b', borderRadius: '4px', overflowX: 'auto' }}>
+                          {JSON.stringify(act.run_params, null, 2)}
+                        </pre>
+                      )}
+                    </div>
+
+                    {/* Confirm/Reject Buttons or Status */}
+                    <div style={{ display: 'flex', gap: '0.4rem', flexShrink: 0, alignItems: 'center' }}>
+                      {isPending ? (
+                        <>
+                          <button
+                            onClick={() => setConfirmProposal(act)}
+                            disabled={statusItem?.loading}
+                            title="Confirm proposed action"
+                            style={{
+                              padding: '0.35rem 0.65rem',
+                              borderRadius: '0.375rem',
+                              border: '1px solid #059669',
+                              backgroundColor: '#065f46',
+                              color: '#34d399',
+                              fontSize: '0.75rem',
+                              fontWeight: 600,
+                              cursor: statusItem?.loading ? 'not-allowed' : 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.25rem',
+                            }}
+                          >
+                            <Check size={13} />
+                            Confirm
+                          </button>
+                          <button
+                            onClick={() => {
+                              setRejectProposal(act);
+                              setRejectReason('');
+                            }}
+                            disabled={statusItem?.loading}
+                            title="Reject proposed action"
+                            style={{
+                              padding: '0.35rem 0.65rem',
+                              borderRadius: '0.375rem',
+                              border: '1px solid #991b1b',
+                              backgroundColor: '#450a0a',
+                              color: '#f87171',
+                              fontSize: '0.75rem',
+                              fontWeight: 600,
+                              cursor: statusItem?.loading ? 'not-allowed' : 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.25rem',
+                            }}
+                          >
+                            <XCircle size={13} />
+                            Reject
+                          </button>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: '0.75rem', color: act.status === 'confirmed' ? '#34d399' : '#f87171', fontWeight: 600 }}>
+                          {act.status === 'confirmed' ? 'Confirmed' : 'Rejected'}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  {act.reason && (
-                    <div style={{ fontSize: '0.75rem', color: '#cbd5e1', marginBottom: '0.25rem' }}>
-                      {act.reason}
+
+                  {/* Inline results / errors */}
+                  {statusItem?.loading && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#38bdf8' }}>
+                      <Loader2 size={12} className="animate-spin" /> Processing...
                     </div>
                   )}
-                  {act.command && (
-                    <code style={{ fontSize: '0.72rem', color: '#818cf8', wordBreak: 'break-all' }}>
-                      {Array.isArray(act.command) ? act.command.join(' ') : String(act.command)}
-                    </code>
+                  {statusItem?.error && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#f87171' }}>
+                      <AlertCircle size={12} /> {statusItem.error}
+                    </div>
+                  )}
+                  {statusItem?.success && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#34d399' }}>
+                      <CheckCircle2 size={12} /> {statusItem.success}
+                    </div>
                   )}
                 </div>
-
-                {/* Confirm/Reject Buttons (Read-only as T024 is in progress) */}
-                <div style={{ display: 'flex', gap: '0.4rem', flexShrink: 0 }}>
-                  <button
-                    disabled
-                    title="Confirm command pending engine implementation (T024)"
-                    style={{
-                      padding: '0.35rem 0.65rem',
-                      borderRadius: '0.375rem',
-                      border: '1px solid #475569',
-                      backgroundColor: '#1e293b',
-                      color: '#64748b',
-                      fontSize: '0.75rem',
-                      fontWeight: 500,
-                      cursor: 'not-allowed',
-                    }}
-                  >
-                    Confirm
-                  </button>
-                  <button
-                    disabled
-                    title="Reject command pending engine implementation (T024)"
-                    style={{
-                      padding: '0.35rem 0.65rem',
-                      borderRadius: '0.375rem',
-                      border: '1px solid #475569',
-                      backgroundColor: '#1e293b',
-                      color: '#64748b',
-                      fontSize: '0.75rem',
-                      fontWeight: 500,
-                      cursor: 'not-allowed',
-                    }}
-                  >
-                    Reject
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
 
-      {/* 3. Conversation Message List */}
+      {/* 3. Messages List Area */}
       <div
         ref={messageListRef}
         onScroll={handleScroll}
@@ -662,7 +823,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
           position: 'relative',
         }}
       >
-        {turns.length === 0 ? (
+        {sortedTurns.length === 0 ? (
           <div
             style={{
               margin: 'auto',
@@ -695,7 +856,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
             </p>
           </div>
         ) : (
-          turns.map((turn, idx) => {
+          sortedTurns.map((turn, idx) => {
             const isOwner = turn.type === 'owner_chat';
             const isEventBatch = turn.type === 'event_batch';
             const isHandoff = turn.type === 'handoff';
@@ -1146,6 +1307,74 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
             setTurnToCancel(null);
           }}
         />
+      )}
+      {/* Confirm Proposal Dialog */}
+      {confirmProposal && (
+        <ConfirmDialog
+          isOpen={Boolean(confirmProposal)}
+          title={`Confirm Proposed Action: ${confirmProposal.action_id}`}
+          summary={
+            `Confirm and execute proposed action under trigger rules.\n\n` +
+            `* **Type:** \`${confirmProposal.type}\`\n` +
+            `* **Rule:** \`${confirmProposal.rule}\`\n` +
+            `* **Action Hash:** \`${confirmProposal.action_hash}\`\n` +
+            (confirmProposal.command
+              ? `\n**Command:**\n\`\`\`bash\n${Array.isArray(confirmProposal.command) ? confirmProposal.command.join(' ') : String(confirmProposal.command)}\n\`\`\`\n`
+              : '') +
+            (confirmProposal.run_params
+              ? `\n**Run Parameters:**\n\`\`\`json\n${JSON.stringify(confirmProposal.run_params, null, 2)}\n\`\`\`\n`
+              : '')
+          }
+          applyButtonText="Confirm & Execute"
+          cancelButtonText="Cancel"
+          hash={confirmProposal.action_hash}
+          onApply={handleConfirmProposal}
+          onCancel={() => setConfirmProposal(null)}
+        />
+      )}
+
+      {/* Reject Proposal Dialog */}
+      {rejectProposal && (
+        <ConfirmDialog
+          isOpen={Boolean(rejectProposal)}
+          title={`Reject Proposed Action: ${rejectProposal.action_id}`}
+          summary={`Reject proposed **${rejectProposal.type}** action (rule: **${rejectProposal.rule}**). A reason is required.`}
+          danger={true}
+          applyButtonText="Reject Action"
+          cancelButtonText="Cancel"
+          isApplyDisabled={!rejectReason.trim() || rejectReason.length > 1000}
+          onApply={handleRejectProposal}
+          onCancel={() => {
+            setRejectProposal(null);
+            setRejectReason('');
+          }}
+        >
+          <div style={{ marginTop: '0.75rem' }}>
+            <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.35rem' }}>
+              Reason for rejection <span style={{ color: '#ef4444' }}>*</span>
+            </label>
+            <textarea
+              value={rejectReason}
+              onChange={(e) => setRejectReason(e.target.value)}
+              placeholder="Enter reason for rejecting this proposal..."
+              rows={3}
+              style={{
+                width: '100%',
+                backgroundColor: '#0f172a',
+                border: '1px solid #475569',
+                borderRadius: '0.375rem',
+                color: '#f8fafc',
+                padding: '0.5rem',
+                fontSize: '0.8rem',
+                resize: 'vertical',
+                boxSizing: 'border-box',
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', fontSize: '0.7rem', color: '#64748b', marginTop: '0.2rem' }}>
+              {rejectReason.length}/1000
+            </div>
+          </div>
+        </ConfirmDialog>
       )}
     </div>
   );

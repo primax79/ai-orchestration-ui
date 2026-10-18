@@ -1837,6 +1837,37 @@ Object.assign(api, orchestratorChatApi);
 
 export const eventsAndTriggersApi = api;
 
+export const proposedActionsApi = {
+  async confirmProposedAction(
+    actionId: string,
+    payload: { expect_hash: string }
+  ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('confirmProposedAction', { actionId, ...payload });
+    }
+    return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async rejectProposedAction(
+    actionId: string,
+    payload: { reason: string }
+  ): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('rejectProposedAction', { actionId, ...payload });
+    }
+    return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/reject`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+};
+
+Object.assign(api, proposedActionsApi);
+
+
 
 
 
