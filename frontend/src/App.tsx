@@ -12,6 +12,7 @@ import { OrchestrationConfigurator } from './components/OrchestrationConfigurato
 import { UseCasesManager } from './components/UseCasesManager';
 import { TriggersPage } from './components/TriggersPage';
 import { EventStreamPanel } from './components/EventStreamPanel';
+import { OrchestratorChatPanel } from './components/OrchestratorChatPanel';
 import { api } from './api';
 import {
   WorkspaceInfo,
@@ -88,7 +89,7 @@ const PanelLoading: React.FC<{ label: string }> = ({ label }) => (
 );
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config'>('backlog');
+  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'orchestrator' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config'>('backlog');
 
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
 
@@ -399,6 +400,10 @@ export const App: React.FC = () => {
               }}
             />
           </div>
+        )}
+
+        {activeTab === 'orchestrator' && (
+          <OrchestratorChatPanel onNavigateTab={(tab) => setActiveTab(tab as any)} />
         )}
 
         {activeTab === 'use-cases' && (

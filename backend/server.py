@@ -287,6 +287,7 @@ _READ_ONLY_PREFIXES = {
     ("events", "tail"), ("events", "stats"),
     ("sessions", "list"), ("sessions", "show"), ("sessions", "role"),
     ("triggers", "list"), ("triggers", "status"), ("triggers", "history"),
+    ("orchestrator", "status"), ("orchestrator", "queue"), ("orchestrator", "hand-off"),
 }
 # Per event loop: asyncio primitives cannot be shared across loops (tests run several).
 _cli_semaphores: dict[int, asyncio.Semaphore] = {}
@@ -641,18 +642,18 @@ def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) ->
 
     ai_orch_dir = workspace / ".ai-orchestration"
     if ai_orch_dir.is_dir():
-        for sub in ("events.jsonl", "events_manifest.json", "manifest.json"):
+        for sub in ("events.jsonl", "events_manifest.json", "manifest.json", "orchestrator.json"):
             ef = ai_orch_dir / sub
             try:
                 if ef.is_file():
-                    mtimes[f"events:{ef}"] = ef.stat().st_mtime
+                    mtimes[f"orchestrator:{ef}" if sub == "orchestrator.json" else f"events:{ef}"] = ef.stat().st_mtime
             except OSError:
                 pass
         for sub_dir, area in (
             ("sessions", "sessions"),
             ("notifications", "notifications"),
             ("proposed_actions", "triggers"),
-            ("orchestrator", "queue"),
+            ("orchestrator", "orchestrator"),
         ):
             target_d = ai_orch_dir / sub_dir
             if target_d.is_dir():
@@ -706,8 +707,9 @@ async def _polling_watcher_loop() -> None:
                         changed_areas.add("triggers")
                     elif k.startswith("notifications:"):
                         changed_areas.add("notifications")
-                    elif k.startswith("queue:"):
+                    elif k.startswith("queue:") or k.startswith("orchestrator:"):
                         changed_areas.add("queue")
+                        changed_areas.add("orchestrator")
 
             if changed_areas:
                 await asyncio.sleep(0.3)
@@ -733,8 +735,9 @@ async def _polling_watcher_loop() -> None:
                             changed_areas.add("triggers")
                         elif k.startswith("notifications:"):
                             changed_areas.add("notifications")
-                        elif k.startswith("queue:"):
+                        elif k.startswith("queue:") or k.startswith("orchestrator:"):
                             changed_areas.add("queue")
+                            changed_areas.add("orchestrator")
                 last_snapshot = debounce_snapshot
                 await state.broadcast({"type": "changed", "areas": sorted(list(changed_areas))})
             else:
@@ -782,6 +785,7 @@ async def _watchfiles_watcher_loop() -> None:
                     areas.add("triggers")
                 if "orchestrator" in p.parts or "queue" in p.parts:
                     areas.add("queue")
+                    areas.add("orchestrator")
                 if "notifications" in p.parts:
                     areas.add("notifications")
         if areas:
@@ -4271,8 +4275,344 @@ async def api_toggle_trigger(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# REST Endpoints: Orchestrator Turn Queue & Notifications (Spec 12 §0, E6)
+# REST Endpoints: Orchestrator Role, Chat, Queue & Controls (Spec 12 §0, §0c E2-E6, E12)
 # ---------------------------------------------------------------------------
+
+def _read_partial_assistant_messages(turn_dir: pathlib.Path) -> list[str]:
+    """Extract streaming assistant text from turn directory if turn is in progress."""
+    chunks = sorted(turn_dir.glob("events.*.jsonl"))
+    if not chunks and (turn_dir / "events.jsonl").is_file():
+        chunks = [turn_dir / "events.jsonl"]
+    messages: list[str] = []
+    kilo_msg_index: dict[str, int] = {}
+    for chunk in chunks:
+        try:
+            text = chunk.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            typ = obj.get("type")
+            part = obj.get("part")
+            if typ == "text" and isinstance(part, dict) and part.get("type") == "text":
+                t = part.get("text")
+                if isinstance(t, str):
+                    mid = part.get("messageID")
+                    if isinstance(mid, str) and mid in kilo_msg_index:
+                        idx = kilo_msg_index[mid]
+                        messages[idx] = messages[idx] + "\n" + t if messages[idx] else t
+                    else:
+                        if isinstance(mid, str):
+                            kilo_msg_index[mid] = len(messages)
+                        messages.append(t)
+            elif typ == "item.completed" and isinstance(obj.get("item"), dict):
+                it = obj["item"]
+                if it.get("type") == "agent_message" and isinstance(it.get("text"), str):
+                    messages.append(it["text"])
+            elif obj.get("role") == "assistant":
+                content = obj.get("content") or obj.get("text")
+                if isinstance(content, str) and content.strip():
+                    messages.append(content)
+    return messages
+
+
+def _get_rotate_after_tokens(workspace: pathlib.Path) -> int:
+    """Read rotate_after_tokens setting from project or global config."""
+    for p in (workspace / ".ai-orchestration.local.toml", workspace / "orchestration.toml"):
+        if p.is_file():
+            try:
+                import tomllib
+                with open(p, "rb") as f:
+                    cfg = tomllib.load(f)
+                if "orchestrator" in cfg and "rotate_after_tokens" in cfg["orchestrator"]:
+                    return int(cfg["orchestrator"]["rotate_after_tokens"])
+            except Exception:
+                pass
+    return 150000
+
+
+async def api_get_orchestrator_status(request: Request) -> JSONResponse:
+    cmd = ["orchestrator", "status", "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+    if isinstance(data, dict):
+        data.setdefault("rotate_after_tokens", _get_rotate_after_tokens(state.workspace))
+        data.setdefault("ok", True)
+    return JSONResponse(data if isinstance(data, dict) else {"status": data}, status_code=200)
+
+
+async def api_post_orchestrator_chat(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    message = body.get("message")
+    if message is None or not str(message).strip():
+        return JSONResponse({"error": "message is required and must not be empty"}, status_code=400)
+
+    turn_type = str(body.get("type") or "owner_chat")
+    priority = str(body.get("priority") or "owner")
+
+    cmd = [
+        "orchestrator", "enqueue",
+        "--message", str(message).strip(),
+        "--type", turn_type,
+        "--priority", priority,
+        "--workspace", str(state.workspace),
+        "--json",
+    ]
+    if body.get("policy"):
+        cmd.extend(["--policy", str(body["policy"])])
+
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+    await state.check_and_push_events()
+    turn_rec = data.get("turn") if isinstance(data, dict) else None
+    await state.broadcast({"type": "turn_queued", "turn": turn_rec})
+    await state.broadcast({"type": "changed", "areas": ["orchestrator", "queue", "events"]})
+    return JSONResponse(data if isinstance(data, dict) else {"ok": True, "result": data}, status_code=200)
+
+
+async def api_get_orchestrator_conversation(request: Request) -> JSONResponse:
+    try:
+        limit = int(request.query_params.get("limit", 50))
+    except (ValueError, TypeError):
+        limit = 50
+    try:
+        offset = int(request.query_params.get("offset", 0))
+    except (ValueError, TypeError):
+        offset = 0
+    order = request.query_params.get("order", "asc").lower()
+
+    t_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "turns"
+    q_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "queue"
+
+    turns_by_id: dict[str, dict[str, Any]] = {}
+
+    # Read archived/completed turns
+    if t_dir.is_dir():
+        for d in t_dir.iterdir():
+            if d.is_dir() and not d.name.startswith("."):
+                t_json = d / "turn.json"
+                if t_json.is_file():
+                    try:
+                        rec = json.loads(t_json.read_text(encoding="utf-8"))
+                        turn_id = str(rec.get("turn_id") or d.name)
+                        assistant_msgs = rec.get("assistant_messages")
+                        if not assistant_msgs and rec.get("state") == "running":
+                            assistant_msgs = _read_partial_assistant_messages(d)
+                            rec["assistant_messages"] = assistant_msgs
+                        output = "\n\n".join(assistant_msgs) if isinstance(assistant_msgs, list) else str(assistant_msgs or "")
+                        rec.setdefault("output", output)
+                        turns_by_id[turn_id] = rec
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        p_file = d / "prompt.txt"
+                        prompt_text = p_file.read_text(encoding="utf-8") if p_file.is_file() else ""
+                        in_file = d / "input.json"
+                        in_data = json.loads(in_file.read_text(encoding="utf-8")) if in_file.is_file() else {}
+                        partial_msgs = _read_partial_assistant_messages(d)
+                        turns_by_id[d.name] = {
+                            "turn_id": d.name,
+                            "turn_seq": int(d.name.split("-")[0]) if d.name.split("-")[0].isdigit() else 0,
+                            "state": "running",
+                            "type": in_data.get("turn_type", "owner_chat"),
+                            "prompt_text": prompt_text,
+                            "message": in_data.get("prompt_text"),
+                            "output": "\n\n".join(partial_msgs),
+                            "assistant_messages": partial_msgs,
+                            "created_at": "",
+                        }
+                    except Exception:
+                        pass
+
+    # Read active queue items (queued or claimed or running)
+    if q_dir.is_dir():
+        for p in q_dir.glob("*.json"):
+            if p.is_file() and not p.name.startswith("."):
+                try:
+                    q_rec = json.loads(p.read_text(encoding="utf-8"))
+                    tid = str(q_rec.get("turn_id") or p.stem)
+                    if tid in turns_by_id:
+                        if q_rec.get("state") in ("running", "claimed", "queued") and turns_by_id[tid].get("state") != "done":
+                            turns_by_id[tid].update(q_rec)
+                            if not turns_by_id[tid].get("assistant_messages"):
+                                t_subdir = t_dir / tid
+                                if t_subdir.is_dir():
+                                    partial_msgs = _read_partial_assistant_messages(t_subdir)
+                                    turns_by_id[tid]["assistant_messages"] = partial_msgs
+                                    turns_by_id[tid]["output"] = "\n\n".join(partial_msgs)
+                    else:
+                        q_rec.setdefault("output", "")
+                        q_rec.setdefault("assistant_messages", [])
+                        t_subdir = t_dir / tid
+                        if t_subdir.is_dir():
+                            partial_msgs = _read_partial_assistant_messages(t_subdir)
+                            if partial_msgs:
+                                q_rec["assistant_messages"] = partial_msgs
+                                q_rec["output"] = "\n\n".join(partial_msgs)
+                        turns_by_id[tid] = q_rec
+                except Exception:
+                    pass
+
+    def get_sort_key(t: dict[str, Any]) -> int:
+        seq = t.get("turn_seq")
+        if isinstance(seq, int):
+            return seq
+        tid = str(t.get("turn_id", "0"))
+        try:
+            return int(tid.split("-")[0])
+        except ValueError:
+            return 0
+
+    all_turns = sorted(turns_by_id.values(), key=get_sort_key)
+    if order == "desc":
+        all_turns.reverse()
+
+    total_count = len(all_turns)
+    paged = all_turns[offset: offset + limit] if limit > 0 else all_turns[offset:]
+
+    return JSONResponse({
+        "ok": True,
+        "turns": paged,
+        "count": total_count,
+        "limit": limit,
+        "offset": offset,
+    }, status_code=200)
+
+
+async def api_get_orchestrator_turn(request: Request) -> JSONResponse:
+    turn_id = request.path_params.get("turn_id", "")
+    if not turn_id:
+        return JSONResponse({"error": "turn_id is required"}, status_code=400)
+
+    t_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "turns" / turn_id
+    q_file = state.workspace / ".ai-orchestration" / "orchestrator" / "queue" / f"{turn_id}.json"
+
+    turn_doc: dict[str, Any] | None = None
+    if (t_dir / "turn.json").is_file():
+        try:
+            turn_doc = json.loads((t_dir / "turn.json").read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    elif q_file.is_file():
+        try:
+            turn_doc = json.loads(q_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if not turn_doc:
+        return JSONResponse({"error": f"Turn {turn_id} not found"}, status_code=404)
+
+    prompt_file = t_dir / "prompt.txt"
+    if prompt_file.is_file() and "prompt_text" not in turn_doc:
+        turn_doc["prompt_text"] = prompt_file.read_text(encoding="utf-8")
+
+    assistant_msgs = turn_doc.get("assistant_messages")
+    if not assistant_msgs and t_dir.is_dir():
+        assistant_msgs = _read_partial_assistant_messages(t_dir)
+        turn_doc["assistant_messages"] = assistant_msgs
+    turn_doc.setdefault("output", "\n\n".join(assistant_msgs) if isinstance(assistant_msgs, list) else str(assistant_msgs or ""))
+
+    return JSONResponse({"ok": True, "turn": turn_doc}, status_code=200)
+
+
+async def api_pause_orchestrator(request: Request) -> JSONResponse:
+    cmd = ["orchestrator", "pause", "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.check_and_push_events()
+        await state.broadcast({"type": "orchestrator_paused", "result": data})
+        await state.broadcast({"type": "changed", "areas": ["orchestrator", "events"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_resume_orchestrator(request: Request) -> JSONResponse:
+    cmd = ["orchestrator", "resume", "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.check_and_push_events()
+        await state.broadcast({"type": "orchestrator_resumed", "result": data})
+        await state.broadcast({"type": "changed", "areas": ["orchestrator", "events"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_rotate_orchestrator(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = ["orchestrator", "rotate", "--workspace", str(state.workspace), "--json"]
+    if body.get("tool"):
+        cmd.extend(["--tool", str(body["tool"])])
+    if body.get("model"):
+        cmd.extend(["--model", str(body["model"])])
+    if body.get("reason"):
+        cmd.extend(["--reason", str(body["reason"])])
+    if body.get("no_handoff"):
+        cmd.append("--no-handoff")
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.check_and_push_events()
+        await state.broadcast({"type": "orchestrator_rotated", "result": data})
+        await state.broadcast({"type": "changed", "areas": ["orchestrator", "events", "sessions"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_cancel_orchestrator_turn(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    turn_id = request.path_params.get("turn_id") or body.get("turn_id") or request.query_params.get("turn_id")
+    if not turn_id:
+        return JSONResponse({"error": "turn_id is required"}, status_code=400)
+
+    cmd = ["orchestrator", "cancel", str(turn_id), "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.check_and_push_events()
+        await state.broadcast({"type": "turn_cancelled", "turn_id": str(turn_id)})
+        await state.broadcast({"type": "changed", "areas": ["orchestrator", "queue", "events"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_run_next_orchestrator_turn(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = ["orchestrator", "run-next", "--workspace", str(state.workspace), "--json"]
+    if body.get("timeout"):
+        cmd.extend(["--timeout", str(body["timeout"])])
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.check_and_push_events()
+        await state.broadcast({"type": "changed", "areas": ["orchestrator", "queue", "events"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
 
 async def api_list_orchestrator_queue(request: Request) -> JSONResponse:
     q_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "queue"
@@ -4531,6 +4871,18 @@ routes = [
     Route("/api/triggers/proposed-actions", api_list_proposed_actions, methods=["GET"]),
     Route("/api/triggers/proposed-actions/{action_id}/confirm", api_confirm_proposed_action, methods=["POST"]),
     Route("/api/triggers/proposed-actions/{action_id}/reject", api_reject_proposed_action, methods=["POST"]),
+    Route("/api/orchestrator/status", api_get_orchestrator_status, methods=["GET"]),
+    Route("/api/orchestrator/chat", api_post_orchestrator_chat, methods=["POST"]),
+    Route("/api/orchestrator/enqueue", api_post_orchestrator_chat, methods=["POST"]),
+    Route("/api/orchestrator/conversation", api_get_orchestrator_conversation, methods=["GET"]),
+    Route("/api/orchestrator/turns", api_get_orchestrator_conversation, methods=["GET"]),
+    Route("/api/orchestrator/turns/{turn_id}", api_get_orchestrator_turn, methods=["GET"]),
+    Route("/api/orchestrator/pause", api_pause_orchestrator, methods=["POST"]),
+    Route("/api/orchestrator/resume", api_resume_orchestrator, methods=["POST"]),
+    Route("/api/orchestrator/rotate", api_rotate_orchestrator, methods=["POST"]),
+    Route("/api/orchestrator/cancel", api_cancel_orchestrator_turn, methods=["POST"]),
+    Route("/api/orchestrator/cancel/{turn_id}", api_cancel_orchestrator_turn, methods=["POST"]),
+    Route("/api/orchestrator/run-next", api_run_next_orchestrator_turn, methods=["POST"]),
     Route("/api/orchestrator/queue", api_list_orchestrator_queue, methods=["GET"]),
     Route("/api/notifications", api_list_notifications, methods=["GET"]),
     Route("/api/notifications/{id}/read", api_mark_notification_read, methods=["POST"]),

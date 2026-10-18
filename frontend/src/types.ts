@@ -1229,6 +1229,83 @@ export interface NotificationsResponse {
   unread_count: number;
 }
 
+// ---------------------------------------------------------------------------
+// Orchestrator Chat & Role Types (Task 12.8)
+// ---------------------------------------------------------------------------
+
+export interface OrchestratorUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read?: number;
+  cache_write?: number;
+  estimated_context_tokens?: number;
+  cost_usd?: number;
+}
+
+export interface OrchestratorStatus {
+  role: string;
+  generation: number;
+  status: 'active' | 'paused' | 'rotating' | string;
+  session_id?: string | null;
+  provider_session_id?: string | null;
+  tool?: string | null;
+  model?: string | null;
+  cursor?: number;
+  turns?: number;
+  last_usage?: OrchestratorUsage | null;
+  consecutive_owner_turns?: number;
+  consecutive_turn_failures?: number;
+  fencing_token?: string | null;
+  queue?: {
+    total: number;
+    queued: number;
+    running: number;
+  };
+  rotate_after_tokens?: number;
+  ok?: boolean;
+}
+
+export interface OrchestratorTurn {
+  turn_id: string;
+  turn_seq: number;
+  role?: string;
+  type: 'owner_chat' | 'event_batch' | 'handoff' | string;
+  state: 'queued' | 'claimed' | 'running' | 'done' | 'failed' | 'dead' | 'cancelled' | string;
+  policy?: string;
+  priority?: string;
+  message?: string | null;
+  prompt_text?: string | null;
+  assistant_messages?: string[];
+  output?: string;
+  usage?: OrchestratorUsage | null;
+  duration_seconds?: number;
+  created_at?: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+  error?: string | null;
+  events?: any[];
+  bound_exceeded?: string;
+  trigger_rule?: string;
+}
+
+export interface OrchestratorConversationResponse {
+  ok: boolean;
+  turns: OrchestratorTurn[];
+  count: number;
+  limit: number;
+  offset: number;
+}
+
+export interface PostChatResponse {
+  ok: boolean;
+  status: string;
+  turn_id?: string;
+  turn_seq?: number;
+  turn?: OrchestratorTurn;
+  error?: string;
+}
+
+
 
 
 
