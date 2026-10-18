@@ -1423,73 +1423,8 @@ async def _handle_child_add(request: Request, is_preview: bool = False) -> JSONR
                     data["summary"] = f"Add child task {alloc_id} under {parent_id}" if alloc_id else f"Add child task under {parent_id}"
         return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
 
-    err_msg = str(data.get("error", "") if isinstance(data, dict) else data)
-    if "child add under the file/folder leaf" in err_msg:
-        cands = list(tasks_dir.glob(f"*/{parent_id}-*/README.md")) + list(tasks_dir.glob(f"*/{parent_id}/README.md"))
-        cands += list(tasks_dir.glob(f"done/*/{parent_id}-*/README.md")) + list(tasks_dir.glob(f"done/*/{parent_id}/README.md"))
-        if cands:
-            readme_file = cands[0]
-            text = readme_file.read_text(encoding="utf-8")
-            state_m = re.search(r"^-\s+(?:state|status):\s*([a-z ]+)", text, re.MULTILINE | re.IGNORECASE)
-            leaf_state = state_m.group(1).strip().lower() if state_m else "open"
-            if leaf_state != "open":
-                return JSONResponse({"error": f"Cannot add child to in-flight leaf {parent_id!r} in state {leaf_state!r}. Leaf must be in state 'open'."}, status_code=400)
-
-            existing_nums = [int(m.group(1)) for m in re.finditer(rf"^###\s+{re.escape(parent_id)}\.(\d+)\b", text, re.MULTILINE)]
-            next_num = max(existing_nums) + 1 if existing_nums else 1
-            alloc_id = f"{parent_id}.{next_num}"
-
-            before_hash = hashlib.sha256(readme_file.read_bytes()).hexdigest()
-            rel_path = str(readme_file.relative_to(tasks_dir))
-            plan = [{"action": "modify", "before_hash": before_hash, "path": rel_path}]
-            plan_hash = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-            if is_preview:
-                return JSONResponse({
-                    "ok": True,
-                    "dry_run": True,
-                    "allocated_id": alloc_id,
-                    "plan": plan,
-                    "plan_hash": plan_hash,
-                    "hash": plan_hash,
-                    "summary": f"Add child task {alloc_id} under {parent_id}",
-                }, status_code=200)
-            else:
-                expect_plan_hash = (
-                    body.get("expect_plan_hash")
-                    or body.get("expect_hash")
-                    or body.get("plan_hash")
-                    or request.query_params.get("expect_plan_hash")
-                    or request.query_params.get("expect_hash")
-                    or request.headers.get("x-expect-plan-hash")
-                )
-                if not expect_plan_hash:
-                    return JSONResponse({"error": "expect_plan_hash is required on apply"}, status_code=400)
-                if expect_plan_hash != plan_hash:
-                    return JSONResponse({"error": f"Plan hash mismatch: expected {expect_plan_hash}, but recomputed {plan_hash}"}, status_code=409)
-
-                lines = text.splitlines()
-                filtered_lines = [ln for ln in lines if not re.match(r"^-\s+(?:state|status):\s*", ln, re.IGNORECASE)]
-                new_text = "\n".join(filtered_lines)
-
-                child_block = (
-                    f"\n### {alloc_id} - {title}\n\n"
-                    f"- **Status:** `open` · **Kind:** {kind}\n"
-                    f"- **Goal:** {title}\n"
-                )
-                if "## Subtasks" in new_text:
-                    closed_m = re.search(r"^##\s+Closed\b", new_text, re.MULTILINE)
-                    if closed_m:
-                        new_text = new_text[:closed_m.start()] + child_block + "\n" + new_text[closed_m.start():]
-                    else:
-                        new_text = new_text.rstrip() + "\n" + child_block
-                else:
-                    new_text = new_text.rstrip() + f"\n\n## Subtasks\n{child_block}"
-
-                readme_file.write_text(new_text, encoding="utf-8")
-                await state.broadcast({"type": "changed", "areas": ["tasks"]})
-                return JSONResponse({"ok": True, "allocated_id": alloc_id, "plan_hash": plan_hash}, status_code=200)
-
+    # No fallback that edits task files here: every task write goes through the engine
+    # (lock, hashes, events). The engine supports children of T### since 11.6.
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
