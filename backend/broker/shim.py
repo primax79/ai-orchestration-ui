@@ -194,8 +194,17 @@ async def dispatch_request(method: str, params: dict[str, Any], config_dir: path
             raise
 
 
+def _drop_nulls(value: Any) -> Any:
+    """Strict MCP clients (Claude Code) reject explicit nulls for optional fields: omit them instead."""
+    if isinstance(value, dict):
+        return {k: _drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_nulls(v) for v in value]
+    return value
+
+
 def write_jsonrpc_response(payload: dict[str, Any]) -> None:
-    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    line = json.dumps(_drop_nulls(payload), ensure_ascii=False) + "\n"
     sys.stdout.write(line)
     sys.stdout.flush()
 
