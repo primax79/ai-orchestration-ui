@@ -13,6 +13,8 @@ import {
   RotateCcw,
   FolderPlus,
   Loader2,
+  ArrowUpRight,
+  Tag,
 } from 'lucide-react';
 import {
   TaskItem,
@@ -21,9 +23,14 @@ import {
   TreeNode,
   Priority,
   StructurePlanItem,
+  SharedFilterState,
 } from '../types';
 import { taskStructureApi } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
+import { KindBadge } from './KindBadge';
+import { LabelList } from './LabelChip';
+import { PromoteDialog } from './PromoteDialog';
+import { matchTaskFilters } from './SharedFilterBar';
 
 const TREE_EXPANDED_KEY = 'ai-orch:tree-expanded-nodes';
 
@@ -112,6 +119,7 @@ interface TaskTreeViewProps {
   onVisibleStatesChange: (states: TaskState[]) => void;
   onSelectTask: (task: TaskItem) => void;
   onRefresh: () => void;
+  sharedFilters?: SharedFilterState;
 }
 
 export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
@@ -120,9 +128,15 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
   onVisibleStatesChange,
   onSelectTask,
   onRefresh,
+  sharedFilters,
 }) => {
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>(getStoredExpanded);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [promoteTargetTask, setPromoteTargetTask] = useState<{ id: string; title: string } | null>(null);
+  const [localGroupByLabel, setLocalGroupByLabel] = useState(false);
+  const [expandedLabelGroups, setExpandedLabelGroups] = useState<Record<string, boolean>>({});
+
+  const isGroupingByLabel = sharedFilters?.groupByLabel ?? localGroupByLabel;
 
   // Structure action dialog states
   const [addChildParent, setAddChildParent] = useState<TreeNode | null>(null);
@@ -188,7 +202,9 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
       if (!node) return false;
 
       if (node.is_leaf) {
-        return visibleStates.includes(node.state as TaskState);
+        if (!visibleStates.includes(node.state as TaskState)) return false;
+        if (sharedFilters && !matchTaskFilters(node, { ...sharedFilters, groupByLabel: false })) return false;
+        return true;
       }
 
       // Container: visible if any child is visible
@@ -236,6 +252,29 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
 
     return { initiativeRoots: initRoots, emergentCategories: emergentByCat };
   }, [treeMap]);
+
+  // Tasks grouped by label
+  const tasksByLabel = useMemo(() => {
+    const map: Record<string, TaskItem[]> = {};
+    const all = data?.all_tasks || data?.emergent_tasks || [];
+    all.forEach((task) => {
+      if (sharedFilters && !matchTaskFilters(task, { ...sharedFilters, groupByLabel: false })) {
+        return;
+      }
+      if (!visibleStates.includes(task.state as TaskState)) {
+        return;
+      }
+      const labels = task.labels && task.labels.length > 0 ? task.labels : ['(no label)'];
+      labels.forEach((lbl) => {
+        if (!map[lbl]) map[lbl] = [];
+        map[lbl].push(task);
+      });
+    });
+    for (const k of Object.keys(map)) {
+      map[k].sort((a, b) => a.id.localeCompare(b.id));
+    }
+    return map;
+  }, [data, sharedFilters, visibleStates]);
 
   // Toggle node expansion
   const toggleExpand = useCallback((nodeId: string, e?: React.MouseEvent) => {
@@ -615,6 +654,26 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
             {node.id}
           </span>
 
+          {/* Microtag & KindBadge */}
+          {node.category === 'micro' && (
+            <span
+              style={{
+                fontSize: '0.62rem',
+                fontWeight: 700,
+                backgroundColor: '#27272a',
+                color: '#a1a1aa',
+                padding: '0.05rem 0.25rem',
+                borderRadius: '0.2rem',
+                textTransform: 'uppercase',
+              }}
+            >
+              micro
+            </span>
+          )}
+          {node.kind && (
+            <KindBadge kind={node.kind} size={11} />
+          )}
+
           {/* Title */}
           <span
             style={{
@@ -630,6 +689,11 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
           >
             {node.title}
           </span>
+
+          {/* Labels */}
+          {node.labels && node.labels.length > 0 && (
+            <LabelList labels={node.labels} maxVisible={2} size="xs" />
+          )}
 
           {/* Progress bar for containers */}
           {isContainer && (
@@ -764,6 +828,33 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
                 title="Collapse folder back into block"
               >
                 Collapse
+              </button>
+            )}
+
+            {node.category === 'micro' && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPromoteTargetTask({ id: node.id, title: node.title });
+                }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.2rem',
+                  fontSize: '0.7rem',
+                  padding: '0.15rem 0.4rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #4f46e5',
+                  backgroundColor: 'rgba(99, 102, 241, 0.2)',
+                  color: '#c7d2fe',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                }}
+                title="Promote microtask to full task"
+              >
+                <ArrowUpRight size={11} />
+                <span>Promote</span>
               </button>
             )}
 
@@ -912,6 +1003,28 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
               {preset.label}
             </button>
           ))}
+
+          <button
+            type="button"
+            onClick={() => setLocalGroupByLabel((v) => !v)}
+            style={{
+              fontSize: '0.72rem',
+              padding: '0.15rem 0.5rem',
+              borderRadius: '0.25rem',
+              border: `1px solid ${isGroupingByLabel ? '#a855f7' : '#334155'}`,
+              backgroundColor: isGroupingByLabel ? 'rgba(168, 85, 247, 0.2)' : '#0f172a',
+              color: isGroupingByLabel ? '#f3e8ff' : '#cbd5e1',
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.25rem',
+              fontWeight: isGroupingByLabel ? 600 : 500,
+            }}
+            title="Group tasks by label headers"
+          >
+            <Tag size={12} color={isGroupingByLabel ? '#c084fc' : '#94a3b8'} />
+            <span>Group by Label</span>
+          </button>
         </div>
 
         {/* Global Expand/Collapse & Counts */}
@@ -963,8 +1076,8 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         </div>
       </div>
 
-      {/* Planned Initiatives Section */}
-      {initiativeRoots.length > 0 && (
+      {/* Body: Group by Label or Standard Hierarchical View */}
+      {isGroupingByLabel ? (
         <div
           style={{
             backgroundColor: '#1e293b',
@@ -975,86 +1088,323 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         >
           <div
             style={{
-              padding: '0.75rem 1rem',
+              padding: '0.6rem 0.85rem',
               backgroundColor: '#0f172a',
               borderBottom: '1px solid #334155',
               display: 'flex',
               alignItems: 'center',
-              gap: '0.5rem',
+              gap: '0.4rem',
             }}
           >
-            <Layers size={17} color="#818cf8" />
-            <h3 style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
-              Planned Initiatives
-            </h3>
-            <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: 'auto' }}>
-              {initiativeRoots.filter((r) => isNodeVisible(r.id)).length} initiative(s) visible
+            <Tag size={16} color="#c084fc" />
+            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#f8fafc' }}>
+              Tasks Grouped by Label ({Object.keys(tasksByLabel).length} labels)
             </span>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column' }}>
-            {initiativeRoots.map((init) => renderNode(init.id, 0))}
+            {Object.keys(tasksByLabel).length === 0 ? (
+              <div style={{ padding: '2rem 1rem', textAlign: 'center', color: '#64748b', fontSize: '0.85rem' }}>
+                No tasks match current filters.
+              </div>
+            ) : (
+              Object.keys(tasksByLabel)
+                .sort()
+                .map((labelName) => {
+                  const groupTasks = tasksByLabel[labelName];
+                  const isExpanded = expandedLabelGroups[labelName] !== false;
+
+                  return (
+                    <div key={labelName} style={{ borderBottom: '1px solid #334155' }}>
+                      <div
+                        onClick={() =>
+                          setExpandedLabelGroups((prev) => ({
+                            ...prev,
+                            [labelName]: !isExpanded,
+                          }))
+                        }
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.5rem',
+                          padding: '0.55rem 0.85rem',
+                          backgroundColor: '#0f172a',
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                        }}
+                      >
+                        {isExpanded ? (
+                          <ChevronDown size={15} color="#94a3b8" />
+                        ) : (
+                          <ChevronRight size={15} color="#94a3b8" />
+                        )}
+                        <Tag size={14} color="#818cf8" />
+                        <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f8fafc' }}>
+                          {labelName}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: '0.7rem',
+                            fontWeight: 700,
+                            backgroundColor: '#1e293b',
+                            color: '#94a3b8',
+                            padding: '0.05rem 0.4rem',
+                            borderRadius: '999px',
+                          }}
+                        >
+                          {groupTasks.length}
+                        </span>
+                      </div>
+
+                      {isExpanded && (
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          {groupTasks.map((t) => {
+                            const isMicro = t.category === 'micro' || t.size === 'XS';
+                            return (
+                              <div
+                                key={t.id}
+                                onClick={() => onSelectTask(t)}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '0.6rem',
+                                  padding: '0.5rem 0.85rem 0.5rem 2.25rem',
+                                  borderTop: '1px solid #1e293b',
+                                  backgroundColor: '#1e293b',
+                                  cursor: 'pointer',
+                                  transition: 'background-color 0.15s ease',
+                                }}
+                                onMouseEnter={(e) =>
+                                  (e.currentTarget.style.backgroundColor = '#27354f')
+                                }
+                                onMouseLeave={(e) =>
+                                  (e.currentTarget.style.backgroundColor = '#1e293b')
+                                }
+                              >
+                                <span
+                                  style={{
+                                    fontSize: '0.8rem',
+                                    fontWeight: 700,
+                                    color: '#38bdf8',
+                                    fontFamily: 'monospace',
+                                    minWidth: '3.5rem',
+                                  }}
+                                >
+                                  {t.id}
+                                </span>
+                                {isMicro && (
+                                  <span
+                                    style={{
+                                      fontSize: '0.6rem',
+                                      fontWeight: 700,
+                                      backgroundColor: '#27272a',
+                                      color: '#a1a1aa',
+                                      padding: '0.05rem 0.25rem',
+                                      borderRadius: '0.2rem',
+                                      textTransform: 'uppercase',
+                                    }}
+                                  >
+                                    micro
+                                  </span>
+                                )}
+                                {t.fields?.kind?.value ? (
+                                  <KindBadge kind={String(t.fields.kind.value)} size={11} />
+                                ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' ? (
+                                  <KindBadge kind={t.kind} size={11} />
+                                ) : null}
+                                <span
+                                  style={{
+                                    fontSize: '0.85rem',
+                                    color: '#f8fafc',
+                                    flex: 1,
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                  title={t.title}
+                                >
+                                  {t.title}
+                                </span>
+                                {t.labels && t.labels.length > 0 && (
+                                  <LabelList labels={t.labels} maxVisible={2} size="xs" />
+                                )}
+                                <span
+                                  style={{
+                                    fontSize: '0.68rem',
+                                    fontWeight: 700,
+                                    padding: '0.1rem 0.35rem',
+                                    borderRadius: '0.2rem',
+                                    backgroundColor:
+                                      t.priority === 'P0'
+                                        ? '#ef4444'
+                                        : t.priority === 'P1'
+                                        ? '#f59e0b'
+                                        : '#64748b',
+                                    color: '#fff',
+                                  }}
+                                >
+                                  {t.priority}
+                                </span>
+                                {t.size && (
+                                  <span
+                                    style={{
+                                      fontSize: '0.68rem',
+                                      fontWeight: 600,
+                                      padding: '0.1rem 0.35rem',
+                                      borderRadius: '0.2rem',
+                                      backgroundColor: '#334155',
+                                      color: '#cbd5e1',
+                                    }}
+                                  >
+                                    {t.size}
+                                  </span>
+                                )}
+                                <span
+                                  style={{
+                                    fontSize: '0.68rem',
+                                    fontWeight: 600,
+                                    padding: '0.1rem 0.35rem',
+                                    borderRadius: '0.2rem',
+                                    backgroundColor: '#0f172a',
+                                    border: '1px solid #334155',
+                                    color: '#94a3b8',
+                                  }}
+                                >
+                                  {t.state}
+                                </span>
+                                {isMicro && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setPromoteTargetTask({ id: t.id, title: t.title });
+                                    }}
+                                    title="Promote microtask to full task"
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '0.15rem',
+                                      padding: '0.15rem 0.35rem',
+                                      borderRadius: '0.25rem',
+                                      backgroundColor: 'rgba(99, 102, 241, 0.2)',
+                                      border: '1px solid #4f46e5',
+                                      color: '#c7d2fe',
+                                      fontSize: '0.65rem',
+                                      fontWeight: 600,
+                                      cursor: 'pointer',
+                                    }}
+                                  >
+                                    <ArrowUpRight size={11} />
+                                    <span>Promote</span>
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+            )}
           </div>
         </div>
-      )}
-
-      {/* Emergent Tasks by Category */}
-      {Object.keys(emergentCategories).length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem',
-              padding: '0.25rem 0',
-            }}
-          >
-            <FolderPlus size={18} color="#38bdf8" />
-            <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
-              Emergent Tasks & Microtasks
-            </h3>
-          </div>
-
-          {Object.entries(emergentCategories).map(([category, nodes]) => {
-            const visibleCategoryNodes = nodes.filter((n) => isNodeVisible(n.id));
-            if (visibleCategoryNodes.length === 0) return null;
-
-            return (
+      ) : (
+        <>
+          {/* Planned Initiatives Section */}
+          {initiativeRoots.length > 0 && (
+            <div
+              style={{
+                backgroundColor: '#1e293b',
+                borderRadius: '0.5rem',
+                border: '1px solid #334155',
+                overflow: 'hidden',
+              }}
+            >
               <div
-                key={category}
                 style={{
-                  backgroundColor: '#1e293b',
-                  borderRadius: '0.5rem',
-                  border: '1px solid #334155',
-                  overflow: 'hidden',
+                  padding: '0.75rem 1rem',
+                  backgroundColor: '#0f172a',
+                  borderBottom: '1px solid #334155',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
                 }}
               >
-                <div
-                  style={{
-                    padding: '0.6rem 1rem',
-                    backgroundColor: '#0f172a',
-                    borderBottom: '1px solid #334155',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.5rem',
-                  }}
-                >
-                  <Folder size={15} color="#cbd5e1" />
-                  <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#cbd5e1' }}>
-                    {category}
-                  </span>
-                  <span style={{ fontSize: '0.72rem', color: '#64748b', marginLeft: 'auto' }}>
-                    {visibleCategoryNodes.length} task(s)
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', flexDirection: 'column' }}>
-                  {nodes.map((node) => renderNode(node.id, 0))}
-                </div>
+                <Layers size={17} color="#818cf8" />
+                <h3 style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
+                  Planned Initiatives
+                </h3>
+                <span style={{ fontSize: '0.75rem', color: '#64748b', marginLeft: 'auto' }}>
+                  {initiativeRoots.filter((r) => isNodeVisible(r.id)).length} initiative(s) visible
+                </span>
               </div>
-            );
-          })}
-        </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                {initiativeRoots.map((init) => renderNode(init.id, 0))}
+              </div>
+            </div>
+          )}
+
+          {/* Emergent Tasks by Category */}
+          {Object.keys(emergentCategories).length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.25rem 0',
+                }}
+              >
+                <FolderPlus size={18} color="#38bdf8" />
+                <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#f8fafc', margin: 0 }}>
+                  Emergent Tasks & Microtasks
+                </h3>
+              </div>
+
+              {Object.entries(emergentCategories).map(([category, nodes]) => {
+                const visibleCategoryNodes = nodes.filter((n) => isNodeVisible(n.id));
+                if (visibleCategoryNodes.length === 0) return null;
+
+                return (
+                  <div
+                    key={category}
+                    style={{
+                      backgroundColor: '#1e293b',
+                      borderRadius: '0.5rem',
+                      border: '1px solid #334155',
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        padding: '0.6rem 1rem',
+                        backgroundColor: '#0f172a',
+                        borderBottom: '1px solid #334155',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                      }}
+                    >
+                      <Folder size={15} color="#cbd5e1" />
+                      <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#cbd5e1' }}>
+                        {category}
+                      </span>
+                      <span style={{ fontSize: '0.72rem', color: '#64748b', marginLeft: 'auto' }}>
+                        {visibleCategoryNodes.length} task(s)
+                      </span>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                      {nodes.map((node) => renderNode(node.id, 0))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
 
       {/* Add Subtask Form Dialog */}
@@ -1322,6 +1672,20 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
           cancelButtonText="Cancel"
           onApply={handleApplyConfirmDialog}
           onCancel={() => setConfirmDialogData(null)}
+        />
+      )}
+
+      {/* Promote Microtask Dialog */}
+      {promoteTargetTask && (
+        <PromoteDialog
+          taskId={promoteTargetTask.id}
+          taskTitle={promoteTargetTask.title}
+          isOpen={true}
+          onClose={() => setPromoteTargetTask(null)}
+          onSuccess={() => {
+            setPromoteTargetTask(null);
+            onRefresh();
+          }}
         />
       )}
     </div>

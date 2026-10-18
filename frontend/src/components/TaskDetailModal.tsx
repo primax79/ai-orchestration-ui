@@ -30,6 +30,11 @@ import {
   downloadAttachmentBlob,
 } from './AttachmentComponents';
 import { TextViewerModal } from './TextViewerModal';
+import { KindBadge } from './KindBadge';
+import { LabelList } from './LabelChip';
+import { LabelEditorModal } from './LabelEditorModal';
+import { PromoteDialog } from './PromoteDialog';
+import { ArrowUpRight } from 'lucide-react';
 
 interface TaskDetailModalProps {
   task: TaskItem;
@@ -119,6 +124,9 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     actionType: 'add-child' | 'expand' | 'collapse';
     extraPayload?: any;
   } | null>(null);
+
+  const [showLabelEditor, setShowLabelEditor] = useState(false);
+  const [showPromoteDialog, setShowPromoteDialog] = useState(false);
 
   // Sync currentTask when incoming prop changes
   useEffect(() => {
@@ -733,7 +741,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               </div>
             )}
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.25rem', flexWrap: 'wrap' }}>
               <span style={{
                 fontSize: '0.75rem',
                 fontWeight: 700,
@@ -745,6 +753,24 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 {currentTask.priority}
               </span>
               <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#818cf8' }}>{currentTask.id}</span>
+              {currentTask.category === 'micro' && (
+                <span style={{
+                  fontSize: '0.65rem',
+                  fontWeight: 700,
+                  backgroundColor: '#27272a',
+                  color: '#a1a1aa',
+                  padding: '0.1rem 0.35rem',
+                  borderRadius: '0.25rem',
+                  textTransform: 'uppercase',
+                }}>
+                  micro
+                </span>
+              )}
+              {currentTask.fields?.kind?.value ? (
+                <KindBadge kind={String(currentTask.fields.kind.value)} size={12} showLabel={true} />
+              ) : currentTask.kind && currentTask.kind !== 'emergent' && currentTask.kind !== 'initiative_task' ? (
+                <KindBadge kind={currentTask.kind} size={12} showLabel={true} />
+              ) : null}
               <span style={{
                 fontSize: '0.75rem',
                 padding: '0.15rem 0.5rem',
@@ -754,6 +780,31 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               }}>
                 {currentTask.state}
               </span>
+
+              {/* Promote button if microtask */}
+              {currentTask.category === 'micro' && (
+                <button
+                  type="button"
+                  onClick={() => setShowPromoteDialog(true)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.25rem',
+                    padding: '0.2rem 0.55rem',
+                    borderRadius: '0.25rem',
+                    backgroundColor: '#4f46e5',
+                    color: '#fff',
+                    border: 'none',
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    marginLeft: 'auto',
+                  }}
+                >
+                  <ArrowUpRight size={13} />
+                  <span>Promote to Full Task</span>
+                </button>
+              )}
             </div>
             <h2 style={{ fontSize: '1.2rem', fontWeight: 600, color: '#f8fafc' }}>{currentTask.title}</h2>
           </div>
@@ -833,6 +884,33 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             <div>
               <div style={{ color: '#64748b', fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 600 }}>Category</div>
               <div style={{ fontWeight: 500, color: '#f1f5f9' }}>{currentTask.category}</div>
+            </div>
+            <div>
+              <div style={{ color: '#64748b', fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span>Labels</span>
+                <button
+                  type="button"
+                  onClick={() => setShowLabelEditor(true)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    color: '#818cf8',
+                    cursor: 'pointer',
+                    fontSize: '0.7rem',
+                    padding: 0,
+                    textDecoration: 'underline',
+                  }}
+                >
+                  Edit
+                </button>
+              </div>
+              <div style={{ marginTop: '0.25rem' }}>
+                {currentTask.labels && currentTask.labels.length > 0 ? (
+                  <LabelList labels={currentTask.labels} maxVisible={5} size="sm" />
+                ) : (
+                  <span style={{ color: '#64748b', fontStyle: 'italic', fontSize: '0.8rem' }}>None</span>
+                )}
+              </div>
             </div>
           </div>
 
@@ -2243,6 +2321,38 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           cancelButtonText="Cancel"
           onApply={handleApplyStructureConfirm}
           onCancel={() => setStructureConfirmData(null)}
+        />
+      )}
+
+      {/* Label Editor Modal */}
+      {showLabelEditor && (
+        <LabelEditorModal
+          taskId={currentTask.id}
+          initialLabels={currentTask.labels}
+          taskHash={currentTask.task_bundle_sha256}
+          isOpen={true}
+          onClose={() => setShowLabelEditor(false)}
+          onSuccess={(updatedLabels) => {
+            setCurrentTask((prev) => ({ ...prev, labels: updatedLabels }));
+            setShowLabelEditor(false);
+            onActionComplete();
+          }}
+        />
+      )}
+
+      {/* Promote Microtask Dialog */}
+      {showPromoteDialog && (
+        <PromoteDialog
+          taskId={currentTask.id}
+          taskTitle={currentTask.title}
+          taskHash={currentTask.task_bundle_sha256}
+          isOpen={true}
+          onClose={() => setShowPromoteDialog(false)}
+          onSuccess={() => {
+            setShowPromoteDialog(false);
+            onActionComplete();
+            onClose();
+          }}
         />
       )}
     </div>

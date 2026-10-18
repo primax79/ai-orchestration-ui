@@ -7,18 +7,20 @@ import {
   Flame,
   AlertCircle,
   Loader2,
-  Search,
 } from 'lucide-react';
 import {
   TaskGraphResponse,
   TaskGraphNode,
   TaskSize,
+  SharedFilterState,
 } from '../types';
 import { api, timelineApi } from '../api';
 import { TimelineCard } from './TimelineCard';
 import { TimelineArrows, ArrowPosition } from './TimelineArrows';
 import { TimelineReadyQueue } from './TimelineReadyQueue';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
+import { SharedFilterBar, getStoredSharedFilters, matchTaskFilters } from './SharedFilterBar';
+import { MicrotaskQuickAdd } from './MicrotaskQuickAdd';
 
 interface TimelineViewProps {
   onSelectTask?: (task: any) => void;
@@ -41,10 +43,10 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
   const [error, setError] = useState<string | null>(null);
   const [showDone, setShowDone] = useState<boolean>(getStoredShowDone);
   const [groupFilter, setGroupFilter] = useState<string>('all');
-  const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [filterChainOnly, setFilterChainOnly] = useState(false);
   const [highlightHeaviestChain, setHighlightHeaviestChain] = useState(true);
+  const [sharedFilters, setSharedFilters] = useState<SharedFilterState>(getStoredSharedFilters);
 
   // Confirm dialog state for priority, size, deps
   const [confirmDialogState, setConfirmDialogState] = useState<{
@@ -163,15 +165,10 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
       if (!showDone && isClosed) return false;
       if (groupFilter !== 'all' && node.group !== groupFilter) return false;
       if (filterChainOnly && selectedTaskId && !selectedChainIds.has(node.id)) return false;
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
-        const matchId = node.id.toLowerCase().includes(q);
-        const matchTitle = node.title.toLowerCase().includes(q);
-        if (!matchId && !matchTitle) return false;
-      }
+      if (!matchTaskFilters(node, sharedFilters)) return false;
       return true;
     });
-  }, [graph?.nodes, showDone, groupFilter, filterChainOnly, selectedTaskId, selectedChainIds, searchQuery]);
+  }, [graph?.nodes, showDone, groupFilter, filterChainOnly, selectedTaskId, selectedChainIds, sharedFilters]);
 
   // Determine columns
   const columnsData = useMemo(() => {
@@ -499,25 +496,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
 
         {/* Right Controls: Filters, Show Done, Search, Refresh */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-          {/* Search box */}
-          <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-            <Search size={14} style={{ position: 'absolute', left: '0.5rem', color: '#64748b' }} />
-            <input
-              type="text"
-              placeholder="Filter tasks..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              style={{
-                fontSize: '0.75rem',
-                padding: '0.25rem 0.5rem 0.25rem 1.75rem',
-                backgroundColor: '#1e293b',
-                border: '1px solid #334155',
-                borderRadius: '0.25rem',
-                color: '#f8fafc',
-                width: '130px',
-              }}
-            />
-          </div>
+          <MicrotaskQuickAdd onCreated={() => { fetchGraph(); onRefresh?.(); }} />
 
           {/* Group / Initiative Filter */}
           <select
@@ -605,6 +584,15 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
             <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
           </button>
         </div>
+      </div>
+
+      {/* Shared Filter Bar */}
+      <div style={{ padding: '0.5rem 1rem 0' }}>
+        <SharedFilterBar
+          filters={sharedFilters}
+          onChange={setSharedFilters}
+          style={{ marginBottom: 0 }}
+        />
       </div>
 
       {/* Main Workspace Body */}
@@ -770,6 +758,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
                             onRequestSetSize={handleRequestSetSize}
                             onRequestAddDep={handleRequestAddDep}
                             onRequestRemoveDep={handleRequestRemoveDep}
+                            onRefresh={fetchGraph}
                           />
                         );
                       })
@@ -786,6 +775,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
               heaviestChainIds={graph?.heaviest_chain || []}
               onSelectTask={handleCardClick}
               onFocusCard={handleFocusCard}
+              onRefresh={fetchGraph}
             />
           </>
         )}

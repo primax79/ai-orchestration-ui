@@ -1,6 +1,10 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { ListOrdered, Flame, ArrowRight } from 'lucide-react';
 import { TaskGraphNode } from '../types';
+import { KindBadge } from './KindBadge';
+import { LabelList } from './LabelChip';
+import { MicrotaskPill } from './MicrotaskPill';
+import { PromoteDialog } from './PromoteDialog';
 
 interface TimelineReadyQueueProps {
   readyQueueIds: string[];
@@ -8,6 +12,7 @@ interface TimelineReadyQueueProps {
   heaviestChainIds: string[];
   onSelectTask?: (task: TaskGraphNode) => void;
   onFocusCard?: (taskId: string) => void;
+  onRefresh?: () => void;
 }
 
 const PRIORITY_COLORS: Record<string, string> = {
@@ -23,7 +28,10 @@ export const TimelineReadyQueue: React.FC<TimelineReadyQueueProps> = ({
   heaviestChainIds,
   onSelectTask,
   onFocusCard,
+  onRefresh,
 }) => {
+  const [promoteTask, setPromoteTask] = useState<TaskGraphNode | null>(null);
+
   return (
     <aside
       style={{
@@ -96,6 +104,46 @@ export const TimelineReadyQueue: React.FC<TimelineReadyQueueProps> = ({
             const node = nodesById[id];
             if (!node) return null;
             const isHeavy = heaviestChainIds.includes(id);
+            const isMicro = node.size === 'XS' || node.group === 'micro' || node.node_type === 'microtask';
+
+            if (isMicro) {
+              return (
+                <div
+                  key={id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.4rem',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: '0.7rem',
+                      color: '#64748b',
+                      fontWeight: 600,
+                      width: '1.25rem',
+                      flexShrink: 0,
+                    }}
+                  >
+                    #{index + 1}
+                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <MicrotaskPill
+                      id={node.id}
+                      title={node.title}
+                      kind={node.kind}
+                      priority={node.priority}
+                      labels={node.labels}
+                      onClick={() => onSelectTask?.(node)}
+                      onPromote={() => setPromoteTask(node)}
+                      style={{ width: '100%', justifyContent: 'flex-start' }}
+                    />
+                  </div>
+                </div>
+              );
+            }
 
             return (
               <div
@@ -120,7 +168,7 @@ export const TimelineReadyQueue: React.FC<TimelineReadyQueueProps> = ({
                 }}
               >
                 {/* Header row */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
                   <span
                     style={{
                       fontSize: '0.7rem',
@@ -131,6 +179,11 @@ export const TimelineReadyQueue: React.FC<TimelineReadyQueueProps> = ({
                   >
                     #{index + 1}
                   </span>
+
+                  {node.kind && (
+                    <KindBadge kind={node.kind} size={11} />
+                  )}
+
                   <span
                     style={{
                       fontSize: '0.8rem',
@@ -218,6 +271,11 @@ export const TimelineReadyQueue: React.FC<TimelineReadyQueueProps> = ({
                   {node.title}
                 </div>
 
+                {/* Labels */}
+                {node.labels && node.labels.length > 0 && (
+                  <LabelList labels={node.labels} maxVisible={3} size="xs" />
+                )}
+
                 {/* Group info */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.7rem', color: '#94a3b8' }}>
                   <span>Group:</span>
@@ -228,6 +286,21 @@ export const TimelineReadyQueue: React.FC<TimelineReadyQueueProps> = ({
           })
         )}
       </div>
+
+      {/* Promote Dialog */}
+      {promoteTask && (
+        <PromoteDialog
+          taskId={promoteTask.id}
+          taskTitle={promoteTask.title}
+          isOpen={true}
+          onClose={() => setPromoteTask(null)}
+          onSuccess={() => {
+            setPromoteTask(null);
+            if (onRefresh) onRefresh();
+          }}
+        />
+      )}
     </aside>
   );
 };
+

@@ -714,6 +714,7 @@ export interface TaskGraphNode {
   blocked_by: string[];
   next_up?: string;
   executor?: string;
+  labels?: string[];
 }
 
 export interface TaskGraphEdge {
@@ -917,6 +918,126 @@ export interface ExpandTaskPayload {
 export interface CollapseTaskPayload {
   expect_plan_hash?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Microtasks, Kinds & Labels Types (Task 10.5)
+// ---------------------------------------------------------------------------
+
+export type TaskKind = 'bug' | 'chore' | 'docs' | 'feature' | 'fix' | 'investigation';
+
+export interface LabelCountItem {
+  label: string;
+  count: number;
+}
+
+export interface LabelsResponse {
+  ok: boolean;
+  tasks_dir?: string;
+  labels: LabelCountItem[];
+  counts: Record<string, number>;
+}
+
+export interface CreateMicrotaskPayload {
+  title: string;
+  kind?: TaskKind | string;
+  priority?: Priority | string;
+  paths?: string;
+  depends_on?: string;
+  labels?: string[] | string;
+  label?: string[] | string;
+  size?: TaskSize | string;
+  executor?: string;
+  what?: string;
+}
+
+export interface CreateMicrotaskResponse {
+  ok: boolean;
+  id: string;
+  category: string;
+  rel_path?: string;
+  file_path?: string;
+  error?: string;
+}
+
+export interface PromoteMicrotaskPayload {
+  category?: string;
+  expect_task_hash?: string;
+  expect_hash?: string;
+}
+
+export interface PromoteMicrotaskResponse {
+  ok: boolean;
+  dry_run?: boolean;
+  id: string;
+  task_id?: string;
+  category: string;
+  old_rel_path?: string;
+  rel_path?: string;
+  file_path?: string;
+  summary?: string;
+  diff?: string;
+  hash?: string;
+  task_hash?: string;
+  base_task_hash?: string;
+  error?: string;
+}
+
+export interface SetKindPayload {
+  kind: TaskKind | string;
+  expect_task_hash?: string;
+  expect_hash?: string;
+}
+
+export interface SetKindResponse {
+  ok: boolean;
+  task_id: string;
+  kind: string;
+  task_hash?: string;
+  hash?: string;
+  base_task_hash?: string;
+  dry_run?: boolean;
+  diff?: string;
+  error?: string;
+}
+
+export interface SetLabelsPayload {
+  add?: string[];
+  remove?: string[];
+  to?: string[];
+  labels?: string[];
+  expect_task_hash?: string;
+  expect_hash?: string;
+}
+
+export interface SetLabelsResponse {
+  ok: boolean;
+  task_id: string;
+  labels: string[];
+  task_hash?: string;
+  hash?: string;
+  base_task_hash?: string;
+  dry_run?: boolean;
+  diff?: string;
+  error?: string;
+}
+
+export interface SharedFilterState {
+  search: string;
+  kinds: TaskKind[];
+  labels: string[];
+  states: TaskState[];
+  priority?: Priority | 'all';
+  groupByLabel?: boolean;
+}
+
+export interface InboxToMicrotaskPayload {
+  title?: string;
+  kind?: string;
+  priority?: string;
+  what?: string;
+  labels?: string[];
+}
+
 
 
 

@@ -737,7 +737,16 @@ async def api_list_tasks(request: Request) -> JSONResponse:
     tasks_dir = state.workspace / "tasks"
     if not tasks_dir.is_dir():
         return JSONResponse({"tasks": [], "initiatives": [], "stats": {"total": 0}, "message": "No tasks/ directory in current workspace"})
-    code, data = await run_ai_orch(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"])
+    cmd = ["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"]
+    for k in request.query_params.getlist("kind"):
+        for sub_k in k.split(","):
+            if sub_k.strip():
+                cmd.extend(["--kind", sub_k.strip()])
+    for l in request.query_params.getlist("label"):
+        for sub_l in l.split(","):
+            if sub_l.strip():
+                cmd.extend(["--label", sub_l.strip()])
+    code, data = await run_ai_orch(cmd)
     if code != 0:
         return JSONResponse({"error": data} if not isinstance(data, dict) else data, status_code=504 if code == 504 else 500)
     return JSONResponse(data)
@@ -753,6 +762,9 @@ async def api_validate_tasks(request: Request) -> JSONResponse:
 TASK_MUTATION_ID_RE = re.compile(r"^(T\d{3,}(\.\d+)*|\d{2,}(\.\d+)*)$")
 VALID_PRIORITIES = {"P0", "P1", "P2", "P3"}
 VALID_SIZES = {"XS", "S", "M", "L", "XL"}
+VALID_KINDS = {"bug", "chore", "docs", "feature", "fix", "investigation"}
+LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
+MICRO_ID_RE = re.compile(r"^T\d{3,}$")
 
 
 def _extract_dep_ids(val: Any) -> list[str]:
@@ -794,7 +806,16 @@ async def api_get_tasks_graph(request: Request) -> JSONResponse:
     tasks_dir = state.workspace / "tasks"
     if not tasks_dir.is_dir():
         return JSONResponse({"ok": True, "nodes": [], "nodes_by_id": {}, "edges": [], "columns": {}, "ready_queue": [], "heaviest_chain": [], "totals": {}}, status_code=200)
-    code, data = await run_ai_orch(["tasks", "graph", "--tasks-dir", str(tasks_dir), "--json"])
+    cmd = ["tasks", "graph", "--tasks-dir", str(tasks_dir), "--json"]
+    for k in request.query_params.getlist("kind"):
+        for sub_k in k.split(","):
+            if sub_k.strip():
+                cmd.extend(["--kind", sub_k.strip()])
+    for l in request.query_params.getlist("label"):
+        for sub_l in l.split(","):
+            if sub_l.strip():
+                cmd.extend(["--label", sub_l.strip()])
+    code, data = await run_ai_orch(cmd)
     if code == 504:
         return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=504)
     if code == 0 and isinstance(data, dict):
@@ -989,6 +1010,368 @@ async def api_preview_set_deps(request: Request) -> JSONResponse:
 
 async def api_set_deps(request: Request) -> JSONResponse:
     return await _handle_set_deps(request, is_preview=False)
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints: Kind & Labels (10.5)
+# ---------------------------------------------------------------------------
+
+async def _handle_set_kind(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not TASK_MUTATION_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    kind = str(body.get("kind") or "").strip().lower()
+    if not kind:
+        return JSONResponse({"error": "kind is required"}, status_code=400)
+    if kind not in VALID_KINDS:
+        return JSONResponse({"error": f"Invalid kind {kind!r}, expected one of {', '.join(sorted(VALID_KINDS))}"}, status_code=400)
+
+    expect_task_hash = (
+        body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_task_hash:
+        return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "set-kind", task_id, kind, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    if expect_task_hash:
+        cmd.extend(["--expect-task-hash", str(expect_task_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                current_hash = expect_task_hash or await _resolve_current_task_hash(tasks_dir, task_id)
+                if current_hash:
+                    data["hash"] = current_hash
+                    data["task_hash"] = current_hash
+                    data["base_task_hash"] = current_hash
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_set_kind(request: Request) -> JSONResponse:
+    return await _handle_set_kind(request, is_preview=True)
+
+
+async def api_set_kind(request: Request) -> JSONResponse:
+    return await _handle_set_kind(request, is_preview=False)
+
+
+def _extract_labels(val: Any) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, list):
+        items = []
+        for x in val:
+            if isinstance(x, str):
+                items.extend([p.strip().lower() for p in re.split(r"[\s,]+", x.strip()) if p.strip()])
+            elif x is not None:
+                items.append(str(x).strip().lower())
+        return items
+    if isinstance(val, str):
+        return [p.strip().lower() for p in re.split(r"[\s,]+", val.strip()) if p.strip()]
+    return []
+
+
+async def _handle_set_labels(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not TASK_MUTATION_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    add_labels = _extract_labels(body.get("add"))
+    remove_labels = _extract_labels(body.get("remove"))
+    to_specified = body.get("to") is not None or body.get("labels") is not None
+    to_labels = _extract_labels(body.get("to") if body.get("to") is not None else body.get("labels"))
+
+    if not add_labels and not remove_labels and not to_specified:
+        return JSONResponse({"error": "at least one of add, remove, or to/labels is required"}, status_code=400)
+
+    for lbl in add_labels + remove_labels + to_labels:
+        if not LABEL_RE.match(lbl):
+            return JSONResponse({"error": f"Invalid label format {lbl!r}, must match ^[a-z0-9][a-z0-9-]{{0,23}}$"}, status_code=400)
+
+    expect_task_hash = (
+        body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_task_hash:
+        return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "set-labels", task_id, "--tasks-dir", str(tasks_dir), "--json"]
+    if add_labels:
+        cmd.extend(["--add", *add_labels])
+    if remove_labels:
+        cmd.extend(["--remove", *remove_labels])
+    if to_specified:
+        cmd.extend(["--to", *to_labels])
+    if is_preview:
+        cmd.append("--dry-run")
+    if expect_task_hash:
+        cmd.extend(["--expect-task-hash", str(expect_task_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                current_hash = expect_task_hash or await _resolve_current_task_hash(tasks_dir, task_id)
+                if current_hash:
+                    data["hash"] = current_hash
+                    data["task_hash"] = current_hash
+                    data["base_task_hash"] = current_hash
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_set_labels(request: Request) -> JSONResponse:
+    return await _handle_set_labels(request, is_preview=True)
+
+
+async def api_set_labels(request: Request) -> JSONResponse:
+    return await _handle_set_labels(request, is_preview=False)
+
+
+async def api_list_labels(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    if not tasks_dir.is_dir():
+        return JSONResponse({"ok": True, "tasks_dir": str(tasks_dir), "labels": [], "counts": {}}, status_code=200)
+    code, data = await run_ai_orch(["tasks", "labels", "--tasks-dir", str(tasks_dir), "--json"])
+    if code == 504:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=504)
+    if code == 0 and isinstance(data, dict):
+        return JSONResponse(data, status_code=200)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints: Microtasks & Promote (10.5)
+# ---------------------------------------------------------------------------
+
+async def api_create_microtask(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    title = str(body.get("title") or "").strip()
+    if not title:
+        return JSONResponse({"error": "title is required"}, status_code=400)
+
+    kind = str(body.get("kind") or "chore").strip().lower()
+    if kind not in VALID_KINDS:
+        return JSONResponse({"error": f"Invalid kind {kind!r}, expected one of {', '.join(sorted(VALID_KINDS))}"}, status_code=400)
+
+    priority = str(body.get("priority") or "P2").strip().upper()
+    if priority not in VALID_PRIORITIES:
+        return JSONResponse({"error": f"Invalid priority {priority!r}, expected one of {', '.join(sorted(VALID_PRIORITIES))}"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = [
+        "tasks", "micro",
+        "--title", title,
+        "--kind", kind,
+        "--priority", priority,
+        "--tasks-dir", str(tasks_dir),
+        "--json",
+    ]
+    if body.get("paths"):
+        cmd.extend(["--paths", str(body["paths"])])
+    if body.get("depends_on"):
+        cmd.extend(["--depends-on", str(body["depends_on"])])
+    if body.get("size"):
+        sz = str(body["size"]).strip().upper()
+        if sz not in VALID_SIZES:
+            return JSONResponse({"error": f"Invalid size {sz!r}"}, status_code=400)
+        cmd.extend(["--size", sz])
+    if body.get("executor"):
+        cmd.extend(["--executor", str(body["executor"])])
+    if body.get("what"):
+        cmd.extend(["--what", str(body["what"])])
+
+    labels = _extract_labels(body.get("labels") or body.get("label"))
+    for lbl in labels:
+        if not LABEL_RE.match(lbl):
+            return JSONResponse({"error": f"Invalid label format {lbl!r}"}, status_code=400)
+        cmd.extend(["--label", lbl])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        task_id = data.get("id") if isinstance(data, dict) else None
+        if task_id:
+            await state.broadcast({"type": "task_created", "task_id": task_id})
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=201)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def _handle_promote(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not MICRO_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid microtask id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    category = str(body.get("category") or "maintenance").strip()
+    if not category:
+        category = "maintenance"
+
+    tasks_dir = state.workspace / "tasks"
+    target_file = None
+    for pdir in (tasks_dir / "micro", tasks_dir / "done" / "micro"):
+        if pdir.is_dir():
+            for f in pdir.glob("*.md"):
+                if f.name.startswith(f"{task_id}-") and f.name != "README.md":
+                    target_file = f
+                    break
+        if target_file:
+            break
+
+    if not target_file:
+        return JSONResponse({"error": f"Microtask {task_id} not found in tasks/micro/"}, status_code=404)
+
+    file_bytes = target_file.read_bytes()
+    task_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    expect_task_hash = (
+        body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if expect_task_hash and expect_task_hash.lower() != task_hash.lower():
+        return JSONResponse({"error": f"Task hash mismatch: expected {expect_task_hash}, actual {task_hash}"}, status_code=409)
+
+    if is_preview:
+        diff_str = f"--- {target_file.name}\n+++ tasks/{category}/{target_file.name}\n(Promote microtask to full emergent task in category '{category}' with Goal, Steps, and Verification)\n"
+        return JSONResponse({
+            "ok": True,
+            "dry_run": True,
+            "id": task_id,
+            "task_id": task_id,
+            "category": category,
+            "summary": f"Promote microtask {task_id} to category '{category}'",
+            "diff": diff_str,
+            "hash": task_hash,
+            "task_hash": task_hash,
+            "base_task_hash": task_hash,
+        }, status_code=200)
+
+    cmd = ["tasks", "promote", task_id, "--category", category, "--tasks-dir", str(tasks_dir), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_promote(request: Request) -> JSONResponse:
+    return await _handle_promote(request, is_preview=True)
+
+
+async def api_promote(request: Request) -> JSONResponse:
+    return await _handle_promote(request, is_preview=False)
+
+
+async def api_inbox_to_microtask(request: Request) -> JSONResponse:
+    note_id = request.path_params["id"]
+    if not NOTE_ID_RE.match(note_id):
+        return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    tasks_dir = state.workspace / "tasks"
+    show_code, show_data = await run_ai_orch(["inbox", "show", note_id, "--tasks-dir", str(tasks_dir), "--json"])
+    if show_code != 0 or not isinstance(show_data, dict) or not show_data.get("ok"):
+        return JSONResponse({"error": f"Note {note_id} not found"}, status_code=404)
+
+    note = show_data.get("note", {})
+    title = body.get("title") or note.get("title") or f"Issue from note {note_id}"
+    kind = str(body.get("kind") or (note.get("kind") if note.get("kind") in VALID_KINDS else "bug")).strip().lower()
+    if kind not in VALID_KINDS:
+        kind = "bug"
+    priority = str(body.get("priority") or "P2").strip().upper()
+    what = body.get("what") or note.get("body") or f"Created from inbox note {note_id}."
+
+    labels = _extract_labels(body.get("labels") or body.get("label"))
+    if not labels and note.get("about"):
+        for ab in re.split(r"[\s,]+", note["about"]):
+            ab_clean = re.sub(r"[^a-z0-9-]", "", ab.strip().lower())
+            if ab_clean and LABEL_RE.match(ab_clean) and ab_clean not in labels:
+                labels.append(ab_clean)
+
+    cmd = [
+        "tasks", "micro",
+        "--title", str(title).strip(),
+        "--kind", kind,
+        "--priority", priority,
+        "--tasks-dir", str(tasks_dir),
+        "--json",
+    ]
+    if body.get("paths"):
+        cmd.extend(["--paths", str(body["paths"])])
+    if body.get("depends_on"):
+        cmd.extend(["--depends-on", str(body["depends_on"])])
+    if body.get("executor"):
+        cmd.extend(["--executor", str(body["executor"])])
+    if what:
+        cmd.extend(["--what", str(what)])
+    for lbl in labels:
+        cmd.extend(["--label", lbl])
+
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+    task_id = data.get("id") if isinstance(data, dict) else None
+    if task_id:
+        await run_ai_orch(["inbox", "resolve", note_id, "--produced", task_id, "--tasks-dir", str(tasks_dir), "--json"])
+        await state.broadcast({"type": "task_created", "task_id": task_id, "from_note": note_id})
+        await state.broadcast({"type": "inbox_updated", "note_id": note_id})
+        await state.broadcast({"type": "changed", "areas": ["tasks", "inbox"]})
+
+    return JSONResponse(data if isinstance(data, dict) else {"ok": True, "id": task_id}, status_code=200)
 
 
 # ---------------------------------------------------------------------------
@@ -3511,6 +3894,8 @@ routes = [
     Route("/index.html", serve_index, methods=["GET"]),
     Route("/api/workspace", api_get_workspace, methods=["GET"]),
     Route("/api/tasks", api_list_tasks, methods=["GET"]),
+    Route("/api/tasks/labels", api_list_labels, methods=["GET"]),
+    Route("/api/tasks/micro", api_create_microtask, methods=["POST"]),
     Route("/api/tasks/validate", api_validate_tasks, methods=["GET"]),
     Route("/api/tasks/graph", api_get_tasks_graph, methods=["GET"]),
     Route("/api/tasks/{id}/priority/preview", api_preview_set_priority, methods=["POST"]),
@@ -3519,6 +3904,12 @@ routes = [
     Route("/api/tasks/{id}/size", api_set_size, methods=["POST"]),
     Route("/api/tasks/{id}/deps/preview", api_preview_set_deps, methods=["POST"]),
     Route("/api/tasks/{id}/deps", api_set_deps, methods=["POST"]),
+    Route("/api/tasks/{id}/kind/preview", api_preview_set_kind, methods=["POST"]),
+    Route("/api/tasks/{id}/kind", api_set_kind, methods=["POST"]),
+    Route("/api/tasks/{id}/labels/preview", api_preview_set_labels, methods=["POST"]),
+    Route("/api/tasks/{id}/labels", api_set_labels, methods=["POST"]),
+    Route("/api/tasks/{id}/promote/preview", api_preview_promote, methods=["POST"]),
+    Route("/api/tasks/{id}/promote", api_promote, methods=["POST"]),
     Route("/api/tasks/{id}/child/preview", api_preview_child_add, methods=["POST"]),
     Route("/api/tasks/{id}/child", api_child_add, methods=["POST"]),
     Route("/api/tasks/{id}/children/preview", api_preview_child_add, methods=["POST"]),
@@ -3596,6 +3987,7 @@ routes = [
     Route("/api/inbox/{id}/discard", api_discard_inbox_note, methods=["POST"]),
     Route("/api/inbox/{id}/reopen", api_reopen_inbox_note, methods=["POST"]),
     Route("/api/inbox/{id}/to-task", api_inbox_to_task, methods=["POST"]),
+    Route("/api/inbox/{id}/to-microtask", api_inbox_to_microtask, methods=["POST"]),
     Route("/api/use-cases", api_list_use_cases, methods=["GET"]),
     Route("/api/use-cases", api_create_use_case, methods=["POST"]),
     Route("/api/use-cases/campaign", api_run_campaign, methods=["POST"]),

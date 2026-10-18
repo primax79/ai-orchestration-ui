@@ -14,11 +14,15 @@ import {
   Eye,
   EyeOff,
 } from 'lucide-react';
-import { TaskItem, TaskListResponse, TaskState } from '../types';
+import { TaskItem, TaskListResponse, TaskState, SharedFilterState } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { TimelineView } from './TimelineView';
 import { TaskTreeView } from './TaskTreeView';
+import { KindBadge } from './KindBadge';
+import { LabelList } from './LabelChip';
+import { MicrotaskQuickAdd } from './MicrotaskQuickAdd';
+import { SharedFilterBar, getStoredSharedFilters, matchTaskFilters } from './SharedFilterBar';
 import { api } from '../api';
 
 export type BacklogView = 'queue' | 'kanban' | 'tree' | 'timeline';
@@ -87,6 +91,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
   const [indexOutOfSync, setIndexOutOfSync] = useState(false);
   const [syncConfirmData, setSyncConfirmData] = useState<(ConfirmDialogPreviewData & { title: string }) | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [sharedFilters, setSharedFilters] = useState<SharedFilterState>(getStoredSharedFilters);
 
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
 
@@ -123,13 +128,17 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
     done: tasks.filter((t) => isClosedState(t.state) || t.is_done).length,
   };
 
+  // Filter tasks based on sharedFilters
+  const filteredTasks = tasks.filter((t) => matchTaskFilters(t, sharedFilters));
+
   // Queue tasks: emergent only, next_up === 'yes', non-closed, never NN.T
   const queueTasks = tasks
     .filter((t) => {
-      if (t.kind !== 'emergent') return false;
+      if (t.kind !== 'emergent' && t.category !== 'micro') return false;
       if (/^\d+\.\d+/.test(t.id)) return false;
       if (t.next_up !== 'yes') return false;
       if (isClosedState(t.state) || t.is_done) return false;
+      if (!matchTaskFilters(t, sharedFilters)) return false;
       return true;
     })
     .sort((a, b) => {
@@ -216,10 +225,10 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
   };
 
   // Kanban task partitions
-  const deliveredCards = tasks.filter((t) => t.state === 'delivered');
-  const verifiedCards = tasks.filter((t) => t.state === 'verified');
-  const doneCards = tasks.filter((t) => t.state === 'done' || t.state === 'done with a caveat');
-  const droppedCards = tasks.filter((t) => t.state === 'dropped');
+  const deliveredCards = filteredTasks.filter((t) => t.state === 'delivered');
+  const verifiedCards = filteredTasks.filter((t) => t.state === 'verified');
+  const doneCards = filteredTasks.filter((t) => t.state === 'done' || t.state === 'done with a caveat');
+  const droppedCards = filteredTasks.filter((t) => t.state === 'dropped');
   const closedCardsCount = doneCards.length + droppedCards.length;
 
   type KanbanColumnDef =
@@ -277,17 +286,37 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
       onMouseEnter={(e) => (e.currentTarget.style.borderColor = '#6366f1')}
       onMouseLeave={(e) => (e.currentTarget.style.borderColor = '#334155')}
     >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.2rem' }}>
-        <span style={{
-          fontSize: '0.65rem',
-          fontWeight: 700,
-          padding: '0.1rem 0.25rem',
-          borderRadius: '0.2rem',
-          backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
-          color: '#fff',
-        }}>
-          {t.priority}
-        </span>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+          <span style={{
+            fontSize: '0.65rem',
+            fontWeight: 700,
+            padding: '0.1rem 0.25rem',
+            borderRadius: '0.2rem',
+            backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
+            color: '#fff',
+          }}>
+            {t.priority}
+          </span>
+          {t.category === 'micro' && (
+            <span style={{
+              fontSize: '0.6rem',
+              fontWeight: 700,
+              backgroundColor: '#27272a',
+              color: '#a1a1aa',
+              padding: '0.05rem 0.25rem',
+              borderRadius: '0.2rem',
+              textTransform: 'uppercase',
+            }}>
+              micro
+            </span>
+          )}
+          {t.fields?.kind?.value ? (
+            <KindBadge kind={String(t.fields.kind.value)} size={11} />
+          ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' ? (
+            <KindBadge kind={t.kind} size={11} />
+          ) : null}
+        </div>
         <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</span>
       </div>
       <div style={{
@@ -301,6 +330,11 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
       }}>
         {t.title}
       </div>
+      {t.labels && t.labels.length > 0 && (
+        <div style={{ marginBottom: '0.4rem' }}>
+          <LabelList labels={t.labels} maxVisible={3} size="xs" />
+        </div>
+      )}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.7rem', color: '#64748b' }}>
         <span>{t.executor || 'self'}</span>
         <span style={{ color: '#475569' }}>{t.category}</span>
@@ -423,6 +457,8 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
             })}
           </div>
 
+          <MicrotaskQuickAdd onCreated={onRefresh} />
+
           <button
             onClick={handleOpenSyncPreview}
             disabled={syncingIndex}
@@ -484,6 +520,13 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
         ))}
       </div>
 
+      {/* Shared Filter Bar across views */}
+      <SharedFilterBar
+        filters={sharedFilters}
+        onChange={setSharedFilters}
+        showGroupByLabel={viewMode === 'tree'}
+      />
+
       {/* Main Backlog View */}
       {viewMode === 'queue' && (
         <div>
@@ -527,19 +570,40 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                     e.currentTarget.style.backgroundColor = '#1e293b';
                   }}
                 >
-                  {/* ID */}
-                  <span
-                    style={{
-                      fontSize: '0.8rem',
-                      fontWeight: 700,
-                      color: '#818cf8',
-                      fontFamily: 'monospace',
-                      flexShrink: 0,
-                      minWidth: '42px',
-                    }}
-                  >
-                    {t.id}
-                  </span>
+                  {/* ID + Micro + Kind */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}>
+                    <span
+                      style={{
+                        fontSize: '0.8rem',
+                        fontWeight: 700,
+                        color: '#818cf8',
+                        fontFamily: 'monospace',
+                        minWidth: '42px',
+                      }}
+                    >
+                      {t.id}
+                    </span>
+                    {t.category === 'micro' && (
+                      <span
+                        style={{
+                          fontSize: '0.6rem',
+                          fontWeight: 700,
+                          backgroundColor: '#27272a',
+                          color: '#a1a1aa',
+                          padding: '0.05rem 0.25rem',
+                          borderRadius: '0.2rem',
+                          textTransform: 'uppercase',
+                        }}
+                      >
+                        micro
+                      </span>
+                    )}
+                    {t.fields?.kind?.value ? (
+                      <KindBadge kind={String(t.fields.kind.value)} size={11} />
+                    ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' ? (
+                      <KindBadge kind={t.kind} size={11} />
+                    ) : null}
+                  </div>
 
                   {/* Title */}
                   <span
@@ -557,6 +621,11 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                   >
                     {t.title}
                   </span>
+
+                  {/* Labels if present */}
+                  {t.labels && t.labels.length > 0 && (
+                    <LabelList labels={t.labels} maxVisible={2} size="xs" />
+                  )}
 
                   {/* Priority chip */}
                   <span
@@ -793,7 +862,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                 );
               }
 
-              const colTasks = tasks.filter((t) => col.states.includes(t.state));
+              const colTasks = filteredTasks.filter((t) => col.states.includes(t.state));
               return (
                 <div
                   key={col.id}
@@ -852,6 +921,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
           onVisibleStatesChange={updateTreeStates}
           onSelectTask={(task) => setSelectedTask(task)}
           onRefresh={onRefresh}
+          sharedFilters={sharedFilters}
         />
       )}
 

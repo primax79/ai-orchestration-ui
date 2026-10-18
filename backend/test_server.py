@@ -2967,3 +2967,198 @@ def test_task_structure_endpoints(tmp_path):
         state.workspace = old_ws
 
 
+def test_microtask_kind_labels_promote_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "micro_ws"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+    (tasks_dir / "01-test").mkdir()
+    (tasks_dir / "01-test" / "plan.md").write_text(
+        "# 01 - Test Initiative\n\n"
+        "## Tasks\n\n"
+        "### 01.1 - Root Task\n\n"
+        "- **Status:** `open` · **Priority:** P2 · **Size:** M\n"
+        "- **Goal:** Root task goal\n\n"
+        "### 01.2 - Child Task\n\n"
+        "- **Status:** `open` · **Priority:** P2 · **Size:** S\n"
+        "- **Goal:** Child task goal\n",
+        encoding="utf-8",
+    )
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # 1. Unauthenticated checks
+        assert client.get("/api/tasks/labels").status_code == 401
+        assert client.post("/api/tasks/micro").status_code == 401
+        assert client.post("/api/tasks/01.1/kind/preview").status_code == 401
+        assert client.post("/api/tasks/01.1/kind").status_code == 401
+        assert client.post("/api/tasks/01.1/labels/preview").status_code == 401
+        assert client.post("/api/tasks/01.1/labels").status_code == 401
+        assert client.post("/api/tasks/T001/promote/preview").status_code == 401
+        assert client.post("/api/tasks/T001/promote").status_code == 401
+        assert client.post("/api/inbox/N001/to-microtask").status_code == 401
+
+        # 2. Initial labels list
+        res_lbls = client.get("/api/tasks/labels", headers=headers)
+        assert res_lbls.status_code == 200
+        assert res_lbls.json().get("labels") == []
+
+        # 3. Microtask creation validation
+        res_bad_title = client.post("/api/tasks/micro", headers=headers, json={"title": ""})
+        assert res_bad_title.status_code == 400
+
+        res_bad_kind = client.post("/api/tasks/micro", headers=headers, json={"title": "Test", "kind": "invalid"})
+        assert res_bad_kind.status_code == 400
+
+        res_bad_prio = client.post("/api/tasks/micro", headers=headers, json={"title": "Test", "priority": "P9"})
+        assert res_bad_prio.status_code == 400
+
+        # Successful microtask creation with WebSocket broadcast verification
+        with client.websocket_connect(f"/ws?token={token}") as sock:
+            init_msg = sock.receive_json()
+            assert init_msg.get("type") == "connected"
+
+            res_create = client.post(
+                "/api/tasks/micro",
+                headers=headers,
+                json={
+                    "title": "Fix navbar overflow",
+                    "kind": "bug",
+                    "priority": "P1",
+                    "labels": ["ui", "regression"],
+                    "what": "Fix the horizontal scroll on small screens.",
+                },
+            )
+            assert res_create.status_code == 201
+            cdata = res_create.json()
+            assert cdata.get("ok") is True
+            micro_id = cdata.get("id")
+            assert micro_id is not None
+            assert micro_id.startswith("T")
+
+            ws_msg1 = sock.receive_json()
+            assert ws_msg1.get("type") == "changed"
+            assert ws_msg1.get("areas") == ["tasks"]
+
+            ws_msg2 = sock.receive_json()
+            assert ws_msg2.get("type") == "task_created"
+            assert ws_msg2.get("task_id") == micro_id
+
+        # 4. Check labels list reflects the new microtask labels
+        res_lbls2 = client.get("/api/tasks/labels", headers=headers)
+        assert res_lbls2.status_code == 200
+        lbl_names = [item["label"] for item in res_lbls2.json().get("labels", [])]
+        assert "ui" in lbl_names
+        assert "regression" in lbl_names
+
+        # 5. Query parameters on tasks list and graph
+        res_filter_kind = client.get("/api/tasks?kind=bug", headers=headers)
+        assert res_filter_kind.status_code == 200
+
+        res_filter_label = client.get("/api/tasks/graph?label=ui", headers=headers)
+        assert res_filter_label.status_code == 200
+        gdata = res_filter_label.json()
+        assert gdata.get("ok") is True
+        assert any(n["id"] == micro_id for n in gdata.get("nodes", []))
+
+        # 6. Kind mutation preview & apply
+        res_bad_k = client.post(f"/api/tasks/{micro_id}/kind/preview", headers=headers, json={"kind": "unknown"})
+        assert res_bad_k.status_code == 400
+
+        res_kind_prev = client.post(f"/api/tasks/{micro_id}/kind/preview", headers=headers, json={"kind": "fix"})
+        assert res_kind_prev.status_code == 200
+        kprev = res_kind_prev.json()
+        assert kprev.get("dry_run") is True
+        task_hash = kprev.get("task_hash") or kprev.get("hash")
+        assert task_hash
+
+        res_k_stale = client.post(f"/api/tasks/{micro_id}/kind", headers=headers, json={"kind": "fix", "expect_task_hash": "deadbeef" * 8})
+        assert res_k_stale.status_code == 409
+
+        res_k_ok = client.post(f"/api/tasks/{micro_id}/kind", headers=headers, json={"kind": "fix", "expect_task_hash": task_hash})
+        assert res_k_ok.status_code == 200
+
+        # 7. Labels mutation preview & apply
+        res_bad_lbl = client.post(f"/api/tasks/{micro_id}/labels/preview", headers=headers, json={"add": ["INVALID LABEL!"]})
+        assert res_bad_lbl.status_code == 400
+
+        res_lbl_prev = client.post(f"/api/tasks/{micro_id}/labels/preview", headers=headers, json={"add": ["frontend"]})
+        assert res_lbl_prev.status_code == 200
+        lprev = res_lbl_prev.json()
+        assert lprev.get("dry_run") is True
+        l_hash = lprev.get("task_hash") or lprev.get("hash")
+        assert l_hash
+
+        res_lbl_stale = client.post(f"/api/tasks/{micro_id}/labels", headers=headers, json={"add": ["frontend"], "expect_task_hash": "badhash"})
+        assert res_lbl_stale.status_code == 409
+
+        res_lbl_ok = client.post(f"/api/tasks/{micro_id}/labels", headers=headers, json={"add": ["frontend"], "expect_task_hash": l_hash})
+        assert res_lbl_ok.status_code == 200
+
+        # 8. Promote preview and apply
+        res_prom_404 = client.post("/api/tasks/T999/promote/preview", headers=headers, json={"category": "bugfix"})
+        assert res_prom_404.status_code == 404
+
+        res_prom_prev = client.post(f"/api/tasks/{micro_id}/promote/preview", headers=headers, json={"category": "bugfix"})
+        assert res_prom_prev.status_code == 200
+        pprev = res_prom_prev.json()
+        assert pprev.get("dry_run") is True
+        assert pprev.get("category") == "bugfix"
+        p_hash = pprev.get("hash")
+        assert p_hash
+
+        res_prom_stale = client.post(f"/api/tasks/{micro_id}/promote", headers=headers, json={"category": "bugfix", "expect_task_hash": "wrong"})
+        assert res_prom_stale.status_code == 409
+
+        res_prom_ok = client.post(f"/api/tasks/{micro_id}/promote", headers=headers, json={"category": "bugfix", "expect_task_hash": p_hash})
+        assert res_prom_ok.status_code == 200
+        pdata = res_prom_ok.json()
+        assert pdata.get("ok") is True
+        assert pdata.get("category") == "bugfix"
+
+        # Check detail endpoint retrieves promoted full task
+        res_prom_detail = client.get(f"/api/tasks/{micro_id}", headers=headers)
+        assert res_prom_detail.status_code == 200
+        content = res_prom_detail.json().get("content", "")
+        assert "## Goal" in content
+        assert "## Steps" in content
+        assert "## Verification" in content
+
+        # 9. Convert bug note to microtask
+        inbox_add = client.post(
+            "/api/inbox",
+            headers=headers,
+            json={
+                "title": "Button click missing feedback",
+                "kind": "bug",
+                "about": "frontend",
+                "body": "User clicks the button and nothing shows up.",
+            },
+        )
+        assert inbox_add.status_code == 200
+        note_id = inbox_add.json().get("id")
+        assert note_id
+
+        res_conv = client.post(f"/api/inbox/{note_id}/to-microtask", headers=headers)
+        assert res_conv.status_code == 200
+        conv_data = res_conv.json()
+        assert conv_data.get("ok") is True
+        created_micro_id = conv_data.get("id")
+        assert created_micro_id.startswith("T")
+
+        # Note should now be resolved
+        res_note = client.get(f"/api/inbox/{note_id}", headers=headers)
+        assert res_note.status_code == 200
+        assert res_note.json()["note"]["status"] == "processed"
+        assert res_note.json()["note"]["produced"] == created_micro_id
+
+    finally:
+        state.workspace = old_ws
+
+
+

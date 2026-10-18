@@ -190,11 +190,19 @@ export const api = {
     throw new ApiError('Workspace switching is not supported in standalone browser mode. Start another server with the desired workspace.', 400);
   },
 
-  async getTasks(): Promise<TaskListResponse> {
+  async getTasks(filters?: { kind?: string[]; label?: string[] }): Promise<TaskListResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskListResponse>('getTasks');
+      return sendVsCodeMessage<TaskListResponse>('getTasks', filters);
     }
-    return apiFetch<TaskListResponse>('/api/tasks');
+    const params = new URLSearchParams();
+    if (filters?.kind) {
+      filters.kind.forEach((k) => params.append('kind', k));
+    }
+    if (filters?.label) {
+      filters.label.forEach((l) => params.append('label', l));
+    }
+    const qs = params.toString();
+    return apiFetch<TaskListResponse>(qs ? `/api/tasks?${qs}` : '/api/tasks');
   },
 
   async validateTasks(): Promise<any> {
@@ -1189,7 +1197,7 @@ import type {
 } from './types';
 
 export interface TimelineApiExtensions {
-  getTasksGraph(): Promise<TaskGraphResponse>;
+  getTasksGraph(filters?: { kind?: string[]; label?: string[] }): Promise<TaskGraphResponse>;
   previewSetPriority(taskId: string, payload: SetPriorityPayload): Promise<TaskMutationPreviewResult>;
   setPriority(taskId: string, payload: SetPriorityPayload): Promise<any>;
   previewSetSize(taskId: string, payload: SetSizePayload): Promise<TaskMutationPreviewResult>;
@@ -1199,11 +1207,19 @@ export interface TimelineApiExtensions {
 }
 
 export const timelineApi: TimelineApiExtensions = {
-  async getTasksGraph(): Promise<TaskGraphResponse> {
+  async getTasksGraph(filters?: { kind?: string[]; label?: string[] }): Promise<TaskGraphResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskGraphResponse>('getGraph');
+      return sendVsCodeMessage<TaskGraphResponse>('getGraph', filters);
     }
-    return apiFetch<TaskGraphResponse>('/api/tasks/graph');
+    const params = new URLSearchParams();
+    if (filters?.kind) {
+      filters.kind.forEach((k) => params.append('kind', k));
+    }
+    if (filters?.label) {
+      filters.label.forEach((l) => params.append('label', l));
+    }
+    const qs = params.toString();
+    return apiFetch<TaskGraphResponse>(qs ? `/api/tasks/graph?${qs}` : '/api/tasks/graph');
   },
 
   async previewSetPriority(taskId: string, payload: SetPriorityPayload): Promise<TaskMutationPreviewResult> {
@@ -1404,5 +1420,126 @@ export const taskStructureApi: TaskStructureApiExtensions = {
 };
 
 Object.assign(api, taskStructureApi);
+
+// ---------------------------------------------------------------------------
+// Microtasks, Kinds & Labels API (Task 10.5)
+// ---------------------------------------------------------------------------
+
+import type {
+  LabelsResponse,
+  CreateMicrotaskPayload,
+  CreateMicrotaskResponse,
+  PromoteMicrotaskPayload,
+  PromoteMicrotaskResponse,
+  SetKindPayload,
+  SetKindResponse,
+  SetLabelsPayload,
+  SetLabelsResponse,
+  InboxToMicrotaskPayload,
+} from './types';
+
+export interface MicrotaskAndLabelsApiExtensions {
+  getLabels(): Promise<LabelsResponse>;
+  createMicrotask(payload: CreateMicrotaskPayload): Promise<CreateMicrotaskResponse>;
+  previewPromoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse>;
+  promoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse>;
+  previewSetKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse>;
+  setKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse>;
+  previewSetLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse>;
+  setLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse>;
+  inboxToMicrotask(noteId: string, payload?: InboxToMicrotaskPayload): Promise<CreateMicrotaskResponse>;
+}
+
+export const microtaskAndLabelsApi: MicrotaskAndLabelsApiExtensions = {
+  async getLabels(): Promise<LabelsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<LabelsResponse>('getLabels');
+    }
+    return apiFetch<LabelsResponse>('/api/tasks/labels');
+  },
+
+  async createMicrotask(payload: CreateMicrotaskPayload): Promise<CreateMicrotaskResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<CreateMicrotaskResponse>('createMicrotask', payload);
+    }
+    return apiFetch<CreateMicrotaskResponse>('/api/tasks/micro', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewPromoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<PromoteMicrotaskResponse>('previewPromoteMicrotask', { taskId, ...payload });
+    }
+    return apiFetch<PromoteMicrotaskResponse>(`/api/tasks/${encodeURIComponent(taskId)}/promote/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async promoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<PromoteMicrotaskResponse>('promoteMicrotask', { taskId, ...payload });
+    }
+    return apiFetch<PromoteMicrotaskResponse>(`/api/tasks/${encodeURIComponent(taskId)}/promote`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async previewSetKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetKindResponse>('previewSetKind', { taskId, ...payload });
+    }
+    return apiFetch<SetKindResponse>(`/api/tasks/${encodeURIComponent(taskId)}/kind/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async setKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetKindResponse>('setKind', { taskId, ...payload });
+    }
+    return apiFetch<SetKindResponse>(`/api/tasks/${encodeURIComponent(taskId)}/kind`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewSetLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetLabelsResponse>('previewSetLabels', { taskId, ...payload });
+    }
+    return apiFetch<SetLabelsResponse>(`/api/tasks/${encodeURIComponent(taskId)}/labels/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async setLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetLabelsResponse>('setLabels', { taskId, ...payload });
+    }
+    return apiFetch<SetLabelsResponse>(`/api/tasks/${encodeURIComponent(taskId)}/labels`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async inboxToMicrotask(noteId: string, payload?: InboxToMicrotaskPayload): Promise<CreateMicrotaskResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<CreateMicrotaskResponse>('inboxToMicrotask', { noteId, ...payload });
+    }
+    return apiFetch<CreateMicrotaskResponse>(`/api/inbox/${encodeURIComponent(noteId)}/to-microtask`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+};
+
+Object.assign(api, microtaskAndLabelsApi);
+
 
 

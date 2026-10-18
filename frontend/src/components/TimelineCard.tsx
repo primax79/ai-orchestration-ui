@@ -6,8 +6,12 @@ import {
   AlertTriangle,
   Link2,
   ChevronDown,
+  ArrowUpRight,
 } from 'lucide-react';
 import { TaskGraphNode, TaskSize } from '../types';
+import { KindBadge } from './KindBadge';
+import { LabelList } from './LabelChip';
+import { PromoteDialog } from './PromoteDialog';
 
 interface TimelineCardProps {
   node: TaskGraphNode;
@@ -20,6 +24,7 @@ interface TimelineCardProps {
   onRequestSetSize: (taskId: string, size: TaskSize) => Promise<void>;
   onRequestAddDep: (taskId: string, depId: string) => Promise<void>;
   onRequestRemoveDep: (taskId: string, depId: string) => Promise<void>;
+  onRefresh?: () => void;
 }
 
 const PRIORITY_COLORS: Record<string, string> = {
@@ -89,10 +94,12 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
   onRequestSetSize,
   onRequestAddDep,
   onRequestRemoveDep,
+  onRefresh,
 }) => {
   const [showPriorityMenu, setShowPriorityMenu] = useState(false);
   const [showSizeMenu, setShowSizeMenu] = useState(false);
   const [showDepPicker, setShowDepPicker] = useState(false);
+  const [showPromote, setShowPromote] = useState(false);
 
   // Priority edit state
   const [selectedPriority, setSelectedPriority] = useState<'P0' | 'P1' | 'P2' | 'P3'>(node.priority);
@@ -112,6 +119,7 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
   const size = node.size || 'M';
   const cardWidth = SIZE_WIDTHS[size] || 230;
   const isDefaultSize = node.size_source === 'default';
+  const isMicro = size === 'XS' || node.group === 'micro' || node.node_type === 'microtask';
 
   // Compute in-memory graph reachable descendants to instantly flag cycles
   const downstreamDescendants = React.useMemo(() => {
@@ -193,11 +201,157 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
     }
   };
 
+  if (isMicro) {
+    return (
+      <>
+        <div
+          ref={cardRef}
+          id={`timeline-card-${node.id}`}
+          data-task-id={node.id}
+          data-card-id={node.id}
+          data-column={node.column}
+          style={{
+            width: `${Math.max(160, cardWidth)}px`,
+            backgroundColor: isSelected ? '#1e1b4b' : '#0f172a',
+            borderRadius: '9999px',
+            border: isHeaviestChain
+              ? '2px solid #f59e0b'
+              : isSelected
+              ? '2px solid #6366f1'
+              : '1px solid #334155',
+            boxShadow: isHeaviestChain ? '0 0 10px rgba(245, 158, 11, 0.3)' : '0 2px 4px rgba(0,0,0,0.2)',
+            padding: '0.25rem 0.55rem',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '0.35rem',
+            position: 'relative',
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+            boxSizing: 'border-box',
+          }}
+          onMouseEnter={(e) => {
+            if (!isSelected) {
+              e.currentTarget.style.borderColor = '#6366f1';
+              e.currentTarget.style.backgroundColor = '#1e293b';
+            }
+          }}
+          onMouseLeave={(e) => {
+            if (!isSelected) {
+              e.currentTarget.style.borderColor = '#334155';
+              e.currentTarget.style.backgroundColor = '#0f172a';
+            }
+          }}
+          onClick={() => onSelectTask?.(node)}
+        >
+          {node.kind && <KindBadge kind={node.kind} size={11} />}
+          <span
+            style={{
+              fontSize: '0.62rem',
+              fontWeight: 700,
+              color: '#a1a1aa',
+              backgroundColor: '#27272a',
+              padding: '0.05rem 0.25rem',
+              borderRadius: '9999px',
+              textTransform: 'uppercase',
+              flexShrink: 0,
+            }}
+          >
+            micro
+          </span>
+          <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#38bdf8', fontFamily: 'monospace', flexShrink: 0 }}>
+            {node.id}
+          </span>
+          <span
+            style={{
+              fontSize: '0.72rem',
+              fontWeight: 500,
+              color: '#f8fafc',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              maxWidth: '85px',
+              flex: 1,
+            }}
+            title={node.title}
+          >
+            {node.title}
+          </span>
+          <span
+            style={{
+              fontSize: '0.62rem',
+              fontWeight: 700,
+              padding: '0.05rem 0.3rem',
+              borderRadius: '9999px',
+              backgroundColor: PRIORITY_COLORS[node.priority] || '#64748b',
+              color: '#fff',
+              flexShrink: 0,
+            }}
+          >
+            {node.priority}
+          </span>
+          <span
+            style={{
+              fontSize: '0.62rem',
+              fontWeight: 600,
+              padding: '0.05rem 0.25rem',
+              borderRadius: '9999px',
+              backgroundColor: '#1e293b',
+              border: '1px solid #475569',
+              color: '#cbd5e1',
+              flexShrink: 0,
+            }}
+          >
+            XS
+          </span>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowPromote(true);
+            }}
+            title="Promote to full task"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.15rem',
+              padding: '0.1rem 0.3rem',
+              borderRadius: '9999px',
+              backgroundColor: 'rgba(99, 102, 241, 0.2)',
+              border: '1px solid #4f46e5',
+              color: '#c7d2fe',
+              fontSize: '0.62rem',
+              fontWeight: 600,
+              cursor: 'pointer',
+              flexShrink: 0,
+            }}
+          >
+            <ArrowUpRight size={10} />
+            <span>Promote</span>
+          </button>
+        </div>
+
+        {showPromote && (
+          <PromoteDialog
+            taskId={node.id}
+            taskTitle={node.title}
+            isOpen={true}
+            onClose={() => setShowPromote(false)}
+            onSuccess={() => {
+              setShowPromote(false);
+              onRefresh?.();
+            }}
+          />
+        )}
+      </>
+    );
+  }
+
   return (
     <div
       ref={cardRef}
       id={`timeline-card-${node.id}`}
       data-task-id={node.id}
+      data-card-id={node.id}
       data-column={node.column}
       style={{
         width: `${cardWidth}px`,
@@ -222,23 +376,26 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
     >
       {/* Top Meta Row */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.25rem' }}>
-        {/* Initiative / Group Badge */}
-        <span
-          style={{
-            fontSize: '0.65rem',
-            fontWeight: 700,
-            color: groupColor,
-            textTransform: 'uppercase',
-            letterSpacing: '0.025em',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            maxWidth: '120px',
-          }}
-          title={`Group: ${node.group}`}
-        >
-          {node.group}
-        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
+          {/* Initiative / Group Badge */}
+          <span
+            style={{
+              fontSize: '0.65rem',
+              fontWeight: 700,
+              color: groupColor,
+              textTransform: 'uppercase',
+              letterSpacing: '0.025em',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              maxWidth: '90px',
+            }}
+            title={`Group: ${node.group}`}
+          >
+            {node.group}
+          </span>
+          {node.kind && <KindBadge kind={node.kind} size={11} showLabel={false} />}
+        </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
           {isHeaviestChain && (
@@ -528,6 +685,11 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
       >
         {node.title}
       </div>
+
+      {/* Labels */}
+      {node.labels && node.labels.length > 0 && (
+        <LabelList labels={node.labels} maxVisible={3} size="xs" />
+      )}
 
       {/* Dependencies Section */}
       <div

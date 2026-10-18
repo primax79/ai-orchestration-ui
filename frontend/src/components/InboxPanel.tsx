@@ -24,6 +24,7 @@ import {
   Info,
   FileDown,
   FileText,
+  Zap,
 } from 'lucide-react';
 import {
   InboxNoteItem,
@@ -34,7 +35,7 @@ import {
   TriageProposal,
   AttachmentDetail,
 } from '../types';
-import { api, ApiError } from '../api';
+import { api, ApiError, microtaskAndLabelsApi } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
 import {
@@ -374,6 +375,27 @@ const ConvertToTaskDialog: React.FC<ConvertToTaskDialogProps> = ({
     }
   };
 
+  const handleConvertAsMicrotask = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await microtaskAndLabelsApi.inboxToMicrotask(note.id, {
+        title: title.trim(),
+        priority,
+      });
+      if (res && res.id) {
+        onSuccess(res.id);
+        onClose();
+      } else {
+        setError('Microtask created but no task ID returned');
+      }
+    } catch (err: any) {
+      setError(err?.message || String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <div
       style={{
@@ -611,6 +633,27 @@ const ConvertToTaskDialog: React.FC<ConvertToTaskDialogProps> = ({
               Cancel
             </button>
             <button
+              type="button"
+              onClick={handleConvertAsMicrotask}
+              disabled={submitting || !title.trim()}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.35rem',
+                padding: '0.45rem 0.9rem',
+                backgroundColor: '#1e293b',
+                border: '1px solid #6366f1',
+                borderRadius: '0.375rem',
+                color: '#c7d2fe',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+                cursor: submitting || !title.trim() ? 'not-allowed' : 'pointer',
+              }}
+            >
+              <Zap size={14} color="#818cf8" />
+              <span>Convert as Microtask</span>
+            </button>
+            <button
               type="submit"
               disabled={submitting}
               style={{
@@ -672,6 +715,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const [conflictError, setConflictError] = useState<string | null>(null);
   const [createdTasks, setCreatedTasks] = useState<string[]>([]);
   const [showConvertToTask, setShowConvertToTask] = useState(false);
+  const [isConvertingMicro, setIsConvertingMicro] = useState(false);
 
   // Run and Triage Proposal states
   const [showRunDialog, setShowRunDialog] = useState(false);
@@ -1228,6 +1272,23 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       onSaved();
     } catch (err: any) {
       setInlineError(err?.message || String(err));
+    }
+  };
+
+  // Convert directly to microtask action
+  const handleConvertToMicrotask = async () => {
+    if (!noteId) return;
+    setIsConvertingMicro(true);
+    try {
+      const res = await microtaskAndLabelsApi.inboxToMicrotask(noteId);
+      if (res && res.id) {
+        setCreatedTasks((prev) => [...prev, res.id]);
+        onSaved();
+      }
+    } catch (err: any) {
+      setInlineError(err?.message || 'Failed to convert note to microtask');
+    } finally {
+      setIsConvertingMicro(false);
     }
   };
 
@@ -2460,6 +2521,31 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
               >
                 <Layers size={14} />
                 <span>Convert to Task</span>
+              </button>
+            )}
+
+            {noteId && (
+              <button
+                type="button"
+                disabled={isConvertingMicro}
+                onClick={handleConvertToMicrotask}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.35rem',
+                  padding: '0.4rem 0.8rem',
+                  backgroundColor: kind === 'bug' ? 'rgba(244, 63, 94, 0.2)' : '#1e293b',
+                  border: kind === 'bug' ? '1px solid #f43f5e' : '1px solid #475569',
+                  borderRadius: '0.375rem',
+                  color: kind === 'bug' ? '#fca5a5' : '#cbd5e1',
+                  fontSize: '0.8rem',
+                  fontWeight: 600,
+                  cursor: isConvertingMicro ? 'not-allowed' : 'pointer',
+                }}
+                title="Convert this note directly into a microtask (XS)"
+              >
+                {isConvertingMicro ? <Loader2 size={14} className="spin" /> : <Zap size={14} />}
+                <span>Convert to Microtask</span>
               </button>
             )}
 
