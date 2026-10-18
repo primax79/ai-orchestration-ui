@@ -3495,4 +3495,152 @@ def test_websocket_events_and_replay(tmp_path):
         state.workspace = old_ws
 
 
+def test_orchestrator_status_endpoint(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        res = client.get("/api/orchestrator/status", headers=headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("ok") is True
+        assert data.get("role") == "orchestrator"
+        assert data.get("generation") >= 1
+        assert "tool" in data
+        assert "queue" in data
+        assert "rotate_after_tokens" in data
+    finally:
+        state.workspace = old_ws
+
+
+def test_orchestrator_chat_and_queue_endpoint(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Empty message should fail with 400
+        res_empty = client.post("/api/orchestrator/chat", headers=headers, json={"message": "   "})
+        assert res_empty.status_code == 400
+        assert "message is required" in res_empty.json().get("error", "")
+
+        # Valid chat message
+        res_chat = client.post("/api/orchestrator/chat", headers=headers, json={"message": "Hello orchestrator!"})
+        assert res_chat.status_code == 200
+        chat_data = res_chat.json()
+        assert chat_data.get("status") == "enqueued"
+        turn_id = chat_data.get("turn_id")
+        assert turn_id is not None
+
+        # Queue check
+        res_q = client.get("/api/orchestrator/queue", headers=headers)
+        assert res_q.status_code == 200
+        q_data = res_q.json()
+        assert q_data.get("ok") is True
+        assert any(item.get("turn_id") == turn_id for item in q_data.get("queue", []))
+    finally:
+        state.workspace = old_ws
+
+
+def test_orchestrator_conversation_and_turn_detail(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Enqueue one turn
+        res_chat = client.post("/api/orchestrator/chat", headers=headers, json={"message": "First question"})
+        assert res_chat.status_code == 200
+        turn1_id = res_chat.json().get("turn_id")
+
+        # Manually write an archived turn with assistant output
+        turns_dir = tmp_path / ".ai-orchestration" / "orchestrator" / "turns" / "000099"
+        turns_dir.mkdir(parents=True, exist_ok=True)
+        turn_json = turns_dir / "turn.json"
+        turn_json.write_text(json.dumps({
+            "turn_id": "000099",
+            "turn_seq": 99,
+            "role": "orchestrator",
+            "state": "done",
+            "type": "owner_chat",
+            "message": "Past question",
+            "prompt_text": "Past prompt",
+            "assistant_messages": ["Hello back! Here is my plan."],
+            "usage": {"input_tokens": 120, "output_tokens": 45, "estimated_context_tokens": 500},
+            "created_at": "2026-10-18T01:00:00Z",
+            "ended_at": "2026-10-18T01:00:05Z",
+            "duration_seconds": 5.0,
+        }), encoding="utf-8")
+
+        # Read conversation
+        res_conv = client.get("/api/orchestrator/conversation", headers=headers)
+        assert res_conv.status_code == 200
+        conv_data = res_conv.json()
+        assert conv_data.get("ok") is True
+        turns = conv_data.get("turns", [])
+        assert len(turns) >= 2
+        # Verify ordering: turn1 should precede turn 99
+        ids = [t.get("turn_id") for t in turns]
+        assert turn1_id in ids
+        assert "000099" in ids
+        assert ids.index(turn1_id) < ids.index("000099")
+
+        # Check turn detail
+        res_detail = client.get("/api/orchestrator/turns/000099", headers=headers)
+        assert res_detail.status_code == 200
+        detail_data = res_detail.json()
+        assert detail_data.get("ok") is True
+        assert detail_data.get("turn", {}).get("output") == "Hello back! Here is my plan."
+
+        # Non-existent turn detail
+        res_not_found = client.get("/api/orchestrator/turns/999999", headers=headers)
+        assert res_not_found.status_code == 404
+    finally:
+        state.workspace = old_ws
+
+
+def test_orchestrator_controls(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Pause orchestrator
+        res_pause = client.post("/api/orchestrator/pause", headers=headers)
+        assert res_pause.status_code == 200
+        assert res_pause.json().get("status") == "paused"
+
+        # Check status shows paused
+        res_st_paused = client.get("/api/orchestrator/status", headers=headers)
+        assert res_st_paused.status_code == 200
+        assert res_st_paused.json().get("status") == "paused"
+
+        # Resume orchestrator
+        res_resume = client.post("/api/orchestrator/resume", headers=headers)
+        assert res_resume.status_code == 200
+        assert res_resume.json().get("status") in ("active", "resumed")
+
+        # Check status shows active
+        res_st_active = client.get("/api/orchestrator/status", headers=headers)
+        assert res_st_active.status_code == 200
+        assert res_st_active.json().get("status") == "active"
+
+        # Enqueue a turn to cancel
+        res_chat = client.post("/api/orchestrator/chat", headers=headers, json={"message": "To be cancelled"})
+        turn_id = res_chat.json().get("turn_id")
+
+        # Cancel turn
+        res_cancel = client.post("/api/orchestrator/cancel", headers=headers, json={"turn_id": turn_id})
+        assert res_cancel.status_code == 200
+        assert res_cancel.json().get("state") == "cancelled" or res_cancel.json().get("status") == "cancelled"
+
+        # Rotate orchestrator (with no_handoff to avoid running external CLI)
+        res_rotate = client.post("/api/orchestrator/rotate", headers=headers, json={"reason": "test_rotation", "no_handoff": True})
+        assert res_rotate.status_code == 200
+        assert res_rotate.json().get("generation") == 2
+    finally:
+        state.workspace = old_ws
+
+
 

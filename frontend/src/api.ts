@@ -1729,7 +1729,114 @@ export const microtaskAndLabelsApi: MicrotaskAndLabelsApiExtensions = {
   },
 };
 
+Object.assign(api, microtaskAndLabelsApi);
+
+// ---------------------------------------------------------------------------
+// Orchestrator Chat & Controls API (Task 12.8)
+// ---------------------------------------------------------------------------
+
+import type {
+  OrchestratorStatus,
+  OrchestratorTurn,
+  OrchestratorConversationResponse,
+  PostChatResponse,
+} from './types';
+
+export interface OrchestratorChatApiExtensions {
+  getOrchestratorStatus(): Promise<OrchestratorStatus>;
+  postOrchestratorChat(message: string, options?: { type?: string; priority?: string; policy?: string }): Promise<PostChatResponse>;
+  getOrchestratorConversation(params?: { limit?: number; offset?: number; order?: string }): Promise<OrchestratorConversationResponse>;
+  getOrchestratorTurn(turnId: string): Promise<{ ok: boolean; turn: OrchestratorTurn }>;
+  pauseOrchestrator(): Promise<any>;
+  resumeOrchestrator(): Promise<any>;
+  rotateOrchestrator(payload?: { tool?: string; model?: string; reason?: string; no_handoff?: boolean }): Promise<any>;
+  cancelOrchestratorTurn(turnId: string): Promise<any>;
+  runNextOrchestratorTurn(timeout?: number): Promise<any>;
+}
+
+export const orchestratorChatApi: OrchestratorChatApiExtensions = {
+  async getOrchestratorStatus(): Promise<OrchestratorStatus> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<OrchestratorStatus>('getOrchestratorStatus', {});
+    }
+    return apiFetch<OrchestratorStatus>('/api/orchestrator/status');
+  },
+
+  async postOrchestratorChat(message: string, options?: { type?: string; priority?: string; policy?: string }): Promise<PostChatResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<PostChatResponse>('postOrchestratorChat', { message, ...options });
+    }
+    return apiFetch<PostChatResponse>('/api/orchestrator/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message, ...(options || {}) }),
+    });
+  },
+
+  async getOrchestratorConversation(params?: { limit?: number; offset?: number; order?: string }): Promise<OrchestratorConversationResponse> {
+    const query = new URLSearchParams();
+    if (params?.limit !== undefined) query.set('limit', String(params.limit));
+    if (params?.offset !== undefined) query.set('offset', String(params.offset));
+    if (params?.order) query.set('order', params.order);
+    const qs = query.toString();
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<OrchestratorConversationResponse>('getOrchestratorConversation', params || {});
+    }
+    return apiFetch<OrchestratorConversationResponse>(`/api/orchestrator/conversation${qs ? `?${qs}` : ''}`);
+  },
+
+  async getOrchestratorTurn(turnId: string): Promise<{ ok: boolean; turn: OrchestratorTurn }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean; turn: OrchestratorTurn }>('getOrchestratorTurn', { turnId });
+    }
+    return apiFetch<{ ok: boolean; turn: OrchestratorTurn }>(`/api/orchestrator/turns/${encodeURIComponent(turnId)}`);
+  },
+
+  async pauseOrchestrator(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('pauseOrchestrator', {});
+    }
+    return apiFetch<any>('/api/orchestrator/pause', { method: 'POST' });
+  },
+
+  async resumeOrchestrator(): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('resumeOrchestrator', {});
+    }
+    return apiFetch<any>('/api/orchestrator/resume', { method: 'POST' });
+  },
+
+  async rotateOrchestrator(payload?: { tool?: string; model?: string; reason?: string; no_handoff?: boolean }): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('rotateOrchestrator', payload || {});
+    }
+    return apiFetch<any>('/api/orchestrator/rotate', {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async cancelOrchestratorTurn(turnId: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('cancelOrchestratorTurn', { turnId });
+    }
+    return apiFetch<any>(`/api/orchestrator/cancel/${encodeURIComponent(turnId)}`, { method: 'POST' });
+  },
+
+  async runNextOrchestratorTurn(timeout?: number): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('runNextOrchestratorTurn', { timeout });
+    }
+    return apiFetch<any>('/api/orchestrator/run-next', {
+      method: 'POST',
+      body: JSON.stringify(timeout ? { timeout } : {}),
+    });
+  },
+};
+
+Object.assign(api, orchestratorChatApi);
+
 export const eventsAndTriggersApi = api;
+
 
 
 

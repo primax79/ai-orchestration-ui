@@ -12,13 +12,14 @@ import {
   CheckCircle2,
   Zap,
   Radio,
+  Bot,
 } from 'lucide-react';
 import { WorkspaceInfo } from '../types';
 import { NotificationArea } from './NotificationArea';
 
 interface NavbarProps {
-  activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config';
-  setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config') => void;
+  activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'orchestrator' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config';
+  setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'orchestrator' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config') => void;
   workspace: WorkspaceInfo | null;
   onRefresh: () => void;
   isWsConnected: boolean;
@@ -85,6 +86,12 @@ export const Navbar: React.FC<NavbarProps> = ({
       shortLabel: 'Runs',
       badge: activeRunsCount,
       badgeColor: '#0ea5e9',
+    },
+    {
+      key: 'orchestrator' as const,
+      icon: <Bot size={16} />,
+      label: 'Orchestrator Chat',
+      shortLabel: 'Chat',
     },
     {
       key: 'use-cases' as const,
