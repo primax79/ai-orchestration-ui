@@ -11,7 +11,7 @@ import {
   CheckCheck,
   Ban,
 } from 'lucide-react';
-import { TaskItem, RunRecord } from '../types';
+import { TaskItem, RunRecord, shortTitle } from '../types';
 import { api } from '../api';
 
 interface RunsTabProps {
@@ -498,8 +498,19 @@ export const RunsTab: React.FC<RunsTabProps> = ({
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                         <span style={{ fontWeight: 700, color: '#818cf8' }}>{r.task_id}</span>
                         {taskItem && (
-                          <span style={{ color: '#cbd5e1', maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {taskItem.title}
+                          <span
+                            style={{
+                              color: '#94a3b8',
+                              fontSize: '0.85rem',
+                              fontWeight: 500,
+                              maxWidth: '240px',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              whiteSpace: 'nowrap',
+                            }}
+                            title={taskItem.title}
+                          >
+                            ({shortTitle(taskItem)})
                           </span>
                         )}
                       </div>

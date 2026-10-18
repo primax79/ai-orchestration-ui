@@ -36,6 +36,7 @@ import {
   ProposedTask,
   ProposedTaskEdits,
   AttachmentDetail,
+  shortTitle,
 } from '../types';
 import { api, ApiError, microtaskAndLabelsApi } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
@@ -2587,30 +2588,40 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                     <CheckCircle2 size={18} color="#10b981" />
                     <span>Triage proposal accepted! Created tasks:</span>
                     <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-                      {triageSuccessTasks.map((tId) => (
-                        <a
-                          key={tId}
-                          href={`#${tId}`}
-                          onClick={(e) => {
-                            e.preventDefault();
-                            onClose();
-                          }}
-                          style={{
-                            padding: '0.15rem 0.5rem',
-                            backgroundColor: '#047857',
-                            color: '#fff',
-                            borderRadius: '0.25rem',
-                            fontWeight: 600,
-                            textDecoration: 'none',
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: '0.25rem',
-                          }}
-                        >
-                          <span>{tId}</span>
-                          <ExternalLink size={12} />
-                        </a>
-                      ))}
+                      {triageSuccessTasks.map((tId, idx) => {
+                        const propTask = selectedRunProposal?.proposal?.tasks?.[idx];
+                        const sTitle = propTask ? shortTitle(propTask) : '';
+                        return (
+                          <a
+                            key={tId}
+                            href={`#${tId}`}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              onClose();
+                            }}
+                            title={propTask?.title || tId}
+                            style={{
+                              padding: '0.15rem 0.5rem',
+                              backgroundColor: '#047857',
+                              color: '#fff',
+                              borderRadius: '0.25rem',
+                              fontWeight: 600,
+                              textDecoration: 'none',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '0.25rem',
+                            }}
+                          >
+                            <span>{tId}</span>
+                            {sTitle && (
+                              <span style={{ opacity: 0.85, fontSize: '0.75rem', fontWeight: 500 }}>
+                                ({sTitle})
+                              </span>
+                            )}
+                            <ExternalLink size={12} />
+                          </a>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>

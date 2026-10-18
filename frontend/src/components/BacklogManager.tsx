@@ -317,7 +317,9 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
             <KindBadge kind={t.kind} size={11} />
           ) : null}
         </div>
-        <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8' }}>{t.id}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
+          <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8', flexShrink: 0 }}>{t.id}</span>
+        </div>
       </div>
       <div style={{
         fontSize: '0.8rem',
@@ -570,7 +572,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                     e.currentTarget.style.backgroundColor = '#1e293b';
                   }}
                 >
-                  {/* ID + Micro + Kind */}
+                  {/* ID + Short Title + Micro + Kind */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}>
                     <span
                       style={{

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { ListOrdered, Flame, ArrowRight } from 'lucide-react';
-import { TaskGraphNode } from '../types';
+import { TaskGraphNode, shortTitle } from '../types';
 import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { MicrotaskPill } from './MicrotaskPill';
@@ -192,6 +192,20 @@ export const TimelineReadyQueue: React.FC<TimelineReadyQueueProps> = ({
                     }}
                   >
                     {node.id}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: '0.75rem',
+                      color: '#94a3b8',
+                      fontWeight: 500,
+                      maxWidth: '140px',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title={node.title}
+                  >
+                    ({shortTitle(node)})
                   </span>
 
                   {/* Priority */}

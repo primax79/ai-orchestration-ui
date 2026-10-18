@@ -1273,6 +1273,75 @@ async def api_set_labels(request: Request) -> JSONResponse:
     return await _handle_set_labels(request, is_preview=False)
 
 
+async def _handle_set_short(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not TASK_MUTATION_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if body.get("dry_run") or body.get("preview") or request.query_params.get("dry_run"):
+        is_preview = True
+
+    short_title = body.get("short_title")
+    if short_title is None:
+        short_title = body.get("short")
+    if short_title is None:
+        short_title = ""
+    short_title = str(short_title).strip()
+
+    expect_plan_hash = (
+        body.get("expect_plan_hash")
+        or body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or body.get("plan_hash")
+        or request.query_params.get("expect_plan_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-plan-hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["tasks", "set-short", task_id, short_title, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--dry-run")
+    if expect_plan_hash:
+        cmd.extend(["--expect-plan-hash", str(expect_plan_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({"type": "changed", "areas": ["tasks"]})
+        else:
+            if isinstance(data, dict):
+                current_hash = expect_plan_hash or await _resolve_current_task_hash(tasks_dir, task_id)
+                if current_hash:
+                    if "hash" not in data:
+                        data["hash"] = current_hash
+                    if "plan_hash" not in data:
+                        data["plan_hash"] = current_hash
+                    if "task_hash" not in data:
+                        data["task_hash"] = current_hash
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_set_short(request: Request) -> JSONResponse:
+    return await _handle_set_short(request, is_preview=True)
+
+
+async def api_set_short(request: Request) -> JSONResponse:
+    return await _handle_set_short(request, is_preview=False)
+
+
 async def api_list_labels(request: Request) -> JSONResponse:
     tasks_dir = state.workspace / "tasks"
     if not tasks_dir.is_dir():
@@ -1330,6 +1399,9 @@ async def api_create_microtask(request: Request) -> JSONResponse:
         cmd.extend(["--executor", str(body["executor"])])
     if body.get("what"):
         cmd.extend(["--what", str(body["what"])])
+    short_title = str(body.get("short_title") or body.get("short") or "").strip()
+    if short_title:
+        cmd.extend(["--short", short_title])
 
     labels = _extract_labels(body.get("labels") or body.get("label"))
     for lbl in labels:
@@ -1469,6 +1541,9 @@ async def api_inbox_to_microtask(request: Request) -> JSONResponse:
         cmd.extend(["--executor", str(body["executor"])])
     if what:
         cmd.extend(["--what", str(what)])
+    short_title = str(body.get("short_title") or body.get("short") or "").strip()
+    if short_title:
+        cmd.extend(["--short", short_title])
     for lbl in labels:
         cmd.extend(["--label", lbl])
 
@@ -1508,6 +1583,9 @@ async def _handle_child_add(request: Request, is_preview: bool = False) -> JSONR
 
     tasks_dir = state.workspace / "tasks"
     cmd = ["tasks", "child", "add", parent_id, "--title", title, "--kind", kind, "--tasks-dir", str(tasks_dir), "--json"]
+    short_title = str(body.get("short_title") or body.get("short") or "").strip()
+    if short_title:
+        cmd.extend(["--short", short_title])
     if is_preview:
         cmd.append("--dry-run")
     else:
@@ -2229,6 +2307,9 @@ async def api_ask_question(request: Request) -> JSONResponse:
 
     if body.get("from_task"):
         cmd.extend(["--from-task", str(body["from_task"])])
+    short_title = str(body.get("short_title") or body.get("short") or "").strip()
+    if short_title:
+        cmd.extend(["--short", short_title])
     if body.get("question"):
         cmd.extend(["--question", str(body["question"])])
     if body.get("recommended"):
@@ -5120,6 +5201,8 @@ routes = [
     Route("/api/tasks/{id}/kind", api_set_kind, methods=["POST"]),
     Route("/api/tasks/{id}/labels/preview", api_preview_set_labels, methods=["POST"]),
     Route("/api/tasks/{id}/labels", api_set_labels, methods=["POST"]),
+    Route("/api/tasks/{id}/short/preview", api_preview_set_short, methods=["POST"]),
+    Route("/api/tasks/{id}/short", api_set_short, methods=["POST"]),
     Route("/api/tasks/{id}/promote/preview", api_preview_promote, methods=["POST"]),
     Route("/api/tasks/{id}/promote", api_promote, methods=["POST"]),
     Route("/api/tasks/{id}/child/preview", api_preview_child_add, methods=["POST"]),

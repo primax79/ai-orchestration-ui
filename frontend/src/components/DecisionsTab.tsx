@@ -18,7 +18,7 @@ import {
   Play,
   X,
 } from 'lucide-react';
-import { QuestionItem, TaskItem, AnswerAndResumePreviewResponse } from '../types';
+import { QuestionItem, TaskItem, AnswerAndResumePreviewResponse, shortTitle } from '../types';
 import { api } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -292,6 +292,54 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
     return map;
   }, [tasks]);
 
+  const renderBlockedTasks = useCallback((blocksStr?: string) => {
+    if (!blocksStr || blocksStr.trim() === '-' || blocksStr.trim() === '') {
+      return <span>-</span>;
+    }
+    const parts = blocksStr.split(',').map((s) => s.trim()).filter(Boolean);
+    return (
+      <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '0.4rem', alignItems: 'center' }}>
+        {parts.map((part, idx) => {
+          const task = taskMap.get(part);
+          return (
+            <span
+              key={`${part}-${idx}`}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.25rem',
+                backgroundColor: '#0f172a',
+                padding: '0.15rem 0.45rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #334155',
+                fontFamily: 'monospace',
+                color: '#fca5a5',
+              }}
+            >
+              <span>{part}</span>
+              {task && (
+                <span
+                  style={{
+                    color: '#94a3b8',
+                    fontWeight: 500,
+                    maxWidth: '140px',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    fontFamily: 'sans-serif',
+                  }}
+                  title={task.title}
+                >
+                  ({shortTitle(task)})
+                </span>
+              )}
+            </span>
+          );
+        })}
+      </span>
+    );
+  }, [taskMap]);
+
   const openQuestions = useMemo(() => {
     return questions.filter((q) => q.status === 'open');
   }, [questions]);
@@ -348,7 +396,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
       const task = taskMap.get(primaryTaskId);
       let label = key === 'No task' ? 'No task (Unlinked decisions)' : `Task ${key}`;
       if (task) {
-        label = `Task ${task.id}: ${task.title}`;
+        label = `Task ${task.id} (${shortTitle(task)}): ${task.title}`;
       }
       groups.push({ key, label, task, questions: qs });
     }
@@ -880,20 +928,34 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                             }}
                           >
                             <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                              <span
-                                style={{
-                                  fontSize: '0.85rem',
-                                  fontWeight: 700,
-                                  color: '#818cf8',
-                                  backgroundColor: '#0f172a',
-                                  padding: '0.2rem 0.5rem',
-                                  borderRadius: '0.375rem',
-                                  border: '1px solid #334155',
-                                  fontFamily: 'monospace',
-                                }}
-                              >
-                                {q.id}
-                              </span>
+                        <span
+                          style={{
+                            fontSize: '0.85rem',
+                            fontWeight: 700,
+                            color: '#818cf8',
+                            backgroundColor: '#0f172a',
+                            padding: '0.2rem 0.5rem',
+                            borderRadius: '0.375rem',
+                            border: '1px solid #334155',
+                            fontFamily: 'monospace',
+                          }}
+                        >
+                          {q.id}
+                        </span>
+                                <span
+                                  style={{
+                                    fontSize: '0.8rem',
+                                    color: '#94a3b8',
+                                    fontWeight: 500,
+                                    maxWidth: '220px',
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                  }}
+                                  title={q.question}
+                                >
+                                  ({shortTitle(q)})
+                                </span>
 
                               <span
                                 style={{
@@ -973,18 +1035,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                             }}
                           >
                             <span style={{ color: '#64748b', fontWeight: 600 }}>Blocked Tasks:</span>
-                            <span
-                              style={{
-                                backgroundColor: '#0f172a',
-                                padding: '0.15rem 0.5rem',
-                                borderRadius: '0.25rem',
-                                border: '1px solid #334155',
-                                fontFamily: 'monospace',
-                                color: q.blocks && q.blocks !== '-' ? '#fca5a5' : '#94a3b8',
-                              }}
-                            >
-                              {q.blocks || '-'}
-                            </span>
+                            {renderBlockedTasks(q.blocks)}
                           </div>
 
                           {/* Collapsible Context */}
@@ -1371,6 +1422,20 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                         </span>
                         <span
                           style={{
+                            fontSize: '0.8rem',
+                            color: '#94a3b8',
+                            fontWeight: 500,
+                            maxWidth: '220px',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                          title={q.question}
+                        >
+                          ({shortTitle(q)})
+                        </span>
+                        <span
+                          style={{
                             fontSize: '0.75rem',
                             padding: '0.15rem 0.5rem',
                             borderRadius: '1rem',
@@ -1391,9 +1456,13 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                               backgroundColor: '#0f172a',
                               color: '#94a3b8',
                               border: '1px solid #334155',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '0.3rem',
                             }}
                           >
-                            Blocks: <strong style={{ color: '#cbd5e1' }}>{blockedTaskId}</strong>
+                            <span>Blocks:</span>
+                            {renderBlockedTasks(blockedTaskId)}
                           </span>
                         )}
                       </div>
@@ -1672,15 +1741,16 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                     {/* Blocked tasks */}
                     <div
                       style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
                         fontSize: '0.8rem',
                         color: '#94a3b8',
                         marginBottom: '0.75rem',
                       }}
                     >
-                      Blocked Tasks:{' '}
-                      <span style={{ color: '#cbd5e1', fontFamily: 'monospace' }}>
-                        {q.blocks || '-'}
-                      </span>
+                      <span>Blocked Tasks:</span>
+                      {renderBlockedTasks(q.blocks)}
                     </div>
 
                     {/* Collapsible Context */}

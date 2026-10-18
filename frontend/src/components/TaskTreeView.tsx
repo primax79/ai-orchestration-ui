@@ -141,6 +141,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
   // Structure action dialog states
   const [addChildParent, setAddChildParent] = useState<TreeNode | null>(null);
   const [addChildTitle, setAddChildTitle] = useState('');
+  const [addChildShortTitle, setAddChildShortTitle] = useState('');
   const [addChildKind, setAddChildKind] = useState('feature');
   const [addChildLoading, setAddChildLoading] = useState(false);
   const [addChildError, setAddChildError] = useState<string | null>(null);
@@ -337,6 +338,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
     if (e) e.stopPropagation();
     setAddChildParent(node);
     setAddChildTitle('');
+    setAddChildShortTitle('');
     setAddChildKind('feature');
     setAddChildError(null);
   };
@@ -350,6 +352,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
     try {
       const res = await taskStructureApi.previewAddChild(addChildParent.id, {
         title: addChildTitle.trim(),
+        short_title: addChildShortTitle.trim() || undefined,
         kind: addChildKind,
       });
 
@@ -367,6 +370,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         nodeId: addChildParent.id,
         extraPayload: {
           title: addChildTitle.trim(),
+          short_title: addChildShortTitle.trim() || undefined,
           kind: addChildKind,
           allocatedId: res.allocated_id,
         },
@@ -463,6 +467,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
     if (actionType === 'add-child') {
       await taskStructureApi.addChild(nodeId, {
         title: extraPayload.title,
+        short_title: extraPayload.short_title,
         kind: extraPayload.kind,
         expect_plan_hash: hash,
       });
@@ -1478,6 +1483,28 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
                     boxSizing: 'border-box',
                   }}
                   autoFocus
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                  Short Title (optional, 3-4 words)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. Implement hierarchy view"
+                  value={addChildShortTitle}
+                  onChange={(e) => setAddChildShortTitle(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: '#0f172a',
+                    color: '#f8fafc',
+                    fontSize: '0.85rem',
+                    boxSizing: 'border-box',
+                  }}
                 />
               </div>
 

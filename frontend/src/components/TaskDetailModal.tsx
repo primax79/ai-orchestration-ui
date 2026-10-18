@@ -17,8 +17,9 @@ import {
   Trash2,
   Send,
   Paperclip,
+  Edit2,
 } from 'lucide-react';
-import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord, TreeNode, StructurePlanItem, TaskState } from '../types';
+import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord, TreeNode, StructurePlanItem, TaskState, shortTitle } from '../types';
 import { api, taskStructureApi } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
@@ -111,9 +112,16 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   // Structure action dialog states
   const [showAddSubtaskModal, setShowAddSubtaskModal] = useState(false);
   const [subtaskTitle, setSubtaskTitle] = useState('');
+  const [subtaskShortTitle, setSubtaskShortTitle] = useState('');
   const [subtaskKind, setSubtaskKind] = useState('feature');
   const [subtaskLoading, setSubtaskLoading] = useState(false);
   const [subtaskError, setSubtaskError] = useState<string | null>(null);
+
+  // Short title inline edit state
+  const [isEditingShortTitle, setIsEditingShortTitle] = useState(false);
+  const [editShortTitleValue, setEditShortTitleValue] = useState('');
+  const [shortTitleLoading, setShortTitleLoading] = useState(false);
+  const [shortTitleError, setShortTitleError] = useState<string | null>(null);
 
   const [structureConfirmData, setStructureConfirmData] = useState<{
     isOpen: boolean;
@@ -140,6 +148,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   // Ask question form state
   const [showAskForm, setShowAskForm] = useState(false);
   const [askQuestionText, setAskQuestionText] = useState('');
+  const [askQuestionShortTitle, setAskQuestionShortTitle] = useState('');
   const [askContextText, setAskContextText] = useState('');
   const [askOptions, setAskOptions] = useState<Array<{ title: string; consequence: string }>>([
     { title: '', consequence: '' },
@@ -264,6 +273,39 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     setSubtaskError(null);
   };
 
+  const handleSaveShortTitle = async () => {
+    const trimmed = editShortTitleValue.trim();
+    setShortTitleLoading(true);
+    setShortTitleError(null);
+    try {
+      const prevRes = await api.previewSetShortTitle(currentTask.id, {
+        short_title: trimmed,
+      });
+      if (!prevRes.ok) {
+        throw new Error(prevRes.error || 'Preview failed');
+      }
+      const planHash = prevRes.plan_hash || prevRes.hash || prevRes.task_hash || '';
+      const applyRes = await api.setShortTitle(currentTask.id, {
+        short_title: trimmed,
+        expect_plan_hash: planHash,
+      });
+      if (!applyRes.ok) {
+        throw new Error(applyRes.error || 'Failed to save short title');
+      }
+      setCurrentTask((prev) => ({
+        ...prev,
+        short_title: trimmed,
+        short_title_source: 'field',
+      }));
+      setIsEditingShortTitle(false);
+      onActionComplete();
+    } catch (err: any) {
+      setShortTitleError(err?.message || String(err));
+    } finally {
+      setShortTitleLoading(false);
+    }
+  };
+
   const handlePreviewAddSubtask = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!subtaskTitle.trim()) return;
@@ -274,6 +316,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       const res = await taskStructureApi.previewAddChild(currentTask.id, {
         title: subtaskTitle.trim(),
         kind: subtaskKind,
+        short_title: subtaskShortTitle.trim() || undefined,
       });
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
@@ -285,7 +328,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         plan: res.plan,
         planHash: res.plan_hash || res.hash,
         actionType: 'add-child',
-        extraPayload: { title: subtaskTitle.trim(), kind: subtaskKind },
+        extraPayload: { title: subtaskTitle.trim(), kind: subtaskKind, short_title: subtaskShortTitle.trim() || undefined },
       });
       setShowAddSubtaskModal(false);
     } catch (err: any) {
@@ -342,6 +385,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       await taskStructureApi.addChild(currentTask.id, {
         title: extraPayload.title,
         kind: extraPayload.kind,
+        short_title: extraPayload.short_title,
         expect_plan_hash: hash,
       });
     } else if (actionType === 'expand') {
@@ -601,6 +645,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     try {
       const payload: AskQuestionPayload = {
         question: qText,
+        short_title: askQuestionShortTitle.trim() || undefined,
         context: askContextText.trim() || undefined,
         options: builtOptions.length > 0 ? builtOptions : undefined,
         recommended: askRecommended !== '-' ? askRecommended : undefined,
@@ -612,6 +657,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       await api.askQuestion(payload);
       setShowAskForm(false);
       setAskQuestionText('');
+      setAskQuestionShortTitle('');
       setAskContextText('');
       setAskOptions([
         { title: '', consequence: '' },
@@ -753,6 +799,106 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 {currentTask.priority}
               </span>
               <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#818cf8' }}>{currentTask.id}</span>
+              {!isEditingShortTitle ? (
+                <span
+                  style={{
+                    fontSize: '0.8rem',
+                    color: '#94a3b8',
+                    fontWeight: 500,
+                    cursor: 'pointer',
+                    maxWidth: '240px',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.25rem',
+                  }}
+                  title={`${currentTask.title} (Click to edit short title)`}
+                  onClick={() => {
+                    setIsEditingShortTitle(true);
+                    setEditShortTitleValue(currentTask.short_title || shortTitle(currentTask));
+                    setShortTitleError(null);
+                  }}
+                >
+                  <span>({shortTitle(currentTask)})</span>
+                  <Edit2 size={11} style={{ opacity: 0.6 }} />
+                </span>
+              ) : (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
+                  <input
+                    type="text"
+                    value={editShortTitleValue}
+                    onChange={(e) => setEditShortTitleValue(e.target.value)}
+                    placeholder="3-4 word short title"
+                    autoFocus
+                    disabled={shortTitleLoading}
+                    style={{
+                      fontSize: '0.75rem',
+                      padding: '0.15rem 0.4rem',
+                      borderRadius: '0.25rem',
+                      border: shortTitleError ? '1px solid #ef4444' : '1px solid #4f46e5',
+                      backgroundColor: '#0f172a',
+                      color: '#f8fafc',
+                      width: '160px',
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleSaveShortTitle();
+                      } else if (e.key === 'Escape') {
+                        setIsEditingShortTitle(false);
+                        setShortTitleError(null);
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    disabled={shortTitleLoading}
+                    onClick={handleSaveShortTitle}
+                    style={{
+                      padding: '0.15rem 0.45rem',
+                      fontSize: '0.7rem',
+                      fontWeight: 600,
+                      borderRadius: '0.25rem',
+                      backgroundColor: '#4f46e5',
+                      color: '#fff',
+                      border: 'none',
+                      cursor: shortTitleLoading ? 'not-allowed' : 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.2rem',
+                    }}
+                  >
+                    {shortTitleLoading && <Loader2 size={11} className="spin" />}
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    disabled={shortTitleLoading}
+                    onClick={() => {
+                      setIsEditingShortTitle(false);
+                      setShortTitleError(null);
+                    }}
+                    style={{
+                      padding: '0.15rem 0.35rem',
+                      fontSize: '0.7rem',
+                      borderRadius: '0.25rem',
+                      backgroundColor: '#334155',
+                      color: '#cbd5e1',
+                      border: 'none',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  {shortTitleError && (
+                    <span style={{ fontSize: '0.7rem', color: '#f87171' }} title={shortTitleError}>
+                      {shortTitleError}
+                    </span>
+                  )}
+                </div>
+              )}
               {currentTask.category === 'micro' && (
                 <span style={{
                   fontSize: '0.65rem',
@@ -1462,6 +1608,29 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                         <span style={{ color: '#10b981' }}>✓ Valid question format</span>
                       )}
                   </div>
+                </div>
+
+                {/* Short Title (optional) */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '0.3rem' }}>
+                    Short Title (optional, 3-4 words)
+                  </label>
+                  <input
+                    type="text"
+                    value={askQuestionShortTitle}
+                    onChange={(e) => setAskQuestionShortTitle(e.target.value)}
+                    placeholder="e.g. Permission policy choice"
+                    style={{
+                      width: '100%',
+                      padding: '0.5rem 0.75rem',
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #334155',
+                      borderRadius: '0.375rem',
+                      color: '#f8fafc',
+                      fontSize: '0.85rem',
+                      outline: 'none',
+                    }}
+                  />
                 </div>
 
                 {/* Context Textarea */}
@@ -2238,6 +2407,28 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                     boxSizing: 'border-box',
                   }}
                   autoFocus
+                />
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.25rem' }}>
+                  Short Title (optional, 3-4 words)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. Implement hierarchy view"
+                  value={subtaskShortTitle}
+                  onChange={(e) => setSubtaskShortTitle(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #475569',
+                    backgroundColor: '#0f172a',
+                    color: '#f8fafc',
+                    fontSize: '0.85rem',
+                    boxSizing: 'border-box',
+                  }}
                 />
               </div>
 

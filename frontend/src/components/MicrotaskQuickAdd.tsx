@@ -22,6 +22,7 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [title, setTitle] = useState('');
+  const [shortTitle, setShortTitle] = useState('');
   const [kind, setKind] = useState<TaskKind>(defaultKind);
   const [priority, setPriority] = useState<Priority>('P2');
   const [labelsStr, setLabelsStr] = useState('');
@@ -48,6 +49,7 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
     try {
       const res = await microtaskAndLabelsApi.createMicrotask({
         title: title.trim(),
+        short_title: shortTitle.trim() || undefined,
         kind,
         priority,
         labels: labels.length > 0 ? labels : undefined,
@@ -56,6 +58,7 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
 
       // Clear form
       setTitle('');
+      setShortTitle('');
       setKind(defaultKind);
       setPriority('P2');
       setLabelsStr('');
@@ -177,6 +180,27 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
               padding: '0.45rem 0.65rem',
               color: '#f8fafc',
               fontSize: '0.85rem',
+              outline: 'none',
+              boxSizing: 'border-box',
+            }}
+          />
+        </div>
+
+        {/* Short Title Input */}
+        <div>
+          <input
+            type="text"
+            value={shortTitle}
+            onChange={(e) => setShortTitle(e.target.value)}
+            placeholder="Short title (optional, 3-4 words)..."
+            style={{
+              width: '100%',
+              backgroundColor: '#1e293b',
+              border: '1px solid #334155',
+              borderRadius: '0.375rem',
+              padding: '0.35rem 0.65rem',
+              color: '#f8fafc',
+              fontSize: '0.8rem',
               outline: 'none',
               boxSizing: 'border-box',
             }}
