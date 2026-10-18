@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 .venv/
 .tmp-ui.log
+.tmp/
