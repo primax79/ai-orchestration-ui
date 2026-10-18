@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
+import difflib
 import hashlib
 import hmac
 import json
@@ -178,6 +179,8 @@ class OrchestrationState:
         self.workspace = workspace.resolve()
         self.active_websockets: set[WebSocket] = set()
         self.watcher_task: asyncio.Task | None = None
+        self.last_event_seq: int = 0
+        self.polling_events_lock = asyncio.Lock()
 
     async def broadcast(self, message: dict[str, Any]) -> None:
         stale = set()
@@ -187,6 +190,30 @@ class OrchestrationState:
             except Exception:
                 stale.add(ws)
         self.active_websockets.difference_update(stale)
+
+    async def check_and_push_events(self) -> list[dict[str, Any]]:
+        if self.polling_events_lock.locked():
+            return []
+        async with self.polling_events_lock:
+            code, data = await run_ai_orch([
+                "events", "tail",
+                "--since", str(self.last_event_seq),
+                "--workspace", str(self.workspace),
+                "--json",
+            ])
+            if code != 0 or not isinstance(data, dict) or not data.get("ok"):
+                return []
+            events = data.get("events", [])
+            for ev in events:
+                seq = int(ev.get("seq", 0))
+                if seq > self.last_event_seq:
+                    self.last_event_seq = seq
+                await self.broadcast({
+                    "type": "event",
+                    "seq": seq,
+                    "event": ev,
+                })
+            return events
 
 
 state = OrchestrationState(get_initial_workspace())
@@ -257,6 +284,9 @@ _READ_ONLY_PREFIXES = {
     ("inbox", "list"), ("inbox", "show"), ("config", "show"), ("env", "status"),
     ("run", "list"), ("run", "show"), ("run", "logs"), ("run", "options"),
     ("use-cases", "list"), ("use-cases", "show"),
+    ("events", "tail"), ("events", "stats"),
+    ("sessions", "list"), ("sessions", "show"), ("sessions", "role"),
+    ("triggers", "list"), ("triggers", "status"), ("triggers", "history"),
 }
 # Per event loop: asyncio primitives cannot be shared across loops (tests run several).
 _cli_semaphores: dict[int, asyncio.Semaphore] = {}
@@ -308,13 +338,16 @@ async def _run_ai_orch_process(args: list[str], timeout: float | None = None) ->
         home = get_ai_orch_home()
         if home and "--home" not in cmd_args:
             cmd_args = ["env", "--home", str(home), *cmd_args[1:]]
-    elif cmd_args and cmd_args[0] in ("run", "config", "render-agents-md"):
+    elif cmd_args and cmd_args[0] in ("run", "config", "render-agents-md", "triggers"):
         # Every command that reads or writes the global config must honour the override,
         # otherwise a scratch/test server would edit the real ~/.config/ai-orchestration file.
         global_cfg = os.environ.get("AI_ORCH_GLOBAL_CONFIG", "").strip()
-        if global_cfg and "--global-config" not in cmd_args:
+        if global_cfg and "--global-config" not in cmd_args and "--config" not in cmd_args:
             if cmd_args[0] == "run":
                 cmd_args = ["run", "--global-config", global_cfg, *cmd_args[1:]]
+            elif cmd_args[0] == "triggers":
+                if len(cmd_args) > 1 and cmd_args[1] in ("list", "run-once", "daemon"):
+                    cmd_args = [*cmd_args, "--config", global_cfg]
             else:
                 cmd_args = [*cmd_args, "--global-config", global_cfg]
 
@@ -355,11 +388,14 @@ async def _run_ai_orch_process(args: list[str], timeout: float | None = None) ->
 
     out = stdout_bytes.decode("utf-8", errors="replace").strip()
     err = stderr_bytes.decode("utf-8", errors="replace").strip()
-    try:
-        parsed = json.loads(out) if out else {}
-        return proc.returncode, parsed
-    except Exception:
-        return proc.returncode, out or err
+    for text_to_try in (out, err):
+        if text_to_try:
+            try:
+                parsed = json.loads(text_to_try)
+                return proc.returncode, parsed
+            except Exception:
+                pass
+    return proc.returncode, out or err or {}
 
 
 def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int:
@@ -603,6 +639,34 @@ def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) ->
         except OSError:
             pass
 
+    ai_orch_dir = workspace / ".ai-orchestration"
+    if ai_orch_dir.is_dir():
+        for sub in ("events.jsonl", "events_manifest.json", "manifest.json"):
+            ef = ai_orch_dir / sub
+            try:
+                if ef.is_file():
+                    mtimes[f"events:{ef}"] = ef.stat().st_mtime
+            except OSError:
+                pass
+        for sub_dir, area in (
+            ("sessions", "sessions"),
+            ("notifications", "notifications"),
+            ("proposed_actions", "triggers"),
+            ("orchestrator", "queue"),
+        ):
+            target_d = ai_orch_dir / sub_dir
+            if target_d.is_dir():
+                try:
+                    mtimes[f"{area}:{target_d}"] = target_d.stat().st_mtime
+                    for p in target_d.rglob("*.json"):
+                        try:
+                            if p.is_file():
+                                mtimes[f"{area}:{p}"] = p.stat().st_mtime
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+
     return mtimes
 
 
@@ -613,6 +677,10 @@ async def _polling_watcher_loop() -> None:
     while True:
         try:
             await asyncio.sleep(poll_interval)
+            try:
+                await state.check_and_push_events()
+            except Exception:
+                pass
             current_snapshot = snapshot_watched_files(state.workspace, get_config_dir())
 
             changed_areas: set[str] = set()
@@ -630,6 +698,16 @@ async def _polling_watcher_loop() -> None:
                         changed_areas.add("tasks")
                     elif k.startswith("runs:"):
                         changed_areas.add("runs")
+                    elif k.startswith("events:"):
+                        changed_areas.add("events")
+                    elif k.startswith("sessions:"):
+                        changed_areas.add("sessions")
+                    elif k.startswith("triggers:"):
+                        changed_areas.add("triggers")
+                    elif k.startswith("notifications:"):
+                        changed_areas.add("notifications")
+                    elif k.startswith("queue:"):
+                        changed_areas.add("queue")
 
             if changed_areas:
                 await asyncio.sleep(0.3)
@@ -647,6 +725,16 @@ async def _polling_watcher_loop() -> None:
                             changed_areas.add("tasks")
                         elif k.startswith("runs:"):
                             changed_areas.add("runs")
+                        elif k.startswith("events:"):
+                            changed_areas.add("events")
+                        elif k.startswith("sessions:"):
+                            changed_areas.add("sessions")
+                        elif k.startswith("triggers:"):
+                            changed_areas.add("triggers")
+                        elif k.startswith("notifications:"):
+                            changed_areas.add("notifications")
+                        elif k.startswith("queue:"):
+                            changed_areas.add("queue")
                 last_snapshot = debounce_snapshot
                 await state.broadcast({"type": "changed", "areas": sorted(list(changed_areas))})
             else:
@@ -679,8 +767,23 @@ async def _watchfiles_watcher_loop() -> None:
                     areas.add("inbox")
                 elif p.suffix == ".md" or p == (state.workspace / "tasks"):
                     areas.add("tasks")
-            elif ".ai-orchestration" in p.parts and "runs" in p.parts and (p.name == "run.json" or p.name == "runs"):
-                areas.add("runs")
+            elif ".ai-orchestration" in p.parts:
+                if "runs" in p.parts and (p.name == "run.json" or p.name == "runs"):
+                    areas.add("runs")
+                if "events" in p.name or "events" in p.parts:
+                    areas.add("events")
+                    try:
+                        await state.check_and_push_events()
+                    except Exception:
+                        pass
+                if "sessions" in p.parts:
+                    areas.add("sessions")
+                if "triggers" in p.parts or "proposed_actions" in p.parts:
+                    areas.add("triggers")
+                if "orchestrator" in p.parts or "queue" in p.parts:
+                    areas.add("queue")
+                if "notifications" in p.parts:
+                    areas.add("notifications")
         if areas:
             await state.broadcast({"type": "changed", "areas": sorted(list(areas))})
 
@@ -701,6 +804,12 @@ async def watcher_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+    try:
+        code, data = await run_ai_orch(["events", "stats", "--workspace", str(state.workspace), "--json"])
+        if code == 0 and isinstance(data, dict):
+            state.last_event_seq = int(data.get("last_seq") or data.get("counter") or 0)
+    except Exception:
+        pass
     state.watcher_task = asyncio.create_task(watcher_loop())
     try:
         yield
@@ -2232,6 +2341,51 @@ async def api_withdraw_question(request: Request) -> JSONResponse:
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "question_withdrawn", "question_id": question_id})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_list_questions_awaiting_application(request: Request) -> JSONResponse:
+    tasks_dir = state.workspace / "tasks"
+    code, data = await run_ai_orch(["questions", "list", "--tasks-dir", str(tasks_dir), "--status", "answered", "--json"])
+    if code != 0:
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    all_questions = data.get("questions", []) if isinstance(data, dict) else []
+    awaiting = [q for q in all_questions if not q.get("applied")]
+    return JSONResponse({"ok": True, "questions": awaiting, "count": len(awaiting)}, status_code=200)
+
+
+async def api_apply_question(request: Request) -> JSONResponse:
+    question_id = request.path_params.get("id") or request.path_params.get("question_id", "")
+    if not QUESTION_ID_RE.match(question_id):
+        return JSONResponse({"error": f"Invalid question ID {question_id!r}, must match ^Q\\d{{3,}}$"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    tasks_dir = state.workspace / "tasks"
+    cmd = ["questions", "apply", question_id, "--tasks-dir", str(tasks_dir), "--json"]
+    if body.get("by"):
+        cmd.extend(["--by", str(body["by"])])
+    if body.get("ref"):
+        cmd.extend(["--ref", str(body["ref"])])
+    if body.get("note"):
+        cmd.extend(["--note", str(body["note"])])
+    if body.get("force"):
+        cmd.append("--force")
+    if body.get("dry_run"):
+        cmd.append("--dry-run")
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not body.get("dry_run"):
+            await state.broadcast({"type": "question_applied", "question_id": question_id})
+            await state.broadcast({"type": "changed", "areas": ["questions", "tasks"]})
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True, "id": question_id}, status_code=200)
+
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
@@ -3804,6 +3958,393 @@ async def api_run_campaign(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# REST Endpoints: Events & Event Log (Spec 12 §1, E1, E13)
+# ---------------------------------------------------------------------------
+
+async def api_list_events(request: Request) -> JSONResponse:
+    cmd = ["events", "tail", "--workspace", str(state.workspace), "--json"]
+    since = request.query_params.get("since")
+    if since is not None and since.strip():
+        try:
+            cmd.extend(["--since", str(int(since))])
+        except ValueError:
+            return JSONResponse({"error": f"Invalid since cursor {since!r}, must be an integer"}, status_code=400)
+    limit = request.query_params.get("limit")
+    if limit is not None and limit.strip():
+        try:
+            cmd.extend(["--limit", str(int(limit))])
+        except ValueError:
+            return JSONResponse({"error": f"Invalid limit {limit!r}, must be an integer"}, status_code=400)
+    for t in request.query_params.getlist("type"):
+        for sub_t in t.split(","):
+            if sub_t.strip():
+                cmd.extend(["--type", sub_t.strip()])
+    session = request.query_params.get("session")
+    if session and session.strip():
+        cmd.extend(["--session", session.strip()])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_events_stats(request: Request) -> JSONResponse:
+    code, data = await run_ai_orch(["events", "stats", "--workspace", str(state.workspace), "--json"])
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints: Orchestration Sessions & Roles (Spec 12 §2, E10)
+# ---------------------------------------------------------------------------
+
+async def api_list_sessions(request: Request) -> JSONResponse:
+    cmd = ["sessions", "list", "--workspace", str(state.workspace), "--json"]
+    role = request.query_params.get("role")
+    if role:
+        cmd.extend(["--role", role])
+    status = request.query_params.get("status")
+    if status:
+        cmd.extend(["--status", status])
+    tool = request.query_params.get("tool")
+    if tool:
+        cmd.extend(["--tool", tool])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        sessions_list = data if isinstance(data, list) else (data.get("sessions", []) if isinstance(data, dict) else [])
+        return JSONResponse({"ok": True, "sessions": sessions_list}, status_code=200)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_session(request: Request) -> JSONResponse:
+    session_id = request.path_params["session_id"]
+    cmd = ["sessions", "show", session_id, "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("message") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "no session" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    return JSONResponse(data if isinstance(data, dict) else {"session": data}, status_code=200)
+
+
+async def api_get_role_holder(request: Request) -> JSONResponse:
+    role_name = request.path_params.get("role") or request.query_params.get("role") or "orchestrator"
+    cmd = ["sessions", "show", "--role", role_name, "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code != 0:
+        err_str = ""
+        if isinstance(data, dict):
+            err_str = str(data.get("error") or data.get("message") or "").lower()
+        elif isinstance(data, str):
+            err_str = data.lower()
+        if "not found" in err_str or "no holder" in err_str or "no active holder" in err_str:
+            return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    return JSONResponse(data if isinstance(data, dict) else {"role": data}, status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints: Triggers, Rules & Proposed Actions (Spec 12 §5, E3, E7)
+# ---------------------------------------------------------------------------
+
+async def api_list_triggers(request: Request) -> JSONResponse:
+    cmd = ["triggers", "list", "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_triggers_status(request: Request) -> JSONResponse:
+    role = request.query_params.get("role", "orchestrator")
+    cmd = ["triggers", "status", "--role", role, "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_get_triggers_history(request: Request) -> JSONResponse:
+    cmd = ["triggers", "history", "--workspace", str(state.workspace), "--json"]
+    rule = request.query_params.get("rule")
+    if rule:
+        cmd.extend(["--rule", rule])
+    limit = request.query_params.get("limit")
+    if limit:
+        cmd.extend(["--limit", str(limit)])
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_run_triggers_once(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cmd = ["triggers", "run-once", "--workspace", str(state.workspace), "--json"]
+    if body.get("dry_run"):
+        cmd.append("--dry-run")
+    if body.get("role"):
+        cmd.extend(["--role", str(body["role"])])
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.broadcast({"type": "triggers_run", "result": data})
+        await state.broadcast({"type": "changed", "areas": ["triggers", "events"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_list_proposed_actions(request: Request) -> JSONResponse:
+    prop_dir = state.workspace / ".ai-orchestration" / "proposed_actions"
+    records = []
+    if prop_dir.is_dir():
+        for p in sorted(prop_dir.glob("*.json")):
+            if p.is_file() and not p.name.startswith("."):
+                try:
+                    rec = json.loads(p.read_text(encoding="utf-8"))
+                    records.append(rec)
+                except Exception:
+                    pass
+    records.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return JSONResponse({"ok": True, "proposed_actions": records, "count": len(records)}, status_code=200)
+
+
+async def api_confirm_proposed_action(request: Request) -> JSONResponse:
+    action_id = request.path_params.get("action_id", "")
+    return JSONResponse({
+        "ok": False,
+        "action_id": action_id,
+        "error": "not-implemented",
+        "message": "Engine does not provide CLI commands for confirming proposed actions; listing only is currently supported.",
+    }, status_code=400)
+
+
+async def api_reject_proposed_action(request: Request) -> JSONResponse:
+    action_id = request.path_params.get("action_id", "")
+    return JSONResponse({
+        "ok": False,
+        "action_id": action_id,
+        "error": "not-implemented",
+        "message": "Engine does not provide CLI commands for rejecting proposed actions; listing only is currently supported.",
+    }, status_code=400)
+
+
+def _get_active_trigger_config_path() -> pathlib.Path:
+    local_cfg = state.workspace / ".ai-orchestration.local.toml"
+    if local_cfg.is_file():
+        return local_cfg
+    ws_cfg = state.workspace / "orchestration.toml"
+    if ws_cfg.is_file():
+        return ws_cfg
+    global_cfg = os.environ.get("AI_ORCH_GLOBAL_CONFIG", "").strip()
+    if global_cfg:
+        return pathlib.Path(global_cfg).resolve()
+    return get_config_dir() / "orchestration.toml"
+
+
+def _compute_trigger_toggle(
+    target_file: pathlib.Path,
+    rule_name: str | None,
+    kill_switch: bool | None,
+    enabled: bool,
+) -> tuple[str, str, str, str]:
+    old_text = target_file.read_text(encoding="utf-8") if target_file.is_file() else ""
+    old_hash = hashlib.sha256(old_text.encode("utf-8")).hexdigest()
+
+    lines = old_text.splitlines()
+    new_lines = list(lines)
+
+    if kill_switch is not None:
+        in_triggers_section = False
+        found_enabled = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == "[triggers]":
+                in_triggers_section = True
+            elif stripped.startswith("[") and stripped != "[triggers]":
+                if in_triggers_section and not found_enabled:
+                    new_lines.insert(i, f"enabled = {'true' if enabled else 'false'}")
+                    found_enabled = True
+                in_triggers_section = False
+            elif in_triggers_section and re.match(r"^enabled\s*=", stripped):
+                new_lines[i] = f"enabled = {'true' if enabled else 'false'}"
+                found_enabled = True
+                break
+
+        if not found_enabled:
+            if not any(l.strip() == "[triggers]" for l in lines):
+                new_lines.append("")
+                new_lines.append("[triggers]")
+            new_lines.append(f"enabled = {'true' if enabled else 'false'}")
+
+    elif rule_name:
+        in_target_rule = False
+        found_enabled = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped in ("[[triggers]]", "[[trigger]]"):
+                in_target_rule = False
+            elif re.match(rf'^name\s*=\s*["\']{re.escape(rule_name)}["\']', stripped):
+                in_target_rule = True
+            elif in_target_rule and re.match(r"^enabled\s*=", stripped):
+                new_lines[i] = f"enabled = {'true' if enabled else 'false'}"
+                found_enabled = True
+                break
+            elif in_target_rule and (stripped.startswith("[") or stripped.startswith("[[")):
+                new_lines.insert(i, f"enabled = {'true' if enabled else 'false'}")
+                found_enabled = True
+                in_target_rule = False
+                break
+
+        if in_target_rule and not found_enabled:
+            new_lines.append(f"enabled = {'true' if enabled else 'false'}")
+
+    new_text = "\n".join(new_lines) + ("\n" if old_text.endswith("\n") or not old_text else "")
+    diff_lines = list(difflib.unified_diff(
+        old_text.splitlines(keepends=True),
+        new_text.splitlines(keepends=True),
+        fromfile=str(target_file),
+        tofile=str(target_file),
+    ))
+    diff_str = "".join(diff_lines)
+    return old_text, new_text, diff_str, old_hash
+
+
+async def api_preview_toggle_trigger(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    rule_name = body.get("rule_name")
+    kill_switch = body.get("kill_switch")
+    enabled = bool(body.get("enabled", False))
+
+    target_cfg = _get_active_trigger_config_path()
+    old_text, new_text, diff_str, old_hash = _compute_trigger_toggle(target_cfg, rule_name, kill_switch, enabled)
+
+    return JSONResponse({
+        "ok": True,
+        "path": str(target_cfg),
+        "diff": diff_str,
+        "hash": old_hash,
+        "changed": old_text != new_text,
+    }, status_code=200)
+
+
+async def api_toggle_trigger(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_hash = body.get("expect_hash")
+    if not expect_hash:
+        return JSONResponse({"error": "expect_hash is required"}, status_code=400)
+
+    rule_name = body.get("rule_name")
+    kill_switch = body.get("kill_switch")
+    enabled = bool(body.get("enabled", False))
+
+    target_cfg = _get_active_trigger_config_path()
+    old_text, new_text, diff_str, old_hash = _compute_trigger_toggle(target_cfg, rule_name, kill_switch, enabled)
+
+    if expect_hash.lower() != old_hash.lower():
+        return JSONResponse({"error": f"Config hash mismatch: expected {expect_hash}, actual {old_hash}"}, status_code=409)
+
+    target_cfg.parent.mkdir(parents=True, exist_ok=True)
+    target_cfg.write_text(new_text, encoding="utf-8")
+    await state.broadcast({"type": "config_updated"})
+    await state.broadcast({"type": "changed", "areas": ["config", "triggers"]})
+    return JSONResponse({
+        "ok": True,
+        "applied": True,
+        "path": str(target_cfg),
+        "hash": hashlib.sha256(new_text.encode("utf-8")).hexdigest(),
+    }, status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints: Orchestrator Turn Queue & Notifications (Spec 12 §0, E6)
+# ---------------------------------------------------------------------------
+
+async def api_list_orchestrator_queue(request: Request) -> JSONResponse:
+    q_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "queue"
+    items = []
+    if q_dir.is_dir():
+        for p in sorted(q_dir.glob("*.json")):
+            if p.is_file() and not p.name.startswith("."):
+                try:
+                    rec = json.loads(p.read_text(encoding="utf-8"))
+                    items.append(rec)
+                except Exception:
+                    pass
+    items.sort(key=lambda x: int(x.get("turn_seq", 0)))
+    return JSONResponse({"ok": True, "queue": items, "count": len(items)}, status_code=200)
+
+
+async def api_list_notifications(request: Request) -> JSONResponse:
+    notif_dir = state.workspace / ".ai-orchestration" / "notifications"
+    notifications = []
+    if notif_dir.is_dir():
+        for entry in sorted(notif_dir.glob("*.json")):
+            if entry.is_file() and not entry.name.startswith("."):
+                try:
+                    rec = json.loads(entry.read_text(encoding="utf-8"))
+                    notifications.append(rec)
+                except Exception:
+                    pass
+    notifications.sort(key=lambda n: n.get("created_at") or "", reverse=True)
+
+    recent_events_code, recent_events_data = await run_ai_orch([
+        "events", "tail", "--limit", "25", "--workspace", str(state.workspace), "--json"
+    ])
+    recent_events = []
+    if recent_events_code == 0 and isinstance(recent_events_data, dict):
+        recent_events = recent_events_data.get("events", [])
+
+    unread_count = sum(1 for n in notifications if not n.get("read"))
+    return JSONResponse({
+        "ok": True,
+        "notifications": notifications,
+        "recent_events": recent_events,
+        "unread_count": unread_count,
+    }, status_code=200)
+
+
+async def api_mark_notification_read(request: Request) -> JSONResponse:
+    notif_id = request.path_params.get("id", "")
+    notif_dir = state.workspace / ".ai-orchestration" / "notifications"
+    if notif_id == "all":
+        if notif_dir.is_dir():
+            for entry in notif_dir.glob("*.json"):
+                try:
+                    data = json.loads(entry.read_text(encoding="utf-8"))
+                    data["read"] = True
+                    entry.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+        return JSONResponse({"ok": True, "marked_all": True}, status_code=200)
+    else:
+        target = notif_dir / f"{notif_id}.json"
+        if target.is_file():
+            try:
+                data = json.loads(target.read_text(encoding="utf-8"))
+                data["read"] = True
+                target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                return JSONResponse({"ok": True, "id": notif_id}, status_code=200)
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": "Notification not found"}, status_code=404)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket Endpoint: Live File & State Updates
 # ---------------------------------------------------------------------------
 
@@ -3811,11 +4352,56 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     state.active_websockets.add(websocket)
     try:
-        await websocket.send_json({"type": "connected", "workspace": str(state.workspace)})
+        qs = parse_qs(websocket.scope.get("query_string", b"").decode("latin1"))
+        since_param = qs.get("since", [None])[0]
+        await websocket.send_json({
+            "type": "connected",
+            "workspace": str(state.workspace),
+            "last_seq": state.last_event_seq,
+        })
+        if since_param is not None:
+            try:
+                since_seq = int(since_param)
+                code, data = await run_ai_orch([
+                    "events", "tail",
+                    "--since", str(since_seq),
+                    "--workspace", str(state.workspace),
+                    "--json",
+                ])
+                if code == 0 and isinstance(data, dict) and data.get("ok"):
+                    for ev in data.get("events", []):
+                        await websocket.send_json({
+                            "type": "event",
+                            "seq": ev.get("seq", 0),
+                            "event": ev,
+                        })
+            except (ValueError, TypeError):
+                pass
+
         while True:
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
+            else:
+                try:
+                    payload = json.loads(data)
+                    if isinstance(payload, dict) and payload.get("type") == "replay":
+                        since_seq = int(payload.get("since", 0))
+                        code, rep_data = await run_ai_orch([
+                            "events", "tail",
+                            "--since", str(since_seq),
+                            "--workspace", str(state.workspace),
+                            "--json",
+                        ])
+                        if code == 0 and isinstance(rep_data, dict) and rep_data.get("ok"):
+                            for ev in rep_data.get("events", []):
+                                await websocket.send_json({
+                                    "type": "event",
+                                    "seq": ev.get("seq", 0),
+                                    "event": ev,
+                                })
+                except Exception:
+                    pass
     except (WebSocketDisconnect, Exception):
         state.active_websockets.discard(websocket)
 
@@ -3872,6 +4458,9 @@ routes = [
     Route("/api/tasks/{task_id}", api_get_task_detail, methods=["GET"]),
     Route("/api/questions", api_list_questions, methods=["GET"]),
     Route("/api/questions", api_ask_question, methods=["POST"]),
+    Route("/api/questions/awaiting-application", api_list_questions_awaiting_application, methods=["GET"]),
+    Route("/api/questions/{question_id}/apply", api_apply_question, methods=["POST"]),
+    Route("/api/questions/{id}/apply", api_apply_question, methods=["POST"]),
     Route("/api/questions/{question_id}", api_get_question, methods=["GET"]),
     Route("/api/questions/{question_id}/answer", api_answer_question, methods=["POST"]),
     Route("/api/questions/{question_id}/withdraw", api_withdraw_question, methods=["POST"]),
@@ -3928,6 +4517,24 @@ routes = [
     Route("/api/use-cases/campaign", api_run_campaign, methods=["POST"]),
     Route("/api/use-cases/{uc_id}", api_get_use_case, methods=["GET"]),
     Route("/api/use-cases/{uc_id}/validate", api_validate_use_case, methods=["POST"]),
+    Route("/api/events", api_list_events, methods=["GET"]),
+    Route("/api/events/stats", api_get_events_stats, methods=["GET"]),
+    Route("/api/sessions", api_list_sessions, methods=["GET"]),
+    Route("/api/sessions/role/{role:path}", api_get_role_holder, methods=["GET"]),
+    Route("/api/sessions/{session_id}", api_get_session, methods=["GET"]),
+    Route("/api/triggers", api_list_triggers, methods=["GET"]),
+    Route("/api/triggers/status", api_get_triggers_status, methods=["GET"]),
+    Route("/api/triggers/history", api_get_triggers_history, methods=["GET"]),
+    Route("/api/triggers/run-once", api_run_triggers_once, methods=["POST"]),
+    Route("/api/triggers/toggle/preview", api_preview_toggle_trigger, methods=["POST"]),
+    Route("/api/triggers/toggle", api_toggle_trigger, methods=["POST"]),
+    Route("/api/triggers/proposed-actions", api_list_proposed_actions, methods=["GET"]),
+    Route("/api/triggers/proposed-actions/{action_id}/confirm", api_confirm_proposed_action, methods=["POST"]),
+    Route("/api/triggers/proposed-actions/{action_id}/reject", api_reject_proposed_action, methods=["POST"]),
+    Route("/api/orchestrator/queue", api_list_orchestrator_queue, methods=["GET"]),
+    Route("/api/notifications", api_list_notifications, methods=["GET"]),
+    Route("/api/notifications/{id}/read", api_mark_notification_read, methods=["POST"]),
+    Route("/api/notifications/read", api_mark_notification_read, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ]
 

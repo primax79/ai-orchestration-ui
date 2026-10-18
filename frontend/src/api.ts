@@ -37,6 +37,18 @@ import {
   AcceptTriagePayload,
   AcceptTriageResponse,
   StructureActionResponse,
+  EventsTailResponse,
+  EventsStatsResponse,
+  OrchestrationSession,
+  TriggersListResponse,
+  TriggersStatusResponse,
+  TriggersHistoryResponse,
+  ProposedActionsResponse,
+  AwaitingApplicationResponse,
+  ApplyQuestionPayload,
+  ApplyQuestionResponse,
+  OrchestratorQueueResponse,
+  NotificationsResponse,
 } from './types';
 
 // Custom ApiError to carry HTTP status and response payload
@@ -1085,6 +1097,184 @@ export const api = {
   subscribeWebSocket(onMessage: (msg: any) => void): () => void {
     return this.connectWebSocket(onMessage);
   },
+
+  async getEvents(params?: { since?: number; limit?: number; type?: string; session?: string }): Promise<EventsTailResponse> {
+    const query = new URLSearchParams();
+    if (params?.since !== undefined) query.set('since', String(params.since));
+    if (params?.limit !== undefined) query.set('limit', String(params.limit));
+    if (params?.type) query.set('type', params.type);
+    if (params?.session) query.set('session', params.session);
+    const qs = query.toString();
+    const endpoint = `/api/events${qs ? `?${qs}` : ''}`;
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<EventsTailResponse>('getEvents', params || {});
+    }
+    return apiFetch<EventsTailResponse>(endpoint);
+  },
+
+  async getEventsStats(): Promise<EventsStatsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<EventsStatsResponse>('getEventsStats', {});
+    }
+    return apiFetch<EventsStatsResponse>('/api/events/stats');
+  },
+
+  async getSessions(params?: { role?: string; status?: string; tool?: string }): Promise<{ ok: boolean; sessions: OrchestrationSession[] }> {
+    const query = new URLSearchParams();
+    if (params?.role) query.set('role', params.role);
+    if (params?.status) query.set('status', params.status);
+    if (params?.tool) query.set('tool', params.tool);
+    const qs = query.toString();
+    const endpoint = `/api/sessions${qs ? `?${qs}` : ''}`;
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean; sessions: OrchestrationSession[] }>('getSessions', params || {});
+    }
+    return apiFetch<{ ok: boolean; sessions: OrchestrationSession[] }>(endpoint);
+  },
+
+  async getSession(sessionId: string): Promise<OrchestrationSession> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<OrchestrationSession>('getSession', { sessionId });
+    }
+    return apiFetch<OrchestrationSession>(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  },
+
+  async getRoleHolder(role: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('getRoleHolder', { role });
+    }
+    return apiFetch<any>(`/api/sessions/role/${encodeURIComponent(role)}`);
+  },
+
+  async getTriggers(): Promise<TriggersListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TriggersListResponse>('getTriggers', {});
+    }
+    return apiFetch<TriggersListResponse>('/api/triggers');
+  },
+
+  async getTriggersStatus(role?: string): Promise<TriggersStatusResponse> {
+    const qs = role ? `?role=${encodeURIComponent(role)}` : '';
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TriggersStatusResponse>('getTriggersStatus', { role });
+    }
+    return apiFetch<TriggersStatusResponse>(`/api/triggers/status${qs}`);
+  },
+
+  async getTriggersHistory(params?: { rule?: string; limit?: number }): Promise<TriggersHistoryResponse> {
+    const query = new URLSearchParams();
+    if (params?.rule) query.set('rule', params.rule);
+    if (params?.limit) query.set('limit', String(params.limit));
+    const qs = query.toString();
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<TriggersHistoryResponse>('getTriggersHistory', params || {});
+    }
+    return apiFetch<TriggersHistoryResponse>(`/api/triggers/history${qs ? `?${qs}` : ''}`);
+  },
+
+  async runTriggersOnce(payload?: { dry_run?: boolean; role?: string }): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('runTriggersOnce', payload || {});
+    }
+    return apiFetch<any>('/api/triggers/run-once', {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  async previewToggleTrigger(payload: { rule_name?: string; kill_switch?: boolean; enabled?: boolean }): Promise<ConfigPreviewResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewToggleTrigger', payload);
+    }
+    return apiFetch<ConfigPreviewResponse>('/api/triggers/toggle/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async toggleTrigger(payload: { rule_name?: string; kill_switch?: boolean; enabled?: boolean; expect_hash: string }): Promise<ConfigApplyResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<ConfigApplyResponse>('toggleTrigger', payload);
+    }
+    return apiFetch<ConfigApplyResponse>('/api/triggers/toggle', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async getProposedActions(): Promise<ProposedActionsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<ProposedActionsResponse>('getProposedActions', {});
+    }
+    return apiFetch<ProposedActionsResponse>('/api/triggers/proposed-actions');
+  },
+
+  async confirmProposedAction(actionId: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('confirmProposedAction', { actionId });
+    }
+    return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/confirm`, {
+      method: 'POST',
+    });
+  },
+
+  async rejectProposedAction(actionId: string): Promise<any> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<any>('rejectProposedAction', { actionId });
+    }
+    return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/reject`, {
+      method: 'POST',
+    });
+  },
+
+  async getQuestionsAwaitingApplication(): Promise<AwaitingApplicationResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<AwaitingApplicationResponse>('getQuestionsAwaitingApplication', {});
+    }
+    return apiFetch<AwaitingApplicationResponse>('/api/questions/awaiting-application');
+  },
+
+  async applyQuestion(questionId: string, payload: ApplyQuestionPayload): Promise<ApplyQuestionResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<ApplyQuestionResponse>('applyQuestion', { questionId, ...payload });
+    }
+    return apiFetch<ApplyQuestionResponse>(`/api/questions/${encodeURIComponent(questionId)}/apply`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async getOrchestratorQueue(): Promise<OrchestratorQueueResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<OrchestratorQueueResponse>('getOrchestratorQueue', {});
+    }
+    return apiFetch<OrchestratorQueueResponse>('/api/orchestrator/queue');
+  },
+
+  async getNotifications(): Promise<NotificationsResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<NotificationsResponse>('getNotifications', {});
+    }
+    return apiFetch<NotificationsResponse>('/api/notifications');
+  },
+
+  async markNotificationRead(id: string): Promise<{ ok: boolean }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean }>('markNotificationRead', { id });
+    }
+    return apiFetch<{ ok: boolean }>(`/api/notifications/${encodeURIComponent(id)}/read`, {
+      method: 'POST',
+    });
+  },
+
+  async markAllNotificationsRead(): Promise<{ ok: boolean }> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<{ ok: boolean }>('markAllNotificationsRead', {});
+    }
+    return apiFetch<{ ok: boolean }>('/api/notifications/read', {
+      method: 'POST',
+    });
+  },
 };
 
 let sharedWs: WebSocket | null = null;
@@ -1539,7 +1729,7 @@ export const microtaskAndLabelsApi: MicrotaskAndLabelsApiExtensions = {
   },
 };
 
-Object.assign(api, microtaskAndLabelsApi);
+export const eventsAndTriggersApi = api;
 
 
 

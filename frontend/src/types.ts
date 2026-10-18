@@ -212,6 +212,7 @@ export interface QuestionOption {
 export interface QuestionAnswer {
   choice: string;
   answered_by?: string;
+  by?: string;
   answered?: string;
   text?: string | null;
 }
@@ -234,6 +235,14 @@ export interface QuestionItem {
   answer?: QuestionAnswer;
   rel_path?: string;
   filename?: string;
+  applied?: boolean;
+  applied_record?: {
+    question?: string;
+    by?: string;
+    at?: string;
+    ref?: string;
+    note?: string;
+  } | null;
 }
 
 export interface QuestionListResponse {
@@ -1036,6 +1045,188 @@ export interface InboxToMicrotaskPayload {
   priority?: string;
   what?: string;
   labels?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Events, Sessions, Triggers & Queue Types (Task 12.6)
+// ---------------------------------------------------------------------------
+
+export interface OrchestrationEvent {
+  seq: number;
+  id: string;
+  ts: string;
+  type: string;
+  subject: string;
+  data?: any;
+  origin_session?: string | null;
+  actor?: string | null;
+}
+
+export interface EventsTailResponse {
+  ok: boolean;
+  events: OrchestrationEvent[];
+  count: number;
+  first_seq: number | null;
+  last_seq: number | null;
+}
+
+export interface EventsStatsResponse {
+  ok: boolean;
+  total_events: number;
+  first_seq: number | null;
+  last_seq: number | null;
+  chunk_count: number;
+  chunks?: any[];
+  counter: number;
+}
+
+export interface OrchestrationSession {
+  session_id: string;
+  tool: string;
+  kind: 'headless' | 'interactive' | string;
+  status: 'active' | 'stale' | 'retired' | 'deregistered' | string;
+  role?: string | null;
+  generation?: number;
+  cursor?: number;
+  last_seen?: string;
+  created_at?: string;
+  subscriptions?: string[];
+  pending_events_count?: number;
+  last_activity_type?: string;
+}
+
+export interface TriggerRule {
+  name: string;
+  on: string;
+  when?: Record<string, any>;
+  action: string;
+  enabled: boolean;
+  run?: any;
+  command?: string | string[];
+  max_per_hour?: number;
+}
+
+export interface TriggersListResponse {
+  ok: boolean;
+  meta: {
+    kill_switch_enabled: boolean;
+    config_paths: string[];
+    rule_count: number;
+  };
+  rules: TriggerRule[];
+  errors?: string[];
+}
+
+export interface TriggersStatusResponse {
+  ok: boolean;
+  kill_switch_enabled: boolean;
+  rule_count: number;
+  role: string;
+  cursor: number;
+  total_firings: number;
+  daemon: any;
+  config_paths: string[];
+}
+
+export interface TriggerFiring {
+  firing_id: string;
+  rule_name: string;
+  event_seq: number;
+  event_id: string;
+  state: 'pending' | 'fired' | 'skipped' | 'retry' | 'dead' | string;
+  updated_at: string;
+  result?: any;
+}
+
+export interface TriggersHistoryResponse {
+  ok: boolean;
+  count?: number;
+  firings: TriggerFiring[];
+}
+
+export interface ProposedAction {
+  action_id: string;
+  action_hash: string;
+  type: string;
+  rule: string;
+  trigger_event?: string;
+  trigger_seq?: number;
+  created_at: string;
+  status: string;
+  origin_run?: string;
+  run_params?: any;
+  command?: string[];
+  reason?: string;
+  policy?: string;
+}
+
+export interface ProposedActionsResponse {
+  ok: boolean;
+  proposed_actions: ProposedAction[];
+  count: number;
+}
+
+export interface AwaitingApplicationResponse {
+  ok: boolean;
+  questions: QuestionItem[];
+  count: number;
+}
+
+export interface ApplyQuestionPayload {
+  by?: string;
+  ref?: string;
+  note?: string;
+  force?: boolean;
+  dry_run?: boolean;
+}
+
+export interface ApplyQuestionResponse {
+  ok: boolean;
+  id: string;
+  status?: string;
+  by?: string;
+  record?: any;
+  error?: string;
+}
+
+export interface OrchestratorTurnItem {
+  turn_seq: number;
+  turn_id: string;
+  role: string;
+  created_at: string;
+  state: 'queued' | 'claimed' | 'running' | 'done' | 'failed' | 'dead' | 'cancelled' | string;
+  type: string;
+  policy: string;
+  trigger_rule?: string;
+  trigger_event_id?: string;
+  trigger_event_seq?: number;
+  events?: any[];
+  prompt_data?: any;
+}
+
+export interface OrchestratorQueueResponse {
+  ok: boolean;
+  queue: OrchestratorTurnItem[];
+  count: number;
+}
+
+export interface NotificationItem {
+  id: string;
+  type?: string;
+  rule?: string;
+  event_seq?: number;
+  event_type?: string;
+  subject?: string;
+  data?: any;
+  created_at: string;
+  read: boolean;
+}
+
+export interface NotificationsResponse {
+  ok: boolean;
+  notifications: NotificationItem[];
+  recent_events?: OrchestrationEvent[];
+  unread_count: number;
 }
 
 

@@ -10,6 +10,8 @@ import { SkillInstaller } from './components/SkillInstaller';
 import { EnvironmentDoctor } from './components/EnvironmentDoctor';
 import { OrchestrationConfigurator } from './components/OrchestrationConfigurator';
 import { UseCasesManager } from './components/UseCasesManager';
+import { TriggersPage } from './components/TriggersPage';
+import { EventStreamPanel } from './components/EventStreamPanel';
 import { api } from './api';
 import {
   WorkspaceInfo,
@@ -86,7 +88,7 @@ const PanelLoading: React.FC<{ label: string }> = ({ label }) => (
 );
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'installer' | 'doctor' | 'config'>('backlog');
+  const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config'>('backlog');
 
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
 
@@ -402,6 +404,18 @@ export const App: React.FC = () => {
         {activeTab === 'use-cases' && (
           <div>
             <UseCasesManager onRefresh={loadTasks} />
+          </div>
+        )}
+
+        {activeTab === 'triggers' && (
+          <div>
+            <TriggersPage onNavigateTab={(tab) => setActiveTab(tab as any)} />
+          </div>
+        )}
+
+        {activeTab === 'events' && (
+          <div>
+            <EventStreamPanel onNavigateTab={(tab) => setActiveTab(tab as any)} />
           </div>
         )}
 

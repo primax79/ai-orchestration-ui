@@ -3161,4 +3161,338 @@ def test_microtask_kind_labels_promote_endpoints(tmp_path):
         state.workspace = old_ws
 
 
+def test_events_and_stats_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Initial empty events
+        res = client.get("/api/events", headers=headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("ok") is True
+        assert data.get("events") == []
+
+        res_stats = client.get("/api/events/stats", headers=headers)
+        assert res_stats.status_code == 200
+        sdata = res_stats.json()
+        assert sdata.get("ok") is True
+        assert sdata.get("total_events") == 0
+
+        # Emit an event using ai-orch events emit
+        bin_path = os.environ.get("AI_ORCH_BIN")
+        subprocess.run(
+            [sys.executable, bin_path, "events", "emit", "test.event", "--subject", "TEST-01", "--payload", '{"foo":"bar"}', "--workspace", str(tmp_path), "--json"],
+            check=True,
+            capture_output=True,
+        )
+
+        res_after = client.get("/api/events", headers=headers)
+        assert res_after.status_code == 200
+        data_after = res_after.json()
+        assert data_after.get("ok") is True
+        assert len(data_after.get("events", [])) == 1
+        ev = data_after["events"][0]
+        assert ev["type"] == "test.event"
+        assert ev["subject"] == "TEST-01"
+
+        # Paged by since cursor
+        res_paged = client.get(f"/api/events?since={ev['seq']}", headers=headers)
+        assert res_paged.status_code == 200
+        assert res_paged.json().get("events") == []
+
+        # Filter by type
+        res_type = client.get("/api/events?type=test.event", headers=headers)
+        assert res_type.status_code == 200
+        assert len(res_type.json().get("events", [])) == 1
+
+        res_type_miss = client.get("/api/events?type=other.type", headers=headers)
+        assert res_type_miss.status_code == 200
+        assert len(res_type_miss.json().get("events", [])) == 0
+    finally:
+        state.workspace = old_ws
+
+
+def test_sessions_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Initial empty
+        res = client.get("/api/sessions", headers=headers)
+        assert res.status_code == 200
+        assert res.json().get("sessions") == []
+
+        # Register a session via CLI
+        bin_path = os.environ.get("AI_ORCH_BIN")
+        proc = subprocess.run(
+            [sys.executable, bin_path, "sessions", "register", "--role", "orchestrator", "--tool", "claude", "--kind", "headless", "--session-id", "sess-test-123", "--workspace", str(tmp_path), "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        reg_data = json.loads(proc.stdout)
+        sid = reg_data.get("session_id")
+        assert sid == "sess-test-123"
+
+        # List sessions
+        res_ls = client.get("/api/sessions", headers=headers)
+        assert res_ls.status_code == 200
+        sessions = res_ls.json().get("sessions", [])
+        assert len(sessions) >= 1
+        assert sessions[0]["session_id"] == sid
+        assert sessions[0]["role"] == "orchestrator"
+
+        # Get session detail
+        res_show = client.get(f"/api/sessions/{sid}", headers=headers)
+        assert res_show.status_code == 200
+        show_data = res_show.json()
+        assert (show_data.get("session_id") or show_data.get("session", {}).get("session_id")) == sid
+
+        # Get role holder
+        res_role = client.get("/api/sessions/role/orchestrator", headers=headers)
+        assert res_role.status_code == 200
+        role_data = res_role.json()
+        assert (role_data.get("session_id") or role_data.get("role", {}).get("session_id")) == sid
+
+        # 404 for unknown session
+        res_404 = client.get("/api/sessions/unknown-session-xyz", headers=headers)
+        assert res_404.status_code == 404
+    finally:
+        state.workspace = old_ws
+
+
+def test_triggers_and_proposed_actions_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Triggers list
+        res_trig = client.get("/api/triggers", headers=headers)
+        assert res_trig.status_code == 200
+        assert res_trig.json().get("ok") is True
+
+        # Triggers status
+        res_st = client.get("/api/triggers/status", headers=headers)
+        assert res_st.status_code == 200
+        assert res_st.json().get("ok") is True
+
+        # Triggers history
+        res_hist = client.get("/api/triggers/history", headers=headers)
+        assert res_hist.status_code == 200
+        assert res_hist.json().get("ok") is True
+
+        # Triggers run-once
+        res_run = client.post("/api/triggers/run-once", headers=headers, json={"dry_run": True})
+        assert res_run.status_code == 200
+        assert res_run.json().get("ok") is True
+
+        # Proposed actions: list empty
+        res_props = client.get("/api/triggers/proposed-actions", headers=headers)
+        assert res_props.status_code == 200
+        assert res_props.json().get("proposed_actions") == []
+
+        # Write a proposed action file
+        prop_dir = tmp_path / ".ai-orchestration" / "proposed_actions"
+        prop_dir.mkdir(parents=True, exist_ok=True)
+        act_file = prop_dir / "act-001.json"
+        act_file.write_text(json.dumps({
+            "action_id": "act-001",
+            "action_hash": "hash123",
+            "type": "start-run",
+            "rule": "verify-on-delivery",
+            "created_at": "2026-10-18T00:00:00Z",
+            "status": "pending_confirmation",
+        }), encoding="utf-8")
+
+        res_props2 = client.get("/api/triggers/proposed-actions", headers=headers)
+        assert res_props2.status_code == 200
+        props = res_props2.json().get("proposed_actions", [])
+        assert len(props) == 1
+        assert props[0]["action_id"] == "act-001"
+
+        # Confirm and reject return not-implemented
+        res_conf = client.post("/api/triggers/proposed-actions/act-001/confirm", headers=headers)
+        assert res_conf.status_code == 400
+        assert "not provide CLI commands" in res_conf.json().get("message", "")
+
+        res_rej = client.post("/api/triggers/proposed-actions/act-001/reject", headers=headers)
+        assert res_rej.status_code == 400
+        assert "not provide CLI commands" in res_rej.json().get("message", "")
+
+        # Triggers toggle preview and apply
+        cfg_file = tmp_path / ".ai-orchestration.local.toml"
+        cfg_file.write_text("[triggers]\nenabled = true\n\n[[triggers]]\nname = \"rule-1\"\non = \"task.transitioned\"\naction = \"notify\"\nenabled = true\n", encoding="utf-8")
+
+        res_prev = client.post("/api/triggers/toggle/preview", headers=headers, json={"rule_name": "rule-1", "enabled": False})
+        assert res_prev.status_code == 200
+        pdata = res_prev.json()
+        assert pdata.get("ok") is True
+        assert pdata.get("changed") is True
+        assert "enabled = false" in pdata.get("diff", "")
+        h = pdata.get("hash")
+        assert h
+
+        res_apply = client.post("/api/triggers/toggle", headers=headers, json={"rule_name": "rule-1", "enabled": False, "expect_hash": h})
+        assert res_apply.status_code == 200
+        assert res_apply.json().get("applied") is True
+
+        # Verify config was updated
+        assert "enabled = false" in cfg_file.read_text(encoding="utf-8")
+    finally:
+        state.workspace = old_ws
+
+
+def test_questions_awaiting_application_and_apply(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+
+    fixture_src = pathlib.Path("/Users/Alfredo/works/ai-coding-tools/ai-orchestration/plugins/architect-side/skills/task-pipeline/scripts/fixtures/index-regression")
+    import shutil
+    tasks_dir = tmp_path / "tasks"
+    shutil.copytree(fixture_src, tasks_dir)
+
+    try:
+        # Ask question via API
+        res_ask = client.post(
+            "/api/questions",
+            headers=headers,
+            json={
+                "question": "Which db engine?",
+                "context": "Need db for service",
+                "blocks": "T012",
+                "options": [{"id": "A", "label": "Postgres"}, {"id": "B", "label": "SQLite"}],
+            },
+        )
+        assert res_ask.status_code == 200
+        qid = res_ask.json()["id"]
+
+        # Answer question
+        res_ans = client.post(
+            f"/api/questions/{qid}/answer",
+            headers=headers,
+            json={"choice": "Postgres", "text": "Use Postgres", "by": "owner"},
+        )
+        assert res_ans.status_code == 200
+
+        # Now it is awaiting application!
+        res_awaiting = client.get("/api/questions/awaiting-application", headers=headers)
+        assert res_awaiting.status_code == 200
+        adata = res_awaiting.json()
+        assert adata.get("ok") is True
+        assert any(q["id"] == qid for q in adata.get("questions", []))
+
+        # Apply the decision
+        res_apply = client.post(
+            f"/api/questions/{qid}/apply",
+            headers=headers,
+            json={"by": "owner", "ref": "T012", "note": "Configured Postgres"},
+        )
+        assert res_apply.status_code == 200
+        assert res_apply.json().get("ok") is True
+
+        # Now no longer awaiting application
+        res_after = client.get("/api/questions/awaiting-application", headers=headers)
+        assert res_after.status_code == 200
+        assert not any(q["id"] == qid for q in res_after.json().get("questions", []))
+
+        # Check ledger file
+        ledger = tasks_dir / "questions" / "applied.jsonl"
+        assert ledger.is_file()
+        assert qid in ledger.read_text(encoding="utf-8")
+    finally:
+        state.workspace = old_ws
+
+
+def test_queue_and_notifications_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # 1. Queue
+        q_dir = tmp_path / ".ai-orchestration" / "orchestrator" / "queue"
+        q_dir.mkdir(parents=True, exist_ok=True)
+        turn_file = q_dir / "000001.json"
+        turn_file.write_text(json.dumps({
+            "turn_seq": 1,
+            "turn_id": "000001",
+            "role": "orchestrator",
+            "created_at": "2026-10-18T00:00:00Z",
+            "state": "queued",
+            "type": "event_batch",
+            "policy": "reduced_capability",
+        }), encoding="utf-8")
+
+        res_q = client.get("/api/orchestrator/queue", headers=headers)
+        assert res_q.status_code == 200
+        qdata = res_q.json()
+        assert qdata.get("ok") is True
+        assert len(qdata.get("queue", [])) == 1
+        assert qdata["queue"][0]["turn_id"] == "000001"
+
+        # 2. Notifications
+        notif_dir = tmp_path / ".ai-orchestration" / "notifications"
+        notif_dir.mkdir(parents=True, exist_ok=True)
+        n_file = notif_dir / "notif-001.json"
+        n_file.write_text(json.dumps({
+            "id": "notif-001",
+            "rule": "notify-question",
+            "event_seq": 10,
+            "event_type": "question.asked",
+            "subject": "Q001",
+            "created_at": "2026-10-18T00:00:00Z",
+            "read": False,
+        }), encoding="utf-8")
+
+        res_n = client.get("/api/notifications", headers=headers)
+        assert res_n.status_code == 200
+        ndata = res_n.json()
+        assert ndata.get("ok") is True
+        assert ndata.get("unread_count") == 1
+        assert len(ndata.get("notifications", [])) == 1
+
+        # Mark read
+        res_read = client.post("/api/notifications/notif-001/read", headers=headers)
+        assert res_read.status_code == 200
+
+        res_n_after = client.get("/api/notifications", headers=headers)
+        assert res_n_after.status_code == 200
+        assert res_n_after.json().get("unread_count") == 0
+    finally:
+        state.workspace = old_ws
+
+
+def test_websocket_events_and_replay(tmp_path):
+    token = get_or_create_token()
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    bin_path = os.environ.get("AI_ORCH_BIN")
+
+    # Emit an initial event
+    subprocess.run(
+        [sys.executable, bin_path, "events", "emit", "init.event", "--subject", "INIT", "--workspace", str(tmp_path), "--json"],
+        check=True,
+        capture_output=True,
+    )
+
+    try:
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            connected_msg = ws.receive_json()
+            assert connected_msg.get("type") == "connected"
+
+            # Request replay since 0
+            ws.send_text(json.dumps({"type": "replay", "since": 0}))
+            replay_msg = ws.receive_json()
+            assert replay_msg.get("type") == "event"
+            assert replay_msg.get("event", {}).get("type") == "init.event"
+    finally:
+        state.workspace = old_ws
+
+
 

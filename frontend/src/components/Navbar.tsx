@@ -1,10 +1,24 @@
 import React, { useState, useEffect } from 'react';
-import { Layers, HelpCircle, Inbox, DownloadCloud, Activity, Settings, RefreshCw, FolderGit2, Terminal, CheckCircle2 } from 'lucide-react';
+import {
+  Layers,
+  HelpCircle,
+  Inbox,
+  DownloadCloud,
+  Activity,
+  Settings,
+  RefreshCw,
+  FolderGit2,
+  Terminal,
+  CheckCircle2,
+  Zap,
+  Radio,
+} from 'lucide-react';
 import { WorkspaceInfo } from '../types';
+import { NotificationArea } from './NotificationArea';
 
 interface NavbarProps {
-  activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'installer' | 'doctor' | 'config';
-  setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'installer' | 'doctor' | 'config') => void;
+  activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config';
+  setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config') => void;
   workspace: WorkspaceInfo | null;
   onRefresh: () => void;
   isWsConnected: boolean;
@@ -77,6 +91,18 @@ export const Navbar: React.FC<NavbarProps> = ({
       icon: <CheckCircle2 size={16} />,
       label: 'Use Cases & Validation',
       shortLabel: 'Use Cases',
+    },
+    {
+      key: 'triggers' as const,
+      icon: <Zap size={16} />,
+      label: 'Triggers',
+      shortLabel: 'Triggers',
+    },
+    {
+      key: 'events' as const,
+      icon: <Radio size={16} />,
+      label: 'Event Stream',
+      shortLabel: 'Events',
     },
     {
       key: 'installer' as const,
@@ -297,6 +323,8 @@ export const Navbar: React.FC<NavbarProps> = ({
             {isWsConnected ? 'Live' : 'Disconnected'}
           </span>
         </div>
+
+        <NotificationArea onNavigate={(t) => setActiveTab(t as any)} />
 
         <button
           onClick={onRefresh}
