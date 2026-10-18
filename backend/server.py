@@ -4177,15 +4177,35 @@ async def api_run_triggers_once(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
+PROPOSAL_ACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 async def api_list_proposed_actions(request: Request) -> JSONResponse:
+    status_filter = request.query_params.get("status", "all").lower().strip() or "all"
+    cmd = ["triggers", "proposals", "--status", status_filter, "--workspace", str(state.workspace), "--json"]
+    code, data = await run_ai_orch(cmd)
+    if code == 0 and isinstance(data, dict):
+        records = data.get("proposed_actions") or data.get("proposals") or []
+        return JSONResponse({"ok": True, "proposed_actions": records, "count": len(records)}, status_code=200)
+
+    # Fallback to direct directory read
     prop_dir = state.workspace / ".ai-orchestration" / "proposed_actions"
     records = []
     if prop_dir.is_dir():
+        norm_status = status_filter
+        if norm_status == "pending_confirmation":
+            norm_status = "pending"
         for p in sorted(prop_dir.glob("*.json")):
             if p.is_file() and not p.name.startswith("."):
                 try:
                     rec = json.loads(p.read_text(encoding="utf-8"))
-                    records.append(rec)
+                    rec_status = (rec.get("status") or "").lower()
+                    if norm_status == "all":
+                        records.append(rec)
+                    elif norm_status == "pending" and rec_status in ("pending", "pending_confirmation"):
+                        records.append(rec)
+                    elif norm_status == rec_status:
+                        records.append(rec)
                 except Exception:
                     pass
     records.sort(key=lambda r: r.get("created_at") or "", reverse=True)
@@ -4194,22 +4214,131 @@ async def api_list_proposed_actions(request: Request) -> JSONResponse:
 
 async def api_confirm_proposed_action(request: Request) -> JSONResponse:
     action_id = request.path_params.get("action_id", "")
-    return JSONResponse({
-        "ok": False,
-        "action_id": action_id,
-        "error": "not-implemented",
-        "message": "Engine does not provide CLI commands for confirming proposed actions; listing only is currently supported.",
-    }, status_code=400)
+    clean_id = action_id[:-5] if action_id.endswith(".json") else action_id
+    if not clean_id or not PROPOSAL_ACTION_ID_RE.match(clean_id):
+        return JSONResponse({
+            "ok": False,
+            "action_id": action_id,
+            "error": "invalid_action_id",
+            "message": f"Action ID '{action_id}' is invalid (must be alphanumeric/hyphens/underscores without path separators).",
+        }, status_code=400)
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+
+    expect_hash = body.get("expect_hash")
+    if not expect_hash or not isinstance(expect_hash, str) or not expect_hash.strip():
+        return JSONResponse({
+            "ok": False,
+            "action_id": clean_id,
+            "error": "missing_expect_hash",
+            "message": "Field 'expect_hash' is required and must be non-empty.",
+        }, status_code=400)
+
+    cmd = [
+        "triggers",
+        "confirm",
+        clean_id,
+        "--expect-hash",
+        expect_hash.strip(),
+        "--actor",
+        "ui",
+        "--workspace",
+        str(state.workspace),
+        "--json",
+    ]
+    code, data = await run_ai_orch(cmd)
+
+    if code == 0 and isinstance(data, dict) and data.get("ok"):
+        areas = ["triggers", "events"]
+        if data.get("run_id"):
+            areas.append("runs")
+        await state.broadcast({"type": "changed", "areas": areas})
+        return JSONResponse(data, status_code=200)
+
+    err_type = data.get("error") if isinstance(data, dict) else ""
+    if err_type == "proposal_not_found":
+        status_code = 404
+    elif err_type in ("not_pending", "hash_mismatch", "plan_hash_mismatch"):
+        status_code = 409
+    elif err_type == "disallowed_command":
+        status_code = 400
+    elif err_type in ("preview_failed", "start_failed"):
+        status_code = 502
+    else:
+        status_code = map_cli_status(code, data)
+
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_reject_proposed_action(request: Request) -> JSONResponse:
     action_id = request.path_params.get("action_id", "")
-    return JSONResponse({
-        "ok": False,
-        "action_id": action_id,
-        "error": "not-implemented",
-        "message": "Engine does not provide CLI commands for rejecting proposed actions; listing only is currently supported.",
-    }, status_code=400)
+    clean_id = action_id[:-5] if action_id.endswith(".json") else action_id
+    if not clean_id or not PROPOSAL_ACTION_ID_RE.match(clean_id):
+        return JSONResponse({
+            "ok": False,
+            "action_id": action_id,
+            "error": "invalid_action_id",
+            "message": f"Action ID '{action_id}' is invalid (must be alphanumeric/hyphens/underscores without path separators).",
+        }, status_code=400)
+
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+
+    reason = body.get("reason")
+    if not reason or not isinstance(reason, str) or not reason.strip():
+        return JSONResponse({
+            "ok": False,
+            "action_id": clean_id,
+            "error": "missing_reason",
+            "message": "Field 'reason' is required and must be non-empty.",
+        }, status_code=400)
+
+    if len(reason.strip()) > 1000:
+        return JSONResponse({
+            "ok": False,
+            "action_id": clean_id,
+            "error": "reason_too_long",
+            "message": "Reason exceeds maximum length of 1000 characters.",
+        }, status_code=400)
+
+    cmd = [
+        "triggers",
+        "reject",
+        clean_id,
+        "--reason",
+        reason.strip(),
+        "--actor",
+        "ui",
+        "--workspace",
+        str(state.workspace),
+        "--json",
+    ]
+    code, data = await run_ai_orch(cmd)
+
+    if code == 0 and isinstance(data, dict) and data.get("ok"):
+        await state.broadcast({"type": "changed", "areas": ["triggers", "events"]})
+        return JSONResponse(data, status_code=200)
+
+    err_type = data.get("error") if isinstance(data, dict) else ""
+    if err_type == "proposal_not_found":
+        status_code = 404
+    elif err_type in ("not_pending", "hash_mismatch"):
+        status_code = 409
+    elif err_type in ("missing_reason", "disallowed_command"):
+        status_code = 400
+    else:
+        status_code = map_cli_status(code, data)
+
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 def _get_active_trigger_config_path() -> pathlib.Path:
@@ -4483,6 +4612,18 @@ async def api_get_orchestrator_conversation(request: Request) -> JSONResponse:
                     try:
                         rec = json.loads(t_json.read_text(encoding="utf-8"))
                         turn_id = str(rec.get("turn_id") or d.name)
+                        created_ts = (
+                            rec.get("created_at")
+                            or rec.get("queued_at")
+                            or rec.get("started_at")
+                            or rec.get("ended_at")
+                        )
+                        if not created_ts:
+                            try:
+                                created_ts = datetime.datetime.fromtimestamp(t_json.stat().st_mtime, datetime.timezone.utc).isoformat()
+                            except Exception:
+                                created_ts = ""
+                        rec.setdefault("created_at", created_ts)
                         assistant_msgs = rec.get("assistant_messages")
                         if not assistant_msgs and rec.get("state") == "running":
                             assistant_msgs = _read_partial_assistant_messages(d)
@@ -4499,6 +4640,12 @@ async def api_get_orchestrator_conversation(request: Request) -> JSONResponse:
                         in_file = d / "input.json"
                         in_data = json.loads(in_file.read_text(encoding="utf-8")) if in_file.is_file() else {}
                         partial_msgs = _read_partial_assistant_messages(d)
+                        created_ts = in_data.get("created_at")
+                        if not created_ts:
+                            try:
+                                created_ts = datetime.datetime.fromtimestamp(d.stat().st_mtime, datetime.timezone.utc).isoformat()
+                            except Exception:
+                                created_ts = ""
                         turns_by_id[d.name] = {
                             "turn_id": d.name,
                             "turn_seq": int(d.name.split("-")[0]) if d.name.split("-")[0].isdigit() else 0,
@@ -4508,7 +4655,7 @@ async def api_get_orchestrator_conversation(request: Request) -> JSONResponse:
                             "message": in_data.get("prompt_text"),
                             "output": "\n\n".join(partial_msgs),
                             "assistant_messages": partial_msgs,
-                            "created_at": "",
+                            "created_at": created_ts,
                         }
                     except Exception:
                         pass
@@ -4520,6 +4667,8 @@ async def api_get_orchestrator_conversation(request: Request) -> JSONResponse:
                 try:
                     q_rec = json.loads(p.read_text(encoding="utf-8"))
                     tid = str(q_rec.get("turn_id") or p.stem)
+                    q_ts = q_rec.get("created_at") or q_rec.get("queued_at") or ""
+                    q_rec.setdefault("created_at", q_ts)
                     if tid in turns_by_id:
                         if q_rec.get("state") in ("running", "claimed", "queued") and turns_by_id[tid].get("state") != "done":
                             turns_by_id[tid].update(q_rec)
@@ -4542,15 +4691,22 @@ async def api_get_orchestrator_conversation(request: Request) -> JSONResponse:
                 except Exception:
                     pass
 
-    def get_sort_key(t: dict[str, Any]) -> int:
+    def get_sort_key(t: dict[str, Any]) -> tuple[str, int]:
+        ts = str(
+            t.get("created_at")
+            or t.get("queued_at")
+            or t.get("started_at")
+            or t.get("ended_at")
+            or ""
+        ).strip()
         seq = t.get("turn_seq")
-        if isinstance(seq, int):
-            return seq
-        tid = str(t.get("turn_id", "0"))
-        try:
-            return int(tid.split("-")[0])
-        except ValueError:
-            return 0
+        if not isinstance(seq, int):
+            tid = str(t.get("turn_id", "0"))
+            try:
+                seq = int(tid.split("-")[0])
+            except ValueError:
+                seq = 0
+        return (ts, seq)
 
     all_turns = sorted(turns_by_id.values(), key=get_sort_key)
     if order == "desc":

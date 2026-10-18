@@ -3460,14 +3460,46 @@ def test_triggers_and_proposed_actions_endpoints(tmp_path):
         assert len(props) == 1
         assert props[0]["action_id"] == "act-001"
 
-        # Confirm and reject return not-implemented
-        res_conf = client.post("/api/triggers/proposed-actions/act-001/confirm", headers=headers)
-        assert res_conf.status_code == 400
-        assert "not provide CLI commands" in res_conf.json().get("message", "")
+        # Confirm validations
+        # Missing expect_hash -> 400
+        res_conf_no_hash = client.post("/api/triggers/proposed-actions/act-001/confirm", headers=headers, json={})
+        assert res_conf_no_hash.status_code == 400
+        assert res_conf_no_hash.json().get("error") == "missing_expect_hash"
 
-        res_rej = client.post("/api/triggers/proposed-actions/act-001/reject", headers=headers)
-        assert res_rej.status_code == 400
-        assert "not provide CLI commands" in res_rej.json().get("message", "")
+        # Invalid action_id with invalid characters -> 400
+        res_conf_bad_id = client.post("/api/triggers/proposed-actions/bad$id/confirm", headers=headers, json={"expect_hash": "h"})
+        assert res_conf_bad_id.status_code == 400
+        assert res_conf_bad_id.json().get("error") == "invalid_action_id"
+
+        # Non-existent proposal -> 404
+        res_conf_404 = client.post("/api/triggers/proposed-actions/act-nonexistent/confirm", headers=headers, json={"expect_hash": "h"})
+        assert res_conf_404.status_code == 404
+
+        # Hash mismatch -> 409
+        res_conf_mismatch = client.post("/api/triggers/proposed-actions/act-001/confirm", headers=headers, json={"expect_hash": "wronghash"})
+        assert res_conf_mismatch.status_code == 409
+        assert res_conf_mismatch.json().get("error") == "hash_mismatch"
+
+        # Reject validations
+        # Missing reason -> 400
+        res_rej_no_reason = client.post("/api/triggers/proposed-actions/act-001/reject", headers=headers, json={})
+        assert res_rej_no_reason.status_code == 400
+        assert res_rej_no_reason.json().get("error") == "missing_reason"
+
+        # Reason too long -> 400
+        res_rej_too_long = client.post("/api/triggers/proposed-actions/act-001/reject", headers=headers, json={"reason": "x" * 1001})
+        assert res_rej_too_long.status_code == 400
+        assert res_rej_too_long.json().get("error") == "reason_too_long"
+
+        # Successful reject
+        res_rej = client.post("/api/triggers/proposed-actions/act-001/reject", headers=headers, json={"reason": "Not needed right now"})
+        assert res_rej.status_code == 200
+        assert res_rej.json().get("ok") is True
+
+        # Now not pending -> 409
+        res_conf_not_pending = client.post("/api/triggers/proposed-actions/act-001/confirm", headers=headers, json={"expect_hash": "hash123"})
+        assert res_conf_not_pending.status_code == 409
+        assert res_conf_not_pending.json().get("error") == "not_pending"
 
         # Triggers toggle preview and apply
         cfg_file = tmp_path / ".ai-orchestration.local.toml"
@@ -3714,7 +3746,7 @@ def test_orchestrator_conversation_and_turn_detail(tmp_path):
             "prompt_text": "Past prompt",
             "assistant_messages": ["Hello back! Here is my plan."],
             "usage": {"input_tokens": 120, "output_tokens": 45, "estimated_context_tokens": 500},
-            "created_at": "2026-10-18T01:00:00Z",
+            "created_at": "2099-01-01T00:00:00Z",
             "ended_at": "2026-10-18T01:00:05Z",
             "duration_seconds": 5.0,
         }), encoding="utf-8")
@@ -3897,6 +3929,66 @@ def test_setup_endpoints(tmp_path):
         content = target_file.read_text(encoding="utf-8")
         assert 'default_orchestrator = "claude"' in content
         assert 'default_executor = "kilo"' in content
+    finally:
+        state.workspace = old_ws
+
+
+def test_orchestrator_handoff_ordering(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        t_dir = tmp_path / ".ai-orchestration" / "orchestrator" / "turns"
+
+        # Turn 1: 000001 created at 10:00:00Z
+        turn1_dir = t_dir / "000001"
+        turn1_dir.mkdir(parents=True, exist_ok=True)
+        (turn1_dir / "turn.json").write_text(json.dumps({
+            "turn_id": "000001",
+            "turn_seq": 1,
+            "type": "owner_chat",
+            "state": "done",
+            "created_at": "2026-10-18T10:00:00Z",
+            "assistant_messages": ["Turn 1 reply"],
+        }), encoding="utf-8")
+
+        # Turn 2: 000002 created at 10:05:00Z
+        turn2_dir = t_dir / "000002"
+        turn2_dir.mkdir(parents=True, exist_ok=True)
+        (turn2_dir / "turn.json").write_text(json.dumps({
+            "turn_id": "000002",
+            "turn_seq": 2,
+            "type": "owner_chat",
+            "state": "done",
+            "created_at": "2026-10-18T10:05:00Z",
+            "assistant_messages": ["Turn 2 reply"],
+        }), encoding="utf-8")
+
+        # Handoff turn: handoff-gen002-abc123 created after Turn 2 (at 10:10:00Z via ended_at / created_at)
+        handoff_dir = t_dir / "handoff-gen002-abc123"
+        handoff_dir.mkdir(parents=True, exist_ok=True)
+        (handoff_dir / "turn.json").write_text(json.dumps({
+            "turn_id": "handoff-gen002-abc123",
+            "type": "handoff",
+            "state": "done",
+            "ended_at": "2026-10-18T10:10:00Z",
+            "assistant_messages": ["Handoff completed"],
+        }), encoding="utf-8")
+
+        # Ascending order: Turn 1, then Turn 2, then Handoff (strictly chronological)
+        res_asc = client.get("/api/orchestrator/conversation?order=asc", headers=headers)
+        assert res_asc.status_code == 200
+        turns_asc = res_asc.json().get("turns", [])
+        asc_ids = [t["turn_id"] for t in turns_asc]
+        assert asc_ids == ["000001", "000002", "handoff-gen002-abc123"]
+
+        # Descending order: Handoff, then Turn 2, then Turn 1
+        res_desc = client.get("/api/orchestrator/conversation?order=desc", headers=headers)
+        assert res_desc.status_code == 200
+        turns_desc = res_desc.json().get("turns", [])
+        desc_ids = [t["turn_id"] for t in turns_desc]
+        assert desc_ids == ["handoff-gen002-abc123", "000002", "000001"]
     finally:
         state.workspace = old_ws
 

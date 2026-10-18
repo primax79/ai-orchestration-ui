@@ -1,14 +1,18 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Zap,
   Shield,
   ShieldAlert,
   Play,
   Clock,
-  Info,
   ChevronDown,
   ChevronRight,
   Lock,
+  Check,
+  XCircle,
+  AlertCircle,
+  CheckCircle2,
+  Loader2,
 } from 'lucide-react';
 import {
   TriggersListResponse,
@@ -16,7 +20,7 @@ import {
   TriggerFiring,
   ProposedAction,
 } from '../types';
-import { api } from '../api';
+import { api, proposedActionsApi } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
 
 interface TriggersPageProps {
@@ -32,6 +36,10 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
   const [actionLoading, setActionLoading] = useState(false);
   const [expandedFiringId, setExpandedFiringId] = useState<string | null>(null);
   const [expandedActionId, setExpandedActionId] = useState<string | null>(null);
+  const [confirmProposal, setConfirmProposal] = useState<ProposedAction | null>(null);
+  const [rejectProposal, setRejectProposal] = useState<ProposedAction | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+  const [proposalActionStatus, setProposalActionStatus] = useState<Record<string, { loading?: boolean; error?: string; success?: string }>>({});
 
   // Toggle Confirm Dialog state
   const [confirmDialog, setConfirmDialog] = useState<{
@@ -71,6 +79,78 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
       setLoading(false);
     }
   }, []);
+
+  const handleConfirmProposal = async () => {
+    if (!confirmProposal) return;
+    const act = confirmProposal;
+    setProposalActionStatus((prev) => ({
+      ...prev,
+      [act.action_id]: { loading: true },
+    }));
+    try {
+      const res = await proposedActionsApi.confirmProposedAction(act.action_id, {
+        expect_hash: act.action_hash,
+      });
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          success: res.message || 'Action confirmed and executed successfully',
+        },
+      }));
+      setConfirmProposal(null);
+      const propRes = await api.getProposedActions();
+      setProposedActions(propRes.proposed_actions || []);
+    } catch (err: any) {
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          error: err.message || 'Failed to confirm action',
+        },
+      }));
+      setConfirmProposal(null);
+    }
+  };
+
+  const handleRejectProposal = async () => {
+    if (!rejectProposal || !rejectReason.trim()) return;
+    const act = rejectProposal;
+    setProposalActionStatus((prev) => ({
+      ...prev,
+      [act.action_id]: { loading: true },
+    }));
+    try {
+      const res = await proposedActionsApi.rejectProposedAction(act.action_id, {
+        reason: rejectReason.trim(),
+      });
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          success: res.message || 'Action rejected',
+        },
+      }));
+      setRejectProposal(null);
+      setRejectReason('');
+      const propRes = await api.getProposedActions();
+      setProposedActions(propRes.proposed_actions || []);
+    } catch (err: any) {
+      setProposalActionStatus((prev) => ({
+        ...prev,
+        [act.action_id]: {
+          loading: false,
+          error: err.message || 'Failed to reject action',
+        },
+      }));
+      setRejectProposal(null);
+    }
+  };
+
+  const pendingCount = useMemo(
+    () => proposedActions.filter((a) => a.status === 'pending' || a.status === 'pending_confirmation').length,
+    [proposedActions]
+  );
 
   useEffect(() => {
     loadAll();
@@ -573,7 +653,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
               fontWeight: 600,
             }}
           >
-            {proposedActions.length} Pending
+            {pendingCount} Pending
           </span>
         </div>
 
@@ -586,6 +666,8 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
               {proposedActions.map((act) => {
                 const isExpanded = expandedActionId === act.action_id;
+                const isPending = act.status === 'pending' || act.status === 'pending_confirmation';
+                const statusItem = proposalActionStatus[act.action_id];
                 return (
                   <div
                     key={act.action_id}
@@ -605,9 +687,10 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
                         justifyContent: 'space-between',
                         cursor: 'pointer',
                         backgroundColor: isExpanded ? '#1e293b' : 'transparent',
+                        gap: '1rem',
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
                         {isExpanded ? <ChevronDown size={14} color="#94a3b8" /> : <ChevronRight size={14} color="#94a3b8" />}
                         <span style={{ fontWeight: 600, fontSize: '0.85rem', color: '#f8fafc' }}>
                           {act.type}
@@ -619,21 +702,114 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
                           style={{
                             fontSize: '0.7rem',
                             fontWeight: 700,
-                            color: '#fbbf24',
-                            backgroundColor: '#fbbf2415',
-                            border: '1px solid #fbbf2430',
                             padding: '0.05rem 0.35rem',
                             borderRadius: '4px',
+                            backgroundColor:
+                              act.status === 'confirmed'
+                                ? '#065f46'
+                                : act.status === 'rejected'
+                                ? '#4c0519'
+                                : '#fbbf2415',
+                            color:
+                              act.status === 'confirmed'
+                                ? '#34d399'
+                                : act.status === 'rejected'
+                                ? '#f43f5e'
+                                : '#fbbf24',
+                            border:
+                              act.status === 'confirmed'
+                                ? '1px solid #059669'
+                                : act.status === 'rejected'
+                                ? '1px solid #e11d48'
+                                : '1px solid #fbbf2430',
                           }}
                         >
                           {act.status}
                         </span>
+                        {act.run_id && (
+                          <span style={{ fontSize: '0.72rem', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                            Run: <code style={{ color: '#38bdf8' }}>{act.run_id}</code>
+                          </span>
+                        )}
                       </div>
 
-                      <div style={{ fontSize: '0.75rem', color: '#64748b' }}>
-                        {formatAge(act.created_at)}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexShrink: 0 }}>
+                        {isPending ? (
+                          <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }} onClick={(e) => e.stopPropagation()}>
+                            <button
+                              onClick={() => setConfirmProposal(act)}
+                              disabled={statusItem?.loading}
+                              title="Confirm proposed action"
+                              style={{
+                                padding: '0.25rem 0.6rem',
+                                borderRadius: '0.375rem',
+                                border: '1px solid #059669',
+                                backgroundColor: '#065f46',
+                                color: '#34d399',
+                                fontSize: '0.75rem',
+                                fontWeight: 600,
+                                cursor: statusItem?.loading ? 'not-allowed' : 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.25rem',
+                              }}
+                            >
+                              <Check size={13} />
+                              Confirm
+                            </button>
+                            <button
+                              onClick={() => {
+                                setRejectProposal(act);
+                                setRejectReason('');
+                              }}
+                              disabled={statusItem?.loading}
+                              title="Reject proposed action"
+                              style={{
+                                padding: '0.25rem 0.6rem',
+                                borderRadius: '0.375rem',
+                                border: '1px solid #991b1b',
+                                backgroundColor: '#450a0a',
+                                color: '#f87171',
+                                fontSize: '0.75rem',
+                                fontWeight: 600,
+                                cursor: statusItem?.loading ? 'not-allowed' : 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.25rem',
+                              }}
+                            >
+                              <XCircle size={13} />
+                              Reject
+                            </button>
+                          </div>
+                        ) : (
+                          <div style={{ fontSize: '0.75rem', color: act.status === 'confirmed' ? '#34d399' : '#f87171', fontWeight: 600 }}>
+                            {act.status === 'confirmed' ? 'Confirmed' : 'Rejected'}
+                          </div>
+                        )}
+
+                        <div style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                          {formatAge(act.created_at)}
+                        </div>
                       </div>
                     </div>
+
+                    {/* Inline results / errors */}
+                    {statusItem?.loading && (
+                      <div style={{ padding: '0.4rem 1rem', display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#38bdf8', backgroundColor: '#0b1329', borderTop: '1px solid #1e293b' }}>
+                        <Loader2 size={12} className="animate-spin" /> Processing...
+                      </div>
+                    )}
+                    {statusItem?.error && (
+                      <div style={{ padding: '0.4rem 1rem', display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#f87171', backgroundColor: '#1c1017', borderTop: '1px solid #1e293b' }}>
+                        <AlertCircle size={12} /> {statusItem.error}
+                      </div>
+                    )}
+                    {statusItem?.success && (
+                      <div style={{ padding: '0.4rem 1rem', display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#34d399', backgroundColor: '#06281e', borderTop: '1px solid #1e293b' }}>
+                        <CheckCircle2 size={12} /> {statusItem.success}
+                      </div>
+                    )}
 
                     {isExpanded && (
                       <div
@@ -649,7 +825,23 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
                           <div><strong>Created:</strong> {act.created_at}</div>
                           <div><strong>Hash:</strong> <code>{act.action_hash}</code></div>
                           {act.trigger_event && <div><strong>Trigger Event:</strong> {act.trigger_event}</div>}
+                          {act.confirmed_at && <div><strong>Confirmed At:</strong> {act.confirmed_at} {act.confirmed_by ? `by ${act.confirmed_by}` : ''}</div>}
+                          {act.rejected_at && <div><strong>Rejected At:</strong> {act.rejected_at} {act.rejected_by ? `by ${act.rejected_by}` : ''}</div>}
+                          {act.run_id && (
+                            <div>
+                              <strong>Run ID:</strong> <code style={{ color: '#38bdf8' }}>{act.run_id}</code>
+                            </div>
+                          )}
                         </div>
+
+                        {act.reason && (
+                          <div style={{ marginBottom: '0.5rem' }}>
+                            <strong>{act.status === 'rejected' ? 'Rejection Reason:' : 'Reason / Note:'}</strong>
+                            <div style={{ color: act.status === 'rejected' ? '#fca5a5' : '#cbd5e1', marginTop: '0.2rem' }}>
+                              {act.reason}
+                            </div>
+                          </div>
+                        )}
 
                         {act.command && (
                           <div style={{ marginBottom: '0.5rem' }}>
@@ -661,6 +853,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
                                 backgroundColor: '#0f172a',
                                 borderRadius: '0.25rem',
                                 color: '#38bdf8',
+                                overflowX: 'auto',
                               }}
                             >
                               {act.command.join(' ')}
@@ -678,26 +871,13 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
                                 backgroundColor: '#0f172a',
                                 borderRadius: '0.25rem',
                                 color: '#cbd5e1',
+                                overflowX: 'auto',
                               }}
                             >
                               {JSON.stringify(act.run_params, null, 2)}
                             </pre>
                           </div>
                         )}
-
-                        <div
-                          style={{
-                            padding: '0.5rem 0.75rem',
-                            backgroundColor: '#1e293b',
-                            borderRadius: '0.25rem',
-                            border: '1px solid #334155',
-                            color: '#94a3b8',
-                            fontSize: '0.72rem',
-                          }}
-                        >
-                          <Info size={12} style={{ display: 'inline', marginRight: '4px' }} />
-                          Note: Under E3 reduced-capability policy, unattended trigger runs cannot execute mutations or agent launches directly. Engine currently supports listing proposed actions for review.
-                        </div>
                       </div>
                     )}
                   </div>
@@ -859,6 +1039,75 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
         onApply={handleApplyToggle}
         onCancel={() => setConfirmDialog((prev) => ({ ...prev, open: false }))}
       />
+
+      {/* Confirm Proposal Dialog */}
+      {confirmProposal && (
+        <ConfirmDialog
+          isOpen={Boolean(confirmProposal)}
+          title={`Confirm Proposed Action: ${confirmProposal.action_id}`}
+          summary={
+            `Confirm and execute proposed action under trigger rules.\n\n` +
+            `* **Type:** \`${confirmProposal.type}\`\n` +
+            `* **Rule:** \`${confirmProposal.rule}\`\n` +
+            `* **Action Hash:** \`${confirmProposal.action_hash}\`\n` +
+            (confirmProposal.command
+              ? `\n**Command:**\n\`\`\`bash\n${Array.isArray(confirmProposal.command) ? confirmProposal.command.join(' ') : String(confirmProposal.command)}\n\`\`\`\n`
+              : '') +
+            (confirmProposal.run_params
+              ? `\n**Run Parameters:**\n\`\`\`json\n${JSON.stringify(confirmProposal.run_params, null, 2)}\n\`\`\`\n`
+              : '')
+          }
+          applyButtonText="Confirm & Execute"
+          cancelButtonText="Cancel"
+          hash={confirmProposal.action_hash}
+          onApply={handleConfirmProposal}
+          onCancel={() => setConfirmProposal(null)}
+        />
+      )}
+
+      {/* Reject Proposal Dialog */}
+      {rejectProposal && (
+        <ConfirmDialog
+          isOpen={Boolean(rejectProposal)}
+          title={`Reject Proposed Action: ${rejectProposal.action_id}`}
+          summary={`Reject proposed **${rejectProposal.type}** action (rule: **${rejectProposal.rule}**). A reason is required.`}
+          danger={true}
+          applyButtonText="Reject Action"
+          cancelButtonText="Cancel"
+          isApplyDisabled={!rejectReason.trim() || rejectReason.length > 1000}
+          onApply={handleRejectProposal}
+          onCancel={() => {
+            setRejectProposal(null);
+            setRejectReason('');
+          }}
+        >
+          <div style={{ marginTop: '0.75rem' }}>
+            <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#f8fafc', marginBottom: '0.35rem' }}>
+              Reason for rejection <span style={{ color: '#ef4444' }}>*</span>
+            </label>
+            <textarea
+              value={rejectReason}
+              onChange={(e) => setRejectReason(e.target.value)}
+              placeholder="Enter reason for rejecting this proposal..."
+              rows={3}
+              style={{
+                width: '100%',
+                backgroundColor: '#0f172a',
+                border: '1px solid #475569',
+                borderRadius: '0.375rem',
+                color: '#f8fafc',
+                padding: '0.5rem',
+                fontSize: '0.8rem',
+                resize: 'vertical',
+                boxSizing: 'border-box',
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', fontSize: '0.7rem', color: '#64748b', marginTop: '0.2rem' }}>
+              {rejectReason.length}/1000
+            </div>
+          </div>
+        </ConfirmDialog>
+      )}
     </div>
   );
 };

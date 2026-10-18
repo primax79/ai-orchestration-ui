@@ -1322,6 +1322,44 @@ export interface OrchestratorReassignPreviewResponse {
   error?: string;
 }
 
+export interface ProposedAction {
+  confirmed_at?: string;
+  confirmed_by?: string;
+  rejected_at?: string;
+  rejected_by?: string;
+  run_id?: string;
+  result?: any;
+}
+
+export interface ConfirmProposedActionPayload {
+  expect_hash: string;
+}
+
+export interface RejectProposedActionPayload {
+  reason: string;
+}
+
+export interface ConfirmProposedActionResponse {
+  ok: boolean;
+  action_id?: string;
+  status?: string;
+  run_id?: string;
+  result?: any;
+  message?: string;
+  error?: string;
+}
+
+export interface RejectProposedActionResponse {
+  ok: boolean;
+  action_id?: string;
+  status?: string;
+  reason?: string;
+  message?: string;
+  error?: string;
+}
+
+
+
 export interface OrchestratorReassignApplyResponse {
   ok: boolean;
   status?: string;
