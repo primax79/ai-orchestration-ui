@@ -1305,6 +1305,96 @@ export interface PostChatResponse {
   error?: string;
 }
 
+// 12.10: Orchestrator Reassign & Setup Wizard types
+export interface OrchestratorReassignPreviewResponse {
+  ok: boolean;
+  dry_run?: boolean;
+  plan?: string;
+  plan_hash?: string;
+  hash?: string;
+  config_hash?: string;
+  diff?: string;
+  path?: string;
+  from_tool?: string;
+  to_tool?: string;
+  generation?: number;
+  target_generation?: number;
+  error?: string;
+}
+
+export interface OrchestratorReassignApplyResponse {
+  ok: boolean;
+  status?: string;
+  plan?: string;
+  plan_hash?: string;
+  generation?: number;
+  session_id?: string;
+  tool?: string;
+  model?: string;
+  path?: string;
+  diff?: string;
+  error?: string;
+}
+
+export interface SetupToolDetection {
+  installed: boolean;
+  path?: string;
+  version?: string;
+  auth_status?: string;
+  models?: string[];
+}
+
+export interface SetupPlanResponse {
+  ok: boolean;
+  applied?: boolean;
+  detection: Record<string, SetupToolDetection>;
+  routing: {
+    default_orchestrator: string;
+    default_executor: string;
+    default_profile: string;
+  };
+  verification: {
+    default_mode: string;
+    cross_agent_order: string[];
+  };
+  profiles: {
+    orchestrator: {
+      tool: string;
+      profile: string;
+      model: string;
+    };
+    executor: {
+      tool: string;
+      profile: string;
+      model: string;
+    };
+  };
+  permission_policy: {
+    description: string;
+    defaults: Record<string, string[]>;
+  };
+  scope: string;
+  path: string;
+  existing_exists: boolean;
+  diff: string;
+  plan_hash: string;
+  config_hash: string;
+  hash: string;
+  error?: string;
+}
+
+export interface SetupApplyResponse {
+  ok: boolean;
+  applied: boolean;
+  scope?: string;
+  path?: string;
+  plan_hash?: string;
+  hash?: string;
+  orchestrator_started?: boolean;
+  error?: string;
+}
+
+
 
 
 

@@ -295,7 +295,7 @@ _inflight_reads: dict[tuple[Any, ...], asyncio.Future] = {}
 
 
 def _is_read_only(args: list[str]) -> bool:
-    if any(a in ("--check", "--dry-run", "--diff") for a in args):
+    if any(a in ("--check", "--dry-run", "--diff", "--plan") for a in args):
         return True
     return tuple(args[:2]) in _READ_ONLY_PREFIXES
 
@@ -4629,6 +4629,130 @@ async def api_list_orchestrator_queue(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "queue": items, "count": len(items)}, status_code=200)
 
 
+async def api_preview_orchestrator_reassign(request: Request) -> JSONResponse:
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    else:
+        body = {}
+    tool = body.get("tool") or request.query_params.get("tool")
+    if not tool:
+        return JSONResponse({"error": "tool is required"}, status_code=400)
+
+    cmd = ["orchestrator", "reassign", "--tool", str(tool), "--dry-run", "--workspace", str(state.workspace), "--json"]
+    model = body.get("model") or request.query_params.get("model")
+    if model:
+        cmd.extend(["--model", str(model)])
+    scope = body.get("scope") or request.query_params.get("scope", "project")
+    cmd.extend(["--scope", str(scope)])
+    if body.get("no_handoff") or request.query_params.get("no_handoff") == "true":
+        cmd.append("--no-handoff")
+    if body.get("timeout"):
+        cmd.extend(["--timeout", str(body["timeout"])])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_orchestrator_reassign(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    tool = body.get("tool")
+    if not tool:
+        return JSONResponse({"error": "tool is required"}, status_code=400)
+    expect_hash = body.get("expect_hash") or body.get("expect_plan_hash")
+    if not expect_hash:
+        return JSONResponse({"error": "expect_hash is required"}, status_code=400)
+
+    cmd = ["orchestrator", "reassign", "--tool", str(tool), "--expect-hash", str(expect_hash), "--workspace", str(state.workspace), "--json"]
+    if body.get("model"):
+        cmd.extend(["--model", str(body["model"])])
+    scope = body.get("scope", "project")
+    cmd.extend(["--scope", str(scope)])
+    if body.get("no_handoff"):
+        cmd.append("--no-handoff")
+    if body.get("timeout"):
+        cmd.extend(["--timeout", str(body["timeout"])])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.check_and_push_events()
+        await state.broadcast({"type": "orchestrator_reassigned", "result": data})
+        await state.broadcast({"type": "changed", "areas": ["orchestrator", "events", "sessions", "config"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_setup(request: Request) -> JSONResponse:
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    else:
+        body = {}
+    scope = body.get("scope") or request.query_params.get("scope", "project-local")
+    cmd = ["setup", "--plan", "--scope", str(scope), "--workspace", str(state.workspace), "--json"]
+    orch = body.get("orchestrator") or request.query_params.get("orchestrator")
+    if orch:
+        cmd.extend(["--orchestrator", str(orch)])
+    executor = body.get("executor") or request.query_params.get("executor")
+    if executor:
+        cmd.extend(["--executor", str(executor)])
+    orch_model = body.get("orchestrator_model") or request.query_params.get("orchestrator_model")
+    if orch_model:
+        cmd.extend(["--orchestrator-model", str(orch_model)])
+    exec_model = body.get("executor_model") or request.query_params.get("executor_model")
+    if exec_model:
+        cmd.extend(["--executor-model", str(exec_model)])
+    vmode = body.get("verification_mode") or request.query_params.get("verification_mode")
+    if vmode:
+        cmd.extend(["--verification-mode", str(vmode)])
+
+    code, data = await run_ai_orch(cmd)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_apply_setup(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    expect_hash = body.get("expect_hash") or body.get("expect_plan_hash")
+    if not expect_hash:
+        return JSONResponse({"error": "expect_hash is required"}, status_code=400)
+
+    scope = body.get("scope", "project-local")
+    cmd = ["setup", "--apply", "--expect-hash", str(expect_hash), "--scope", str(scope), "--workspace", str(state.workspace), "--json"]
+    if body.get("orchestrator"):
+        cmd.extend(["--orchestrator", str(body["orchestrator"])])
+    if body.get("executor"):
+        cmd.extend(["--executor", str(body["executor"])])
+    if body.get("orchestrator_model"):
+        cmd.extend(["--orchestrator-model", str(body["orchestrator_model"])])
+    if body.get("executor_model"):
+        cmd.extend(["--executor-model", str(body["executor_model"])])
+    if body.get("verification_mode"):
+        cmd.extend(["--verification-mode", str(body["verification_mode"])])
+    if body.get("start_orchestrator"):
+        cmd.append("--start-orchestrator")
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        await state.check_and_push_events()
+        await state.broadcast({"type": "setup_applied", "result": data})
+        await state.broadcast({"type": "config_updated"})
+        await state.broadcast({"type": "changed", "areas": ["config", "orchestrator", "events", "sessions"]})
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
 async def api_list_notifications(request: Request) -> JSONResponse:
     notif_dir = state.workspace / ".ai-orchestration" / "notifications"
     notifications = []
@@ -4884,6 +5008,11 @@ routes = [
     Route("/api/orchestrator/cancel/{turn_id}", api_cancel_orchestrator_turn, methods=["POST"]),
     Route("/api/orchestrator/run-next", api_run_next_orchestrator_turn, methods=["POST"]),
     Route("/api/orchestrator/queue", api_list_orchestrator_queue, methods=["GET"]),
+    Route("/api/orchestrator/reassign/preview", api_preview_orchestrator_reassign, methods=["GET", "POST"]),
+    Route("/api/orchestrator/reassign", api_orchestrator_reassign, methods=["POST"]),
+    Route("/api/setup/preview", api_preview_setup, methods=["GET", "POST"]),
+    Route("/api/setup/plan", api_preview_setup, methods=["GET", "POST"]),
+    Route("/api/setup/apply", api_apply_setup, methods=["POST"]),
     Route("/api/notifications", api_list_notifications, methods=["GET"]),
     Route("/api/notifications/{id}/read", api_mark_notification_read, methods=["POST"]),
     Route("/api/notifications/read", api_mark_notification_read, methods=["POST"]),

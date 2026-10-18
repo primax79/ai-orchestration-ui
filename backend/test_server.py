@@ -3643,4 +3643,116 @@ def test_orchestrator_controls(tmp_path):
         state.workspace = old_ws
 
 
+def test_orchestrator_reassign_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Missing tool -> 400
+        res_bad = client.post("/api/orchestrator/reassign/preview", headers=headers, json={})
+        assert res_bad.status_code == 400
+        assert "tool is required" in res_bad.json().get("error", "")
+
+        # Valid preview
+        res_prev = client.post("/api/orchestrator/reassign/preview", headers=headers, json={
+            "tool": "kilo",
+            "model": "google/gemini-4-argon",
+            "scope": "project",
+        })
+        assert res_prev.status_code == 200
+        data_prev = res_prev.json()
+        assert data_prev.get("ok") is True
+        assert data_prev.get("dry_run") is True
+        assert "plan" in data_prev
+        assert "plan_hash" in data_prev
+        plan_hash = data_prev["plan_hash"]
+
+        # Apply without expect_hash -> 400
+        res_no_hash = client.post("/api/orchestrator/reassign", headers=headers, json={
+            "tool": "kilo",
+        })
+        assert res_no_hash.status_code == 400
+
+        # Apply with wrong expect_hash -> hash mismatch error
+        res_wrong_hash = client.post("/api/orchestrator/reassign", headers=headers, json={
+            "tool": "kilo",
+            "expect_hash": "deadbeef" * 8,
+            "no_handoff": True,
+        })
+        assert res_wrong_hash.status_code in (409, 400, 500)
+
+        # Apply with correct plan_hash (and no_handoff to avoid external CLI calls)
+        res_apply = client.post("/api/orchestrator/reassign", headers=headers, json={
+            "tool": "kilo",
+            "model": "google/gemini-4-argon",
+            "expect_hash": plan_hash,
+            "no_handoff": True,
+        })
+        assert res_apply.status_code == 200
+        data_apply = res_apply.json()
+        assert data_apply.get("ok") is True
+        assert data_apply.get("status") == "reassigned"
+        assert data_apply.get("tool") == "kilo"
+        assert data_apply.get("generation") >= 2
+    finally:
+        state.workspace = old_ws
+
+
+def test_setup_endpoints(tmp_path):
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+    old_ws = state.workspace
+    state.workspace = tmp_path
+    try:
+        # Preview plan via GET
+        res_get_plan = client.get("/api/setup/plan", headers=headers)
+        assert res_get_plan.status_code == 200
+        data_plan = res_get_plan.json()
+        assert data_plan.get("ok") is True
+        assert data_plan.get("applied") is False
+        assert "detection" in data_plan
+        assert "routing" in data_plan
+        assert "plan_hash" in data_plan
+
+        # Preview plan via POST with custom options
+        res_post_plan = client.post("/api/setup/preview", headers=headers, json={
+            "scope": "project-local",
+            "orchestrator": "claude",
+            "executor": "kilo",
+            "verification_mode": "cross-agent",
+        })
+        assert res_post_plan.status_code == 200
+        custom_plan = res_post_plan.json()
+        assert custom_plan.get("ok") is True
+        plan_hash = custom_plan.get("plan_hash")
+        assert plan_hash
+
+        # Apply setup without expect_hash -> 400
+        res_no_hash = client.post("/api/setup/apply", headers=headers, json={})
+        assert res_no_hash.status_code == 400
+
+        # Apply setup with expect_hash
+        res_apply = client.post("/api/setup/apply", headers=headers, json={
+            "scope": "project-local",
+            "orchestrator": "claude",
+            "executor": "kilo",
+            "verification_mode": "cross-agent",
+            "expect_hash": plan_hash,
+        })
+        assert res_apply.status_code == 200
+        data_apply = res_apply.json()
+        assert data_apply.get("ok") is True
+        assert data_apply.get("applied") is True
+
+        # Check file was written in scratch workspace
+        target_file = tmp_path / ".ai-orchestration.local.toml"
+        assert target_file.is_file()
+        content = target_file.read_text(encoding="utf-8")
+        assert 'default_orchestrator = "claude"' in content
+        assert 'default_executor = "kilo"' in content
+    finally:
+        state.workspace = old_ws
+
+
 
