@@ -1837,6 +1837,99 @@ Object.assign(api, orchestratorChatApi);
 
 export const eventsAndTriggersApi = api;
 
+// 12.10: Orchestrator Card & First-Run Setup Wizard API
+import type {
+  OrchestratorReassignPreviewResponse,
+  OrchestratorReassignApplyResponse,
+  SetupPlanResponse,
+  SetupApplyResponse,
+} from './types';
+
+export interface OrchestratorCardAndSetupApiExtensions {
+  previewOrchestratorReassign(payload: {
+    tool: string;
+    model?: string;
+    scope?: string;
+    no_handoff?: boolean;
+    timeout?: number;
+  }): Promise<OrchestratorReassignPreviewResponse>;
+  reassignOrchestrator(payload: {
+    tool: string;
+    expect_hash: string;
+    model?: string;
+    scope?: string;
+    no_handoff?: boolean;
+    timeout?: number;
+  }): Promise<OrchestratorReassignApplyResponse>;
+  previewSetup(params?: {
+    scope?: string;
+    orchestrator?: string;
+    executor?: string;
+    orchestrator_model?: string;
+    executor_model?: string;
+    verification_mode?: string;
+  }): Promise<SetupPlanResponse>;
+  applySetup(payload: {
+    expect_hash: string;
+    scope?: string;
+    orchestrator?: string;
+    executor?: string;
+    orchestrator_model?: string;
+    executor_model?: string;
+    verification_mode?: string;
+    start_orchestrator?: boolean;
+  }): Promise<SetupApplyResponse>;
+}
+
+export const orchestratorCardAndSetupApi: OrchestratorCardAndSetupApiExtensions = {
+  async previewOrchestratorReassign(payload) {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<OrchestratorReassignPreviewResponse>('previewOrchestratorReassign', payload);
+    }
+    return apiFetch<OrchestratorReassignPreviewResponse>('/api/orchestrator/reassign/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async reassignOrchestrator(payload) {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<OrchestratorReassignApplyResponse>('reassignOrchestrator', payload);
+    }
+    return apiFetch<OrchestratorReassignApplyResponse>('/api/orchestrator/reassign', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async previewSetup(params) {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetupPlanResponse>('previewSetup', params || {});
+    }
+    return apiFetch<SetupPlanResponse>('/api/setup/preview', {
+      method: 'POST',
+      body: JSON.stringify(params || {}),
+    });
+  },
+
+  async applySetup(payload) {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<SetupApplyResponse>('applySetup', payload);
+    }
+    return apiFetch<SetupApplyResponse>('/api/setup/apply', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+};
+
+Object.assign(api, orchestratorCardAndSetupApi);
+
+export const orchestratorConfigApi = {
+  ...orchestratorChatApi,
+  ...orchestratorCardAndSetupApi,
+};
+
 // ---------------------------------------------------------------------------
 // Triage Proposal Editing API helpers (Task 09.10)
 // ---------------------------------------------------------------------------

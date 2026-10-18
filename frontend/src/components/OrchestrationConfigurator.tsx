@@ -16,6 +16,8 @@ import {
 import { OrchestrationConfigResponse, VerificationMode, ConfigPreviewResponse } from '../types';
 import { api } from '../api';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
+import { OrchestratorConfigCard } from './OrchestratorConfigCard';
+import { SetupWizard } from './SetupWizard';
 
 interface OrchestrationConfiguratorProps {
   configData: OrchestrationConfigResponse | null;
@@ -53,6 +55,11 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
   // Scope: 'global' vs 'project'
   const [selectedScope, setSelectedScope] = useState<'global' | 'project'>(() => {
     return configData?.meta?.project_config_exists ? 'project' : 'global';
+  });
+
+  // First-run wizard state: auto-open if workspace has no project config
+  const [showWizard, setShowWizard] = useState<boolean>(() => {
+    return !configData?.meta?.project_config_exists;
   });
 
   // Routing state
@@ -663,6 +670,28 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
           </ul>
         </div>
       )}
+
+      {/* First-Run Setup Wizard */}
+      {showWizard && (
+        <SetupWizard
+          onComplete={() => {
+            setShowWizard(false);
+            setStatusMsg({
+              type: 'success',
+              text: 'Setup completed successfully! Orchestrator role configured.',
+            });
+            onRefresh();
+          }}
+          onDismiss={() => setShowWizard(false)}
+        />
+      )}
+
+      {/* Orchestrator Role & Reassignment Card */}
+      <OrchestratorConfigCard
+        configData={configData}
+        onRefresh={onRefresh}
+        onOpenSetupWizard={() => setShowWizard(true)}
+      />
 
       {/* Claude headless permission policy (R11). Since 07.12 (decision Q001 = A) an empty
           config is valid: runs use the built-in per-mode allow-list, never --dangerously-*. */}
