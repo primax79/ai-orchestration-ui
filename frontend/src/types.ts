@@ -1526,24 +1526,40 @@ export function shortTitle(
   // 4. Strip markdown headings or bullet prefixes
   text = text.replace(/^[#\-*:]+\s*/, '');
 
-  // 5. Tokenize into words
-  const words = text.trim().split(/\s+/).filter(Boolean);
+  // 5. Drop a short code prefix such as "P1-a:" or "P3-a..d:" (mirrors derive_short_title in the engine)
+  text = text.replace(/^\s*[A-Z]\d+[-\w.]*:\s+/, '');
 
-  // 6. Drop leading articles ('a', 'an', 'the')
-  while (words.length > 0 && /^(a|an|the)$/i.test(words[0])) {
+  // 6. Tokenize, strip outer punctuation, drop leading articles
+  const words = text.trim().split(/\s+/).map((w) => w.replace(/^[^\w]+|[^\w]+$/g, '')).filter(Boolean);
+  while (words.length > 0 && /^(a|an|the|which|what|how|who|should|would)$/i.test(words[0])) {
     words.shift();
   }
-
   if (words.length === 0) {
     const fallbackWords = raw.replace(/[`()]/g, '').trim().split(/\s+/).filter(Boolean);
     return fallbackWords.slice(0, 4).join(' ');
   }
 
-  // 7. Take first 3-4 significant words (up to 4 words)
-  const picked = words.slice(0, 4).join(' ');
+  // 7. Keep significant words: no function words, no case-insensitive repeats (same list as the engine)
+  const seen = new Set<string>();
+  let sig = words.filter((w) => {
+    const lw = w.toLowerCase();
+    if (SHORT_TITLE_STOP_WORDS.has(lw) || seen.has(lw)) return false;
+    seen.add(lw);
+    return true;
+  });
+  if (sig.length < 2) sig = words;
 
-  // 8. Trim trailing punctuation
-  return picked.replace(/[,;:\-.]+$/, '').trim();
+  // 8. Up to 4 words, at most 40 characters, no trailing punctuation
+  const picked = sig.slice(0, 4);
+  while (picked.join(' ').length > 40 && picked.length > 1) picked.pop();
+  return picked.join(' ').slice(0, 40).replace(/[.,:;!?\u2014\u2013-]+$/, '').trim();
 }
+
+const SHORT_TITLE_STOP_WORDS = new Set([
+  'a', 'an', 'the', 'and', 'or', 'for', 'of', 'in', 'on', 'at', 'to', 'by', 'with', 'from', 'as', 'is', 'are',
+  'was', 'were', 'it', 'its', 'via', 'which', 'what', 'should', 'would', 'could', 'does', 'do', 'before',
+  'after', 'that', 'this', 'into', 'when', 'where', 'be', 'but', 'not', 'than', 'then', 'so', 'if', 'all',
+  'each', 'every',
+]);
 
 
