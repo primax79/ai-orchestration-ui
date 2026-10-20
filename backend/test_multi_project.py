@@ -231,7 +231,7 @@ def test_scratch_workspace_discovery_and_exclusions(auth_headers):
             assert any(t["id"] == "01.1" for t in data_a.get("all_tasks", []))
 
             # 5. New Aggregate endpoint: GET /api/workspace/tasks
-            res_agg = client.get("/api/workspace/tasks", headers=auth_headers)
+            res_agg = client.get("/api/workspace/tasks?per_page=500", headers=auth_headers)
             assert res_agg.status_code == 200
             agg_data = res_agg.json()
             assert agg_data["ok"] is True
@@ -674,9 +674,16 @@ def test_scratch_registered_workspace_canonical_counts_and_coordinates(monkeypat
             state.workspace = old_ws
 
 
-def test_real_d4science_python_library_read_only(auth_headers):
-    """Read-only test against real /Users/Alfredo/works/d4science-python-library."""
-    real_path = pathlib.Path("/Users/Alfredo/works/d4science-python-library")
+def test_live_workspace_read_only(auth_headers):
+    """Opt-in, read-only check against a real multi-project workspace.
+
+    Set AI_ORCH_LIVE_WORKSPACE to its root (e.g. ~/works/d4science-python-library).
+    Live data changes, so only invariants are asserted, never fixed counts.
+    """
+    raw = os.environ.get("AI_ORCH_LIVE_WORKSPACE", "").strip()
+    if not raw:
+        pytest.skip("AI_ORCH_LIVE_WORKSPACE not set")
+    real_path = pathlib.Path(raw).expanduser().resolve()
     if not real_path.is_dir():
         pytest.skip(f"{real_path} not found")
 
@@ -685,72 +692,42 @@ def test_real_d4science_python_library_read_only(auth_headers):
     try:
         client = TestClient(app)
 
-        # 1. GET /api/workspace
         res_ws = client.get("/api/workspace", headers=auth_headers)
         assert res_ws.status_code == 200, res_ws.text
-        data = res_ws.json()
-        assert data["mode"] == "registered"
-        projects = data["projects"]
-        project_ids = [p["id"] for p in projects]
-
-        print(f"\n[Real d4science-python-library] Discovered {len(projects)} projects: {project_ids}")
-        assert len(projects) == 5
-        assert "_workspace" in project_ids
-        assert "d4science-python-iam" in project_ids
-        assert "d4science-python-legacy-is" in project_ids
-        assert "d4science-python-library" in project_ids
-        assert "d4science-python-resource-registry" in project_ids
+        projects = res_ws.json()["projects"]
+        assert len(projects) > 1
 
         expected_canonical_states = {
             "open", "in progress", "waiting", "blocked", "paused",
             "bounced", "delivered", "verified", "done", "dropped", "total"
         }
-
-        # Check counts per project
         for p in projects:
-            assert set(p["counts"].keys()) == expected_canonical_states
+            counts = p["counts"]
+            assert set(counts.keys()) == expected_canonical_states
+            assert sum(v for k, v in counts.items() if k != "total") == counts["total"]
 
-        lib_p = next(p for p in projects if p["id"] == "d4science-python-library")
-        assert lib_p["counts"]["total"] == 48
-        assert lib_p["counts"]["done"] == 38
-        assert lib_p["counts"]["open"] == 6
-        assert lib_p["counts"]["in progress"] == 1
-        assert lib_p["counts"]["waiting"] == 1
-        assert lib_p["counts"]["blocked"] == 1
-        assert lib_p["counts"]["bounced"] == 1
-
-        # 2. Timing test for GET /api/workspace/tasks
-        # First call (cold cache)
         t0 = time.perf_counter()
-        res_tasks_cold = client.get("/api/workspace/tasks", headers=auth_headers)
-        t_cold = time.perf_counter() - t0
+        res_tasks_cold = client.get("/api/workspace/tasks?per_page=500", headers=auth_headers)
         assert res_tasks_cold.status_code == 200
-        print(f"[Real d4science-python-library] /api/workspace/tasks cold duration: {t_cold * 1000:.2f} ms")
+        print(f"[live] /api/workspace/tasks cold: {(time.perf_counter() - t0) * 1000:.2f} ms")
+        body = res_tasks_cold.json()
+        tasks = body.get("items") or body.get("tasks") or []
+        assert len(tasks) == body["total"]
 
-        # Verify coordinates resolved in live aggregate
-        cold_tasks = res_tasks_cold.json()["tasks"]
-        t2 = next(t for t in cold_tasks if t["qualified_id"] == "_workspace/T002")
-        assert len(t2["coordinates"]) == 1
-        assert t2["coordinates"][0]["project"] == "d4science-python-library"
-        assert t2["coordinates"][0]["id"] == "T046"
-        assert t2["coordinates"][0]["short_title"] == "split plugins"
-        assert t2["coordinates"][0]["state"] == "blocked"
+        # Every project's total matches the aggregate, and every coordinate
+        # resolves to the live state of the task it points to.
+        for p in projects:
+            assert p["counts"]["total"] == sum(1 for t in tasks if t["project"] == p["id"])
+        states = {(t["project"], t["id"]): t["state"] for t in tasks if "id" in t}
+        for t in tasks:
+            for c in t.get("coordinates") or []:
+                if (c["project"], c["id"]) in states:
+                    assert c["state"] == states[(c["project"], c["id"])]
 
-        t3 = next(t for t in cold_tasks if t["qualified_id"] == "_workspace/T003")
-        assert len(t3["coordinates"]) == 2
-        assert any(c["project"] == "d4science-python-iam" and c["id"] == "T001" and c["state"] == "open" for c in t3["coordinates"])
-        assert any(c["project"] == "d4science-python-library" and c["id"] == "T044" and c["state"] == "waiting" for c in t3["coordinates"])
-
-        t4 = next(t for t in cold_tasks if t["qualified_id"] == "_workspace/T004")
-        assert len(t4["coordinates"]) == 4
-
-        # Second call (warm cache)
         t1 = time.perf_counter()
-        res_tasks_warm = client.get("/api/workspace/tasks", headers=auth_headers)
+        res_tasks_warm = client.get("/api/workspace/tasks?per_page=500", headers=auth_headers)
         t_warm = time.perf_counter() - t1
         assert res_tasks_warm.status_code == 200
-        print(f"[Real d4science-python-library] /api/workspace/tasks warm duration: {t_warm * 1000:.2f} ms")
-
         assert t_warm < 2.0, f"Warm cache duration {t_warm}s exceeded 2.0s limit"
     finally:
         state.workspace = old_ws
