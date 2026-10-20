@@ -235,6 +235,14 @@ async def test_every_tool_happy_path(test_env):
     assert data["items"][0]["id"] == "T001"
     assert_no_nulls(data)
 
+    # 6b. tasks.next without project (workspace level)
+    res_next_ws = await server.call_tool("tasks.next", {"workspace": "test-ws"})
+    assert not res_next_ws.is_error
+    data_next_ws = json.loads(res_next_ws.content[0].text)
+    assert data_next_ws["ok"] is True
+    assert len(data_next_ws["items"]) >= 1
+    assert_no_nulls(data_next_ws)
+
     # 7. tasks.graph
     res = await server.call_tool("tasks.graph", {"workspace": "test-ws", "project": "pkg-a"})
     assert not res.is_error
@@ -343,7 +351,26 @@ async def test_every_tool_happy_path(test_env):
     assert "hash" in data_set
     assert_no_nulls(data_set)
 
-    # 11. questions.ask
+    # 11. questions.ask (preview)
+    res_qask_prev = await server.call_tool(
+        "questions.ask",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "question": "Which cache to use?",
+            "short": "Cache choice",
+            "context": "Redis vs Memcached",
+            "options": [{"label": "A", "consequences": "Redis"}],
+            "preview": True,
+        },
+    )
+    assert not res_qask_prev.is_error
+    data_qask_prev = json.loads(res_qask_prev.content[0].text)
+    assert data_qask_prev["ok"] is True
+    assert data_qask_prev.get("preview") is True
+    assert_no_nulls(data_qask_prev)
+
+    # 11. questions.ask (actual)
     res_qask = await server.call_tool(
         "questions.ask",
         {
@@ -378,7 +405,32 @@ async def test_every_tool_happy_path(test_env):
     assert q001["status"] == "open"
     assert_no_nulls(data_ql)
 
-    # 13. questions.answer
+    # 12b. questions.list without project (workspace level)
+    res_ql_ws = await server.call_tool("questions.list", {"workspace": "test-ws"})
+    assert not res_ql_ws.is_error
+    data_ql_ws = json.loads(res_ql_ws.content[0].text)
+    assert data_ql_ws["ok"] is True
+    assert any(q["id"] == "Q001" for q in data_ql_ws["items"])
+    assert_no_nulls(data_ql_ws)
+
+    # 13. questions.answer (preview)
+    res_qans_prev = await server.call_tool(
+        "questions.answer",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "id": "Q001",
+            "choice": "B",
+            "preview": True,
+        },
+    )
+    assert not res_qans_prev.is_error
+    data_qans_prev = json.loads(res_qans_prev.content[0].text)
+    assert data_qans_prev["ok"] is True
+    assert data_qans_prev.get("preview") is True
+    assert_no_nulls(data_qans_prev)
+
+    # 13. questions.answer (actual)
     res_qans = await server.call_tool(
         "questions.answer",
         {
@@ -394,9 +446,27 @@ async def test_every_tool_happy_path(test_env):
     assert data_qans["ok"] is True
     assert data_qans["id"] == "Q001"
     assert isinstance(data_qans["unblocked"], list)
+    assert "hash" in data_qans
     assert_no_nulls(data_qans)
 
-    # 14. inbox.add_note
+    # 14. inbox.add_note (preview)
+    res_inbox_prev = await server.call_tool(
+        "inbox.add_note",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "title": "Preview note",
+            "body": "Preview body",
+            "preview": True,
+        },
+    )
+    assert not res_inbox_prev.is_error
+    data_inbox_prev = json.loads(res_inbox_prev.content[0].text)
+    assert data_inbox_prev["ok"] is True
+    assert data_inbox_prev.get("preview") is True
+    assert_no_nulls(data_inbox_prev)
+
+    # 14. inbox.add_note (actual)
     res_inbox = await server.call_tool(
         "inbox.add_note",
         {
@@ -412,6 +482,7 @@ async def test_every_tool_happy_path(test_env):
     assert data_inbox["ok"] is True
     assert data_inbox["id"].startswith("N")
     assert "path" in data_inbox
+    assert "hash" in data_inbox
     assert_no_nulls(data_inbox)
 
     # 15. orchestrator.status
@@ -424,6 +495,21 @@ async def test_every_tool_happy_path(test_env):
     assert "worker" in data_orch
     assert data_orch["unread_mail"] == 0
     assert_no_nulls(data_orch)
+
+    # 15b. orchestrator.status with worker heartbeat file
+    orch_dir = test_env["ws_dir"] / ".ai-orchestration" / "orchestrator"
+    orch_dir.mkdir(parents=True, exist_ok=True)
+    (orch_dir / "worker.json").write_text(
+        json.dumps({"alive": True, "heartbeat_at": "2026-10-20T12:00:00Z"}),
+        encoding="utf-8",
+    )
+    res_orch_live = await server.call_tool("orchestrator.status", {"workspace": "test-ws"})
+    assert not res_orch_live.is_error
+    data_orch_live = json.loads(res_orch_live.content[0].text)
+    assert data_orch_live["ok"] is True
+    assert data_orch_live["worker"]["alive"] is True
+    assert data_orch_live["worker"]["heartbeat_at"] == "2026-10-20T12:00:00Z"
+    assert_no_nulls(data_orch_live)
 
 
 @pytest.mark.asyncio
@@ -487,6 +573,21 @@ Goal for task {i}.
     assert data_p2["next_cursor"] == "10"
     assert data_p2["items"][0]["id"] != data_p1["items"][0]["id"]
     assert_no_nulls(data_p2)
+
+    # projects.list paging
+    res_pr_p1 = await server.call_tool("projects.list", {"workspace": "test-ws", "limit": 1})
+    data_pr_p1 = json.loads(res_pr_p1.content[0].text)
+    assert data_pr_p1["ok"] is True
+    assert len(data_pr_p1["items"]) == 1
+    assert data_pr_p1.get("next_cursor") == "1"
+    assert_no_nulls(data_pr_p1)
+
+    res_pr_p2 = await server.call_tool("projects.list", {"workspace": "test-ws", "cursor": "1", "limit": 1})
+    data_pr_p2 = json.loads(res_pr_p2.content[0].text)
+    assert data_pr_p2["ok"] is True
+    assert len(data_pr_p2["items"]) == 1
+    assert data_pr_p2["items"][0]["slug"] != data_pr_p1["items"][0]["slug"]
+    assert_no_nulls(data_pr_p2)
 
     # 2. 256 KiB cap test: simulate a massive payload
     large_items = [
@@ -641,3 +742,230 @@ async def test_stale_expect_hash_refused(test_env):
     data_stale = json.loads(res_stale.content[0].text)
     assert data_stale["ok"] is False
     assert "mismatch" in data_stale["error"].lower() or "mismatch" in data_stale["message"].lower()
+    assert_no_nulls(data_stale)
+
+
+@pytest.mark.asyncio
+async def test_tasks_list_filtering(test_env):
+    """Filter tasks.list by state, kind, label, text."""
+    cfg_dir = test_env["config_dir"]
+    server = create_broker_server(cfg_dir)
+
+    # 1. State filter
+    res_open = await server.call_tool("tasks.list", {"workspace": "test-ws", "project": "pkg-a", "state": "open"})
+    data_open = json.loads(res_open.content[0].text)
+    assert data_open["ok"] is True
+    assert all(t["state"] == "open" for t in data_open["items"])
+    assert_no_nulls(data_open)
+
+    # 2. Kind filter
+    res_kind = await server.call_tool("tasks.list", {"workspace": "test-ws", "project": "pkg-a", "kind": "feature"})
+    data_kind = json.loads(res_kind.content[0].text)
+    assert data_kind["ok"] is True
+    assert all(t["kind"] == "feature" for t in data_kind["items"])
+    assert_no_nulls(data_kind)
+
+    # 3. Text filter
+    res_text = await server.call_tool("tasks.list", {"workspace": "test-ws", "project": "pkg-a", "text": "setup"})
+    data_text = json.loads(res_text.content[0].text)
+    assert data_text["ok"] is True
+    assert any("setup" in t["title"].lower() or "setup" in t["short_title"].lower() for t in data_text["items"])
+    assert_no_nulls(data_text)
+
+
+@pytest.mark.asyncio
+async def test_tasks_set_all_fields_and_preview(test_env):
+    """Test tasks.set for all fields (size, short, kind, labels, deps), preview mode, and invalid field."""
+    cfg_dir = test_env["config_dir"]
+    server = create_broker_server(cfg_dir)
+
+    # 1. Size
+    res_sz = await server.call_tool("tasks.set", {"workspace": "test-ws", "project": "pkg-a", "id": "T001", "field": "size", "value": "M"})
+    assert not res_sz.is_error
+    data_sz = json.loads(res_sz.content[0].text)
+    assert data_sz["ok"] is True
+    assert data_sz["field"] == "size"
+    assert data_sz["value"] == "M"
+    assert_no_nulls(data_sz)
+
+    # 2. Short
+    res_sh = await server.call_tool("tasks.set", {"workspace": "test-ws", "project": "pkg-a", "id": "T001", "field": "short", "value": "Setup Fast"})
+    assert not res_sh.is_error
+    data_sh = json.loads(res_sh.content[0].text)
+    assert data_sh["ok"] is True
+    assert data_sh["field"] == "short"
+    assert data_sh["value"] == "Setup Fast"
+    assert_no_nulls(data_sh)
+
+    # 3. Kind
+    res_kd = await server.call_tool("tasks.set", {"workspace": "test-ws", "project": "pkg-a", "id": "T001", "field": "kind", "value": "chore"})
+    assert not res_kd.is_error
+    data_kd = json.loads(res_kd.content[0].text)
+    assert data_kd["ok"] is True
+    assert data_kd["field"] == "kind"
+    assert data_kd["value"] == "chore"
+    assert_no_nulls(data_kd)
+
+    # 4. Labels
+    res_lb = await server.call_tool("tasks.set", {"workspace": "test-ws", "project": "pkg-a", "id": "T001", "field": "labels", "value": ["core", "urgent"]})
+    assert not res_lb.is_error
+    data_lb = json.loads(res_lb.content[0].text)
+    assert data_lb["ok"] is True
+    assert data_lb["field"] == "labels"
+    assert_no_nulls(data_lb)
+
+    # 5. Preview mode
+    res_prev = await server.call_tool("tasks.set", {"workspace": "test-ws", "project": "pkg-a", "id": "T001", "field": "priority", "value": "P0", "preview": True})
+    assert not res_prev.is_error
+    data_prev = json.loads(res_prev.content[0].text)
+    assert data_prev["ok"] is True
+    assert data_prev.get("preview") is True
+    assert_no_nulls(data_prev)
+
+    # 6. Invalid field rejected
+    res_inv = await server.call_tool("tasks.set", {"workspace": "test-ws", "project": "pkg-a", "id": "T001", "field": "nonexistent_field", "value": "x"})
+    assert res_inv.is_error
+    data_inv = json.loads(res_inv.content[0].text)
+    assert data_inv["ok"] is False
+    assert data_inv["error"] == "invalid-field"
+    assert_no_nulls(data_inv)
+
+
+@pytest.mark.asyncio
+async def test_transition_and_question_stale_expect_hash(test_env):
+    """Test stale expect_hash on tasks.transition and questions.answer."""
+    cfg_dir = test_env["config_dir"]
+    server = create_broker_server(cfg_dir)
+
+    # 1. tasks.transition with stale hash (actual)
+    res_tr = await server.call_tool(
+        "tasks.transition",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "id": "T001",
+            "to": "in progress",
+            "expect_hash": "stale_hash_deadbeef_1234",
+        },
+    )
+    assert res_tr.is_error
+    data_tr = json.loads(res_tr.content[0].text)
+    assert data_tr["ok"] is False
+    assert "mismatch" in data_tr["error"].lower() or "mismatch" in data_tr["message"].lower()
+    assert_no_nulls(data_tr)
+
+    # 2. tasks.transition with stale hash (preview)
+    res_tr_prev = await server.call_tool(
+        "tasks.transition",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "id": "T001",
+            "to": "in progress",
+            "expect_hash": "stale_hash_deadbeef_1234",
+            "preview": True,
+        },
+    )
+    assert res_tr_prev.is_error
+    data_tr_prev = json.loads(res_tr_prev.content[0].text)
+    assert data_tr_prev["ok"] is False
+    assert "mismatch" in data_tr_prev["error"].lower() or "mismatch" in data_tr_prev["message"].lower()
+    assert_no_nulls(data_tr_prev)
+
+    # 3. questions.answer with stale hash
+    res_q_ask = await server.call_tool(
+        "questions.ask",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "question": "Which framework?",
+            "short": "Framework choice",
+            "context": "React vs Vue",
+            "options": [
+                {"label": "A", "consequences": "React"},
+                {"label": "B", "consequences": "Vue"},
+            ],
+        },
+    )
+    assert not res_q_ask.is_error
+    data_q_ask = json.loads(res_q_ask.content[0].text)
+    q_id = data_q_ask["id"]
+
+    res_q_ans_stale = await server.call_tool(
+        "questions.answer",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "id": q_id,
+            "choice": "A",
+            "expect_hash": "stale_question_hash_9999",
+        },
+    )
+    assert res_q_ans_stale.is_error
+    data_q_ans_stale = json.loads(res_q_ans_stale.content[0].text)
+    assert data_q_ans_stale["ok"] is False
+    assert "mismatch" in data_q_ans_stale["error"].lower() or "mismatch" in data_q_ans_stale["message"].lower()
+    assert_no_nulls(data_q_ans_stale)
+
+
+@pytest.mark.asyncio
+async def test_idempotent_retry_inbox(test_env):
+    """Test idempotent retry on inbox.add_note."""
+    cfg_dir = test_env["config_dir"]
+    server = create_broker_server(cfg_dir)
+
+    key = "idemp_inbox_key_98765"
+    res1 = await server.call_tool(
+        "inbox.add_note",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "title": "Idempotent inbox note",
+            "body": "Body text",
+            "idempotency_key": key,
+        },
+    )
+    assert not res1.is_error
+    data1 = json.loads(res1.content[0].text)
+    assert data1["ok"] is True
+    n_id1 = data1["id"]
+
+    res2 = await server.call_tool(
+        "inbox.add_note",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "title": "Idempotent inbox note",
+            "body": "Body text",
+            "idempotency_key": key,
+        },
+    )
+    assert not res2.is_error
+    data2 = json.loads(res2.content[0].text)
+    assert data2["ok"] is True
+    assert data2["id"] == n_id1
+
+
+@pytest.mark.asyncio
+async def test_error_handling_and_no_nulls(test_env):
+    """Test error returns for invalid or missing workspace/project/tasks and ensure no nulls."""
+    cfg_dir = test_env["config_dir"]
+    server = create_broker_server(cfg_dir)
+
+    # Missing workspace
+    res = await server.call_tool("projects.list", {"workspace": "nonexistent-ws"})
+    assert res.is_error
+    data = json.loads(res.content[0].text)
+    assert data["ok"] is False
+    assert "error" in data
+    assert "message" in data
+    assert_no_nulls(data)
+
+    # Nonexistent task in tasks.show
+    res_task = await server.call_tool("tasks.show", {"workspace": "test-ws", "project": "pkg-a", "id": "T999"})
+    assert res_task.is_error
+    data_task = json.loads(res_task.content[0].text)
+    assert data_task["ok"] is False
+    assert data_task["error"] == "task-not-found"
+    assert_no_nulls(data_task)
+
