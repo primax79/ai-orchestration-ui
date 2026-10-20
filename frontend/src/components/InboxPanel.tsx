@@ -36,9 +36,10 @@ import {
   ProposedTask,
   ProposedTaskEdits,
   AttachmentDetail,
+  WorkspaceProjectInfo,
   shortTitle,
 } from '../types';
-import { api, ApiError, microtaskAndLabelsApi } from '../api';
+import { api, ApiError, microtaskAndLabelsApi, setCurrentProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
 import {
@@ -47,6 +48,7 @@ import {
   downloadAttachmentBlob,
 } from './AttachmentComponents';
 import { TextViewerModal } from './TextViewerModal';
+import { ProjectChip } from './ProjectBadges';
 
 const ALL_STATUSES: InboxNoteStatus[] = ['draft', 'ready', 'processing', 'processed', 'discarded'];
 const ALL_KINDS: Array<InboxNoteKind | 'all'> = ['all', 'note', 'bug', 'feature', 'idea', 'request', 'question'];
@@ -122,6 +124,7 @@ function getStatusBadgeStyle(status?: string) {
 
 interface AttachmentThumbnailProps {
   noteId: string;
+  project?: string;
   name: string;
   size?: number;
   canRemove?: boolean;
@@ -132,6 +135,7 @@ interface AttachmentThumbnailProps {
 
 const AttachmentThumbnail: React.FC<AttachmentThumbnailProps> = ({
   noteId,
+  project,
   name,
   size = 56,
   canRemove = false,
@@ -158,7 +162,7 @@ const AttachmentThumbnail: React.FC<AttachmentThumbnailProps> = ({
     setError(false);
 
     api
-      .getInboxAttachment(noteId, name)
+      .getInboxAttachment(noteId, name, project)
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
@@ -1167,6 +1171,9 @@ interface NoteEditorModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSaved: () => void;
+  isCommonView?: boolean;
+  projects?: WorkspaceProjectInfo[];
+  defaultProject?: string | null;
 }
 
 const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
@@ -1174,7 +1181,16 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   isOpen,
   onClose,
   onSaved,
+  isCommonView = false,
+  projects = [],
+  defaultProject = null,
 }) => {
+  const writableProjects = projects.filter((p) => p.kind !== 'sub_workspace');
+  const [targetProject, setTargetProject] = useState<string>(
+    initialNote?.project ||
+      defaultProject ||
+      (writableProjects.length === 1 ? writableProjects[0].id : writableProjects[0]?.id || '')
+  );
   const [noteId, setNoteId] = useState<string>(initialNote?.id || '');
   const [title, setTitle] = useState<string>(initialNote?.title || '');
   const [kind, setKind] = useState<string>(initialNote?.kind || 'note');
@@ -1636,6 +1652,14 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     if (!title.trim()) {
       if (!silent) setInlineError('Title is required');
       return false;
+    }
+    const effectiveProject = initialNote?.project || targetProject;
+    if (isCommonView && writableProjects.length > 0 && !effectiveProject) {
+      if (!silent) setInlineError('Target project is required');
+      return false;
+    }
+    if (effectiveProject) {
+      setCurrentProject(effectiveProject);
     }
 
     setIsSaving(true);
@@ -2195,6 +2219,38 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                   Confirm Processed
                 </button>
               </div>
+            </div>
+          )}
+
+          {/* Project selector for new note in common view */}
+          {isCommonView && !noteId && writableProjects.length > 0 && (
+            <div>
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.3rem' }}>
+                Target Project *
+              </label>
+              <select
+                value={targetProject}
+                onChange={(e) => {
+                  setTargetProject(e.target.value);
+                  setCurrentProject(e.target.value);
+                }}
+                style={{
+                  width: '100%',
+                  padding: '0.5rem 0.75rem',
+                  backgroundColor: '#0f172a',
+                  border: '1px solid #4f46e5',
+                  borderRadius: '0.375rem',
+                  color: '#f8fafc',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                }}
+              >
+                {writableProjects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.id} ({p.kind})
+                  </option>
+                ))}
+              </select>
             </div>
           )}
 
@@ -3152,11 +3208,17 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
 interface InboxPanelProps {
   onRefreshNotesCount?: () => void;
   refreshTrigger?: number;
+  isCommonView?: boolean;
+  projects?: WorkspaceProjectInfo[];
+  selectedProject?: string | null;
 }
 
 export const InboxPanel: React.FC<InboxPanelProps> = ({
   onRefreshNotesCount,
   refreshTrigger = 0,
+  isCommonView = false,
+  projects = [],
+  selectedProject = null,
 }) => {
   const [notes, setNotes] = useState<InboxNoteItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -3174,7 +3236,9 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await api.listInboxNotes();
+      const res = isCommonView
+        ? await api.getWorkspaceInbox()
+        : await api.listInboxNotes();
       if (res && res.notes) {
         setNotes(res.notes);
       }
@@ -3186,7 +3250,7 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
     } finally {
       setLoading(false);
     }
-  }, [onRefreshNotesCount]);
+  }, [onRefreshNotesCount, isCommonView]);
 
   useEffect(() => {
     loadNotes();
@@ -3441,8 +3505,11 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
 
             return (
               <div
-                key={note.id || note.folder_name || note.title}
+                key={`${note.project || ''}-${note.id || note.folder_name || note.title}`}
                 onClick={() => {
+                  if (note.project) {
+                    setCurrentProject(note.project);
+                  }
                   setEditingNote(note);
                   setIsEditorOpen(true);
                 }}
@@ -3470,6 +3537,9 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
               >
                 {/* Left side: ID, kind, title, about */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flex: 1, minWidth: '280px' }}>
+                  {isCommonView && note.project && (
+                    <ProjectChip project={note.project} size="xs" />
+                  )}
                   <span
                     style={{
                       fontFamily: 'monospace',
@@ -3479,7 +3549,7 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
                       minWidth: '45px',
                     }}
                   >
-                    {note.id || '—'}
+                    {isCommonView && note.project ? `${note.project}/${note.id || '—'}` : (note.id || '—')}
                   </span>
 
                   <span
@@ -3519,6 +3589,7 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
                         <AttachmentThumbnail
                           key={attName}
                           noteId={note.id}
+                          project={note.project}
                           name={attName}
                           size={36}
                           canRemove={false}
@@ -3588,7 +3659,13 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
         <NoteEditorModal
           note={editingNote}
           isOpen={isEditorOpen}
+          isCommonView={isCommonView}
+          projects={projects}
+          defaultProject={selectedProject}
           onClose={() => {
+            if (isCommonView) {
+              setCurrentProject(null);
+            }
             setIsEditorOpen(false);
             setEditingNote(null);
           }}

@@ -21,10 +21,57 @@ export interface AttachmentDetail {
   size: number;
 }
 
+export interface TaskConditionItem {
+  id: string;
+  status: string;
+  short_title?: string;
+  age_days?: number;
+  decider?: string;
+}
+
+export interface TaskCoordinateItem {
+  project: string;
+  id: string;
+  short_title?: string;
+  state?: TaskState | string;
+}
+
+export type ProjectKind = 'project' | '_workspace' | 'sub_workspace' | string;
+
+export interface ProjectCounts {
+  open: number;
+  'in progress': number;
+  waiting: number;
+  blocked: number;
+  paused: number;
+  bounced: number;
+  delivered: number;
+  verified: number;
+  done: number;
+  dropped: number;
+  total: number;
+  conditional?: number;
+  [key: string]: number | undefined;
+}
+
+export interface WorkspaceProjectInfo {
+  id: string;
+  path: string;
+  kind: ProjectKind;
+  uuid?: string | null;
+  counts?: ProjectCounts;
+  open_questions?: number;
+  inbox_notes?: number;
+  conditional?: number;
+}
+
 export interface TaskItem {
   kind: 'emergent' | 'initiative_task' | string;
   id: string;
+  project?: string;
+  qualified_id?: string;
   title: string;
+  short?: string;
   short_title?: string;
   short_title_source?: 'field' | 'derived';
   category: string;
@@ -33,6 +80,7 @@ export interface TaskItem {
   next_up?: string;
   size?: string;
   state: TaskState;
+  canonical_state?: TaskState | string;
   executor: string;
   depends_on?: string;
   decider?: string;
@@ -63,6 +111,12 @@ export interface TaskItem {
   label_sources?: Record<string, string>;
   priority_source?: string;
   size_source?: string;
+  conditional?: boolean;
+  conditions?: TaskConditionItem[];
+  coordinates?: TaskCoordinateItem[];
+  placement_warning?: string;
+  placement_warnings?: string[];
+  warnings?: string[];
 }
 
 export interface InitiativeItem {
@@ -82,11 +136,32 @@ export interface TaskListResponse {
   tree?: Record<string, TreeNode>;
 }
 
+export interface WorkspaceTasksResponse {
+  ok: boolean;
+  tasks: TaskItem[];
+  items?: TaskItem[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
 export interface WorkspaceInfo {
+  root?: string;
   workspace_path: string;
   workspace_name: string;
+  mode?: 'registered' | 'discovered' | 'single' | string;
+  registered?: boolean;
+  discovered?: boolean;
+  single?: boolean;
   has_tasks_dir: boolean;
   tasks_path: string | null;
+  projects?: WorkspaceProjectInfo[];
+  sub_workspaces?: Array<{
+    uuid?: string | null;
+    slug: string;
+    path: string;
+    kind: string;
+  }>;
 }
 
 export interface CliInfo {
@@ -221,6 +296,7 @@ export interface QuestionAnswer {
 
 export interface QuestionItem {
   id: string;
+  project?: string;
   question: string;
   short_title?: string;
   short_title_source?: 'field' | 'derived';
@@ -412,6 +488,7 @@ export interface RunVerdict {
 export interface RunRecord {
   run_id: string;
   task_id: string;
+  project?: string;
   mode: RunMode;
   tool: string;
   profile: string;
@@ -551,6 +628,7 @@ export type InboxNoteStatus = 'draft' | 'ready' | 'processing' | 'processed' | '
 
 export interface InboxNoteItem {
   id: string;
+  project?: string;
   title: string;
   kind: InboxNoteKind | string;
   status: InboxNoteStatus | string;
@@ -717,6 +795,8 @@ export type TaskSize = 'XS' | 'S' | 'M' | 'L' | 'XL';
 
 export interface TaskGraphNode {
   id: string;
+  project?: string;
+  qualified_id?: string;
   node_type?: string;
   kind?: string;
   title: string;
@@ -736,6 +816,9 @@ export interface TaskGraphNode {
   next_up?: string;
   executor?: string;
   labels?: string[];
+  conditional?: boolean;
+  conditions?: TaskConditionItem[];
+  coordinates?: TaskCoordinateItem[];
 }
 
 export interface TaskGraphEdge {
@@ -891,6 +974,8 @@ export interface TreeNodeField {
 export interface TreeNode {
   kind?: string;
   id: string;
+  project?: string;
+  qualified_id?: string;
   title: string;
   short_title?: string;
   short_title_source?: 'field' | 'derived';
@@ -926,6 +1011,12 @@ export interface TreeNode {
   handoff?: string;
   category?: string;
   slug?: string;
+  conditional?: boolean;
+  conditions?: TaskConditionItem[];
+  coordinates?: TaskCoordinateItem[];
+  placement_warning?: string;
+  placement_warnings?: string[];
+  warnings?: string[];
 }
 
 export interface StructurePlanItem {
@@ -1079,6 +1170,8 @@ export interface SharedFilterState {
   states: TaskState[];
   priority?: Priority | 'all';
   groupByLabel?: boolean;
+  projects?: string[];
+  groupByProject?: boolean;
 }
 
 export interface InboxToMicrotaskPayload {

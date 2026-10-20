@@ -13,14 +13,55 @@ import { UseCasesManager } from './components/UseCasesManager';
 import { TriggersPage } from './components/TriggersPage';
 import { EventStreamPanel } from './components/EventStreamPanel';
 import { OrchestratorChatPanel } from './components/OrchestratorChatPanel';
-import { api } from './api';
+import { UnregisteredWorkspaceBanner, WorkspaceDashboardStrip } from './components/ProjectBadges';
+import { api, setCurrentProject, setFallbackProject } from './api';
 import {
   WorkspaceInfo,
   TaskListResponse,
   EnvStatusResponse,
   OrchestrationConfigResponse,
   TaskItem,
+  TaskState,
+  Priority,
 } from './types';
+
+const SELECTED_PROJECT_KEY = 'ai-orch:selected-project';
+
+function readInitialProjectSelection(): string | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const urlProj = params.get('project');
+    if (urlProj && urlProj.trim()) {
+      return urlProj === '__all__' ? null : urlProj.trim();
+    }
+    const stored = localStorage.getItem(SELECTED_PROJECT_KEY);
+    if (stored && stored !== '__all__') {
+      return stored.trim() || null;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function persistProjectSelection(projectId: string | null): void {
+  try {
+    if (projectId) {
+      localStorage.setItem(SELECTED_PROJECT_KEY, projectId);
+    } else {
+      localStorage.setItem(SELECTED_PROJECT_KEY, '__all__');
+    }
+    const url = new URL(window.location.href);
+    if (projectId) {
+      url.searchParams.set('project', projectId);
+    } else {
+      url.searchParams.delete('project');
+    }
+    window.history.replaceState({}, '', url.toString());
+  } catch {
+    // ignore
+  }
+}
 
 const PanelErrorBanner: React.FC<{ title: string; error: string; onRetry: () => void }> = ({
   title,
@@ -92,6 +133,20 @@ export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'backlog' | 'decisions' | 'inbox' | 'runs' | 'orchestrator' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config'>('backlog');
 
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const [selectedProject, setSelectedProject] = useState<string | null>(() => {
+    const initial = readInitialProjectSelection();
+    setCurrentProject(initial);
+    return initial;
+  });
+
+  const isMultiProject = Boolean(workspace?.projects && workspace.projects.length > 1);
+  const isCommonView = isMultiProject && selectedProject === null;
+
+  const handleSelectProject = useCallback((projectId: string | null) => {
+    setSelectedProject(projectId);
+    setCurrentProject(projectId);
+    persistProjectSelection(projectId);
+  }, []);
 
   const [tasksData, setTasksData] = useState<TaskListResponse | null>(null);
   const [tasksLoading, setTasksLoading] = useState(false);
@@ -123,61 +178,156 @@ export const App: React.FC = () => {
     ownActionTimestamps.current[area] = Date.now();
   };
 
-  const loadWorkspace = useCallback(async () => {
+  const loadWorkspace = useCallback(async (): Promise<WorkspaceInfo | null> => {
     try {
       const ws = await api.getWorkspace();
       setWorkspace(ws);
+      const projs = ws?.projects || [];
+      if (projs.length > 0) {
+        const defaultFb = projs.find((p) => p.id === '_workspace')?.id || projs[0].id;
+        setFallbackProject(defaultFb);
+      }
+      if (projs.length <= 1) {
+        setCurrentProject(projs[0]?.id || null);
+      } else {
+        setSelectedProject((prev) => {
+          if (prev && !projs.some((p) => p.id === prev)) {
+            setCurrentProject(null);
+            persistProjectSelection(null);
+            return null;
+          }
+          setCurrentProject(prev);
+          return prev;
+        });
+      }
+      return ws;
     } catch (e: any) {
       console.error('Workspace load error:', e);
+      return null;
     }
   }, []);
 
-  const loadTasks = useCallback(async () => {
+  const loadTasks = useCallback(async (wsOverride?: WorkspaceInfo | null, projOverride?: string | null) => {
     setTasksLoading(true);
     setTasksError(null);
+    const ws = wsOverride !== undefined ? wsOverride : workspace;
+    const proj = projOverride !== undefined ? projOverride : selectedProject;
+    const multi = Boolean(ws?.projects && ws.projects.length > 1);
+    const common = multi && proj === null;
     try {
-      const data = await api.getTasks();
-      setTasksData(data);
-      if (data && data.all_tasks) {
-        const allTasks = data.all_tasks;
+      if (common) {
+        setCurrentProject(null);
+        const agg = await api.getWorkspaceTasks({ per_page: 500 });
+        const rawList = agg.tasks || agg.items || [];
+        const normalized: TaskItem[] = rawList.map((r: any) => {
+          const st = (r.state || r.canonical_state || 'open') as TaskState;
+          const isClosed = st === 'done' || st === 'done with a caveat' || st === 'dropped';
+          return {
+            ...r,
+            id: r.id,
+            project: r.project,
+            qualified_id: r.qualified_id || (r.project ? `${r.project}/${r.id}` : r.id),
+            title: r.title || r.short || r.short_title || r.id,
+            short_title: r.short_title || r.short || undefined,
+            kind: r.kind || (String(r.id).startsWith('T') ? 'emergent' : 'initiative_task'),
+            category: r.category || r.project || 'general',
+            priority: (r.priority || 'P2') as Priority,
+            state: st,
+            executor: r.executor || 'self',
+            is_done: isClosed,
+          };
+        });
+        const data: TaskListResponse = {
+          ok: true,
+          tasks_dir: ws?.workspace_path || '',
+          emergent_tasks: normalized.filter((t) => t.kind === 'emergent' || String(t.id).startsWith('T')),
+          initiatives: [],
+          all_tasks: normalized,
+          tree: {},
+        };
+        setTasksData(data);
         setModalTaskAndRun((prev) => {
           if (!prev) return null;
-          const updated = allTasks.find((t: TaskItem) => t.id === prev.task.id);
+          const updated = normalized.find(
+            (t: TaskItem) => t.id === prev.task.id && (!prev.task.project || t.project === prev.task.project)
+          );
           return updated ? { ...prev, task: updated } : prev;
         });
+      } else {
+        if (proj) setCurrentProject(proj);
+        const data = await api.getTasks(undefined, proj || undefined);
+        const tagProj = proj || (ws?.projects && ws.projects.length === 1 ? ws.projects[0].id : undefined);
+        if (tagProj && data) {
+          if (data.all_tasks) {
+            data.all_tasks = data.all_tasks.map((t) => ({ ...t, project: t.project || tagProj }));
+          }
+          if (data.emergent_tasks) {
+            data.emergent_tasks = data.emergent_tasks.map((t) => ({ ...t, project: t.project || tagProj }));
+          }
+          if (data.tree) {
+            Object.values(data.tree).forEach((node) => {
+              if (!node.project) node.project = tagProj;
+            });
+          }
+        }
+        setTasksData(data);
+        if (data && data.all_tasks) {
+          const allTasks = data.all_tasks;
+          setModalTaskAndRun((prev) => {
+            if (!prev) return null;
+            const updated = allTasks.find((t: TaskItem) => t.id === prev.task.id);
+            return updated ? { ...prev, task: updated } : prev;
+          });
+        }
       }
     } catch (e: any) {
       setTasksError(e.message || String(e));
     } finally {
       setTasksLoading(false);
     }
-  }, []);
+  }, [workspace, selectedProject]);
 
-  const loadQuestionsCount = useCallback(async () => {
+  const loadQuestionsCount = useCallback(async (wsOverride?: WorkspaceInfo | null, projOverride?: string | null) => {
+    const ws = wsOverride !== undefined ? wsOverride : workspace;
+    const proj = projOverride !== undefined ? projOverride : selectedProject;
+    const multi = Boolean(ws?.projects && ws.projects.length > 1);
+    const common = multi && proj === null;
     try {
-      const res = await api.getQuestions({ status: 'open' });
+      const res = common
+        ? await api.getWorkspaceQuestions({ status: 'open' })
+        : await api.getQuestions({ status: 'open' });
       if (res && res.questions) {
         setOpenQuestionsCount(res.questions.length);
       }
     } catch (e: any) {
       console.error('Failed to load open questions count:', e);
     }
-  }, []);
+  }, [workspace, selectedProject]);
 
-  const loadActiveRunsCount = useCallback(async () => {
+  const loadActiveRunsCount = useCallback(async (wsOverride?: WorkspaceInfo | null, projOverride?: string | null) => {
+    const ws = wsOverride !== undefined ? wsOverride : workspace;
+    const proj = projOverride !== undefined ? projOverride : selectedProject;
+    const multi = Boolean(ws?.projects && ws.projects.length > 1);
+    const common = multi && proj === null;
     try {
-      const res = await api.listRuns({ active: true });
+      const res = common
+        ? await api.getWorkspaceRuns({ active: true })
+        : await api.listRuns({ active: true });
       if (res && res.runs) {
         setActiveRunsCount(res.runs.length);
       }
     } catch (e: any) {
       console.error('Failed to load active runs count:', e);
     }
-  }, []);
+  }, [workspace, selectedProject]);
 
-  const loadInboxNotesCount = useCallback(async () => {
+  const loadInboxNotesCount = useCallback(async (wsOverride?: WorkspaceInfo | null, projOverride?: string | null) => {
+    const ws = wsOverride !== undefined ? wsOverride : workspace;
+    const proj = projOverride !== undefined ? projOverride : selectedProject;
+    const multi = Boolean(ws?.projects && ws.projects.length > 1);
+    const common = multi && proj === null;
     try {
-      const res = await api.listInboxNotes();
+      const res = common ? await api.getWorkspaceInbox() : await api.listInboxNotes();
       if (res && res.notes) {
         const count = res.notes.filter(
           (n) => (n.status || 'draft').toLowerCase() === 'draft' || (n.status || '').toLowerCase() === 'ready'
@@ -187,7 +337,7 @@ export const App: React.FC = () => {
     } catch (e: any) {
       console.error('Failed to load inbox notes count:', e);
     }
-  }, []);
+  }, [workspace, selectedProject]);
 
   const loadEnv = useCallback(async () => {
     setEnvLoading(true);
@@ -215,18 +365,18 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  const loadAll = useCallback(() => {
-    loadWorkspace();
-    loadTasks();
-    loadQuestionsCount();
+  const loadAll = useCallback(async () => {
+    const ws = await loadWorkspace();
+    loadTasks(ws, selectedProject);
+    loadQuestionsCount(ws, selectedProject);
     setQuestionsRefreshKey((k) => k + 1);
-    loadActiveRunsCount();
+    loadActiveRunsCount(ws, selectedProject);
     setRunsRefreshKey((k) => k + 1);
-    loadInboxNotesCount();
+    loadInboxNotesCount(ws, selectedProject);
     setInboxRefreshKey((k) => k + 1);
     loadEnv();
     loadConfig();
-  }, [loadWorkspace, loadTasks, loadQuestionsCount, loadActiveRunsCount, loadInboxNotesCount, loadEnv, loadConfig]);
+  }, [loadWorkspace, loadTasks, loadQuestionsCount, loadActiveRunsCount, loadInboxNotesCount, loadEnv, loadConfig, selectedProject]);
 
   // Debounced area reloading (300 ms)
   const pendingAreas = useRef<Set<string>>(new Set());
@@ -326,12 +476,27 @@ export const App: React.FC = () => {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         workspace={workspace}
+        selectedProject={selectedProject}
+        onSelectProject={handleSelectProject}
         onRefresh={loadAll}
         isWsConnected={isWsConnected}
         openQuestionsCount={openQuestionsCount}
         activeRunsCount={activeRunsCount}
         inboxNotesCount={inboxBadgeCount}
       />
+
+      {workspace && workspace.registered === false && workspace.projects && workspace.projects.length > 1 && (
+        <UnregisteredWorkspaceBanner rootPath={workspace.root || workspace.workspace_path} />
+      )}
+
+      {activeTab === 'backlog' && isCommonView && workspace?.projects && (
+        <WorkspaceDashboardStrip
+          projects={workspace.projects}
+          tasks={tasksData?.all_tasks || []}
+          selectedProject={selectedProject}
+          onSelectProject={handleSelectProject}
+        />
+      )}
 
       <main style={{ flex: 1 }}>
         {activeTab === 'backlog' && (
@@ -340,7 +505,7 @@ export const App: React.FC = () => {
               <PanelErrorBanner
                 title="Failed to Load Task Backlog"
                 error={tasksError}
-                onRetry={loadTasks}
+                onRetry={() => loadTasks()}
               />
             )}
             {tasksLoading && !tasksData ? (
@@ -348,10 +513,17 @@ export const App: React.FC = () => {
             ) : (
               <BacklogManager
                 data={tasksData}
+                isCommonView={isCommonView}
+                projects={workspace?.projects || []}
+                selectedProject={selectedProject}
+                onSelectCoordTarget={(proj, _tid) => {
+                  handleSelectProject(proj);
+                }}
                 onRefresh={() => {
                   recordOwnAction('tasks');
                   recordOwnAction('questions');
                   recordOwnAction('runs');
+                  loadWorkspace();
                   loadTasks();
                   loadQuestionsCount();
                   loadActiveRunsCount();
@@ -364,11 +536,13 @@ export const App: React.FC = () => {
         {activeTab === 'decisions' && (
           <div>
             <DecisionsTab
-              key={questionsRefreshKey}
+              key={`${questionsRefreshKey}-${selectedProject || 'all'}`}
               tasks={tasksData?.all_tasks || tasksData?.emergent_tasks || []}
+              isCommonView={isCommonView}
               onRefresh={() => {
                 recordOwnAction('questions');
                 recordOwnAction('tasks');
+                loadWorkspace();
                 loadQuestionsCount();
                 loadTasks();
               }}
@@ -379,10 +553,14 @@ export const App: React.FC = () => {
         {activeTab === 'inbox' && (
           <div>
             <InboxPanel
-              key={inboxRefreshKey}
+              key={`${inboxRefreshKey}-${selectedProject || 'all'}`}
               refreshTrigger={inboxRefreshKey}
+              isCommonView={isCommonView}
+              projects={workspace?.projects || []}
+              selectedProject={selectedProject}
               onRefreshNotesCount={() => {
                 recordOwnAction('inbox');
+                loadWorkspace();
                 loadInboxNotesCount();
               }}
             />
@@ -392,10 +570,14 @@ export const App: React.FC = () => {
         {activeTab === 'runs' && (
           <div>
             <RunsTab
-              key={runsRefreshKey}
+              key={`${runsRefreshKey}-${selectedProject || 'all'}`}
               tasks={tasksData?.all_tasks || tasksData?.emergent_tasks || []}
               refreshKey={runsRefreshKey}
+              isCommonView={isCommonView}
               onSelectRun={(task, runId) => {
+                if (task.project) {
+                  setCurrentProject(task.project);
+                }
                 setModalTaskAndRun({ task, runId });
               }}
             />
@@ -488,15 +670,20 @@ export const App: React.FC = () => {
         <TaskDetailModal
           task={modalTaskAndRun.task}
           initialRunId={modalTaskAndRun.runId}
-          onClose={() => setModalTaskAndRun(null)}
+          onClose={() => {
+            if (isCommonView) setCurrentProject(null);
+            setModalTaskAndRun(null);
+          }}
           onActionComplete={() => {
             recordOwnAction('tasks');
             recordOwnAction('runs');
+            loadWorkspace();
             loadTasks();
             loadActiveRunsCount();
             setRunsRefreshKey((k) => k + 1);
           }}
           onNavigateToDecisions={() => {
+            if (isCommonView) setCurrentProject(null);
             setModalTaskAndRun(null);
             setActiveTab('decisions');
           }}

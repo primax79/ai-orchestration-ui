@@ -14,7 +14,7 @@ import {
   Eye,
   EyeOff,
 } from 'lucide-react';
-import { TaskItem, TaskListResponse, TaskState, SharedFilterState } from '../types';
+import { TaskItem, TaskListResponse, TaskState, SharedFilterState, WorkspaceProjectInfo } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { TimelineView } from './TimelineView';
@@ -23,7 +23,15 @@ import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { MicrotaskQuickAdd } from './MicrotaskQuickAdd';
 import { SharedFilterBar, getStoredSharedFilters, matchTaskFilters } from './SharedFilterBar';
-import { api } from '../api';
+import {
+  ProjectChip,
+  ConditionalBadge,
+  PlacementWarningChip,
+  CoordinatesExpansionList,
+  formatTaskIdentifier,
+  getPlacementWarnings,
+} from './ProjectBadges';
+import { api, setCurrentProject } from '../api';
 
 export type BacklogView = 'queue' | 'kanban' | 'tree' | 'timeline';
 
@@ -77,9 +85,22 @@ const getStoredShowDone = (): boolean => {
 interface BacklogManagerProps {
   data: TaskListResponse | null;
   onRefresh: () => void;
+  isCommonView?: boolean;
+  projects?: WorkspaceProjectInfo[];
+  selectedProject?: string | null;
+  onOpenTask?: (task: TaskItem) => void;
+  onSelectCoordTarget?: (project: string, taskId: string) => void;
 }
 
-export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh }) => {
+export const BacklogManager: React.FC<BacklogManagerProps> = ({
+  data,
+  onRefresh,
+  isCommonView = false,
+  projects = [],
+  selectedProject = null,
+  onOpenTask,
+  onSelectCoordTarget,
+}) => {
   const [viewMode, setViewMode] = useState<BacklogView>(getStoredView);
   const [showDone, setShowDone] = useState<boolean>(getStoredShowDone);
   const [treeStates, setTreeStates] = useState<TaskState[]>(getStoredTreeStates);
@@ -95,9 +116,21 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
 
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
 
+  const handleOpenTaskModal = (t: TaskItem) => {
+    if (t.project) {
+      setCurrentProject(t.project);
+    }
+    if (onOpenTask) {
+      onOpenTask(t);
+    }
+    setSelectedTask(t);
+  };
+
   useEffect(() => {
     if (selectedTask && data?.all_tasks) {
-      const updated = data.all_tasks.find((t) => t.id === selectedTask.id);
+      const updated = data.all_tasks.find(
+        (t) => t.id === selectedTask.id && (!selectedTask.project || t.project === selectedTask.project)
+      );
       if (updated && updated.state !== selectedTask.state) {
         setSelectedTask(updated);
       }
@@ -126,29 +159,36 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
     delivered: tasks.filter((t) => t.state === 'delivered').length,
     verified: tasks.filter((t) => t.state === 'verified').length,
     done: tasks.filter((t) => isClosedState(t.state) || t.is_done).length,
+    conditional: tasks.filter((t) => t.conditional).length,
   };
 
   // Filter tasks based on sharedFilters
   const filteredTasks = tasks.filter((t) => matchTaskFilters(t, sharedFilters));
 
-  // Queue tasks: emergent only, next_up === 'yes', non-closed, never NN.T
-  const queueTasks = tasks
-    .filter((t) => {
-      if (t.kind !== 'emergent' && t.category !== 'micro') return false;
-      if (/^\d+\.\d+/.test(t.id)) return false;
-      if (t.next_up !== 'yes') return false;
+  // Queue tasks: in project view emergent only with next_up === 'yes'; in common view, next_up === 'yes' if present, else all open/active tasks
+  const queueTasks = (() => {
+    const base = tasks.filter((t) => {
       if (isClosedState(t.state) || t.is_done) return false;
       if (!matchTaskFilters(t, sharedFilters)) return false;
       return true;
-    })
-    .sort((a, b) => {
-      const pOrder: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
-      const pA = pOrder[a.priority] ?? 99;
-      const pB = pOrder[b.priority] ?? 99;
-      if (pA !== pB) return pA - pB;
-      return a.id.localeCompare(b.id);
-    })
-    .slice(0, 5);
+    });
+    const nextUpCandidates = base.filter((t) => {
+      if (!isCommonView && t.kind !== 'emergent' && t.category !== 'micro') return false;
+      if (!isCommonView && /^\d+\.\d+/.test(t.id)) return false;
+      if (t.next_up !== 'yes') return false;
+      return true;
+    });
+    const listToSort = isCommonView && nextUpCandidates.length === 0 ? base : nextUpCandidates;
+    return listToSort
+      .sort((a, b) => {
+        const pOrder: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+        const pA = pOrder[a.priority] ?? 99;
+        const pB = pOrder[b.priority] ?? 99;
+        if (pA !== pB) return pA - pB;
+        return (a.qualified_id || a.id).localeCompare(b.qualified_id || b.id);
+      })
+      .slice(0, isCommonView ? 100 : 5);
+  })();
 
   const handleOpenSyncPreview = async () => {
     setSyncingIndex(true);
@@ -271,78 +311,151 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
     }
   }
 
-  const renderKanbanCard = (t: TaskItem) => (
-    <div
-      key={t.id}
-      onClick={() => setSelectedTask(t)}
-      style={{
-        backgroundColor: '#0f172a',
-        border: '1px solid #334155',
-        borderRadius: '0.375rem',
-        padding: '0.6rem',
-        cursor: 'pointer',
-        transition: 'border-color 0.15s ease',
-      }}
-      onMouseEnter={(e) => (e.currentTarget.style.borderColor = '#6366f1')}
-      onMouseLeave={(e) => (e.currentTarget.style.borderColor = '#334155')}
-    >
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-          <span style={{
-            fontSize: '0.65rem',
-            fontWeight: 700,
-            padding: '0.1rem 0.25rem',
-            borderRadius: '0.2rem',
-            backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
-            color: '#fff',
-          }}>
-            {t.priority}
-          </span>
-          {t.category === 'micro' && (
-            <span style={{
-              fontSize: '0.6rem',
-              fontWeight: 700,
-              backgroundColor: '#27272a',
-              color: '#a1a1aa',
-              padding: '0.05rem 0.25rem',
-              borderRadius: '0.2rem',
-              textTransform: 'uppercase',
-            }}>
-              micro
-            </span>
-          )}
-          {t.fields?.kind?.value ? (
-            <KindBadge kind={String(t.fields.kind.value)} size={11} />
-          ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' ? (
-            <KindBadge kind={t.kind} size={11} />
-          ) : null}
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
-          <span style={{ fontSize: '0.7rem', fontWeight: 600, color: '#818cf8', flexShrink: 0 }}>{t.id}</span>
-        </div>
-      </div>
-      <div style={{
-        fontSize: '0.8rem',
-        fontWeight: 500,
-        color: '#f8fafc',
-        lineHeight: 1.3,
-        marginBottom: '0.4rem',
-        overflowWrap: 'break-word',
-        wordBreak: 'break-word',
-      }}>
-        {t.title}
-      </div>
-      {t.labels && t.labels.length > 0 && (
-        <div style={{ marginBottom: '0.4rem' }}>
-          <LabelList labels={t.labels} maxVisible={3} size="xs" />
-        </div>
-      )}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.7rem', color: '#64748b' }}>
-        <span>{t.executor || 'self'}</span>
-        <span style={{ color: '#475569' }}>{t.category}</span>
-      </div>
-    </div>
+  const isSubWorkspaceReadOnly =
+    !isCommonView &&
+    selectedProject !== null &&
+    projects.some((p) => p.id === selectedProject && p.kind === 'sub_workspace');
+
+  const defaultCreateProject =
+    sharedFilters.projects && sharedFilters.projects.length === 1
+      ? sharedFilters.projects[0]
+      : selectedProject;
+
+  const availableLabels = Array.from(
+    new Set(tasks.flatMap((t) => t.labels || []))
   );
+
+  const renderCardListWithGrouping = (list: TaskItem[], renderFn: (t: TaskItem) => React.ReactNode) => {
+    if (!isCommonView || !sharedFilters.groupByProject) {
+      return list.map(renderFn);
+    }
+    const byProject: Record<string, TaskItem[]> = {};
+    list.forEach((t) => {
+      const p = t.project || '_workspace';
+      if (!byProject[p]) byProject[p] = [];
+      byProject[p].push(t);
+    });
+    return Object.keys(byProject)
+      .sort()
+      .map((projId) => (
+        <div key={projId} style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginBottom: '0.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', padding: '0.15rem 0.25rem' }}>
+            <ProjectChip project={projId} size="xs" />
+            <span style={{ fontSize: '0.68rem', color: '#64748b', fontWeight: 600 }}>
+              ({byProject[projId].length})
+            </span>
+          </div>
+          {byProject[projId].map(renderFn)}
+        </div>
+      ));
+  };
+
+  const renderKanbanCard = (t: TaskItem) => {
+    const warnings = getPlacementWarnings(t);
+    const idDisplay = isCommonView ? formatTaskIdentifier(t, true) : t.id;
+    return (
+      <div
+        key={t.qualified_id || `${t.project || ''}-${t.id}`}
+        onClick={() => handleOpenTaskModal(t)}
+        style={{
+          backgroundColor: '#0f172a',
+          border: '1px solid #334155',
+          borderRadius: '0.375rem',
+          padding: '0.6rem',
+          cursor: 'pointer',
+          transition: 'border-color 0.15s ease',
+        }}
+        onMouseEnter={(e) => (e.currentTarget.style.borderColor = '#6366f1')}
+        onMouseLeave={(e) => (e.currentTarget.style.borderColor = '#334155')}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem', gap: '0.3rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', flexWrap: 'wrap' }}>
+            <span style={{
+              fontSize: '0.65rem',
+              fontWeight: 700,
+              padding: '0.1rem 0.25rem',
+              borderRadius: '0.2rem',
+              backgroundColor: t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
+              color: '#fff',
+            }}>
+              {t.priority}
+            </span>
+            {isCommonView && t.project && (
+              <ProjectChip project={t.project} size="xs" />
+            )}
+            {t.category === 'micro' && (
+              <span style={{
+                fontSize: '0.6rem',
+                fontWeight: 700,
+                backgroundColor: '#27272a',
+                color: '#a1a1aa',
+                padding: '0.05rem 0.25rem',
+                borderRadius: '0.2rem',
+                textTransform: 'uppercase',
+              }}>
+                micro
+              </span>
+            )}
+            {t.fields?.kind?.value ? (
+              <KindBadge kind={String(t.fields.kind.value)} size={11} />
+            ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative' ? (
+              <KindBadge kind={t.kind} size={11} />
+            ) : null}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
+            <span
+              style={{
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                color: '#818cf8',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+              title={idDisplay}
+            >
+              {idDisplay}
+            </span>
+          </div>
+        </div>
+        <div style={{
+          fontSize: '0.8rem',
+          fontWeight: 500,
+          color: '#f8fafc',
+          lineHeight: 1.3,
+          marginBottom: '0.4rem',
+          overflowWrap: 'break-word',
+          wordBreak: 'break-word',
+        }}>
+          {t.title}
+        </div>
+        {(t.conditional || warnings.length > 0) && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem', marginBottom: '0.4rem' }}>
+            <ConditionalBadge conditional={t.conditional} conditions={t.conditions} size="xs" />
+            <PlacementWarningChip warnings={warnings} size="xs" />
+          </div>
+        )}
+        {t.labels && t.labels.length > 0 && (
+          <div style={{ marginBottom: '0.4rem' }}>
+            <LabelList labels={t.labels} maxVisible={3} size="xs" />
+          </div>
+        )}
+        {isCommonView && t.project === '_workspace' && t.coordinates && t.coordinates.length > 0 && (
+          <div style={{ marginBottom: '0.4rem' }}>
+            <CoordinatesExpansionList
+              coordinates={t.coordinates}
+              onSelectTarget={onSelectCoordTarget}
+              compact={true}
+            />
+          </div>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.7rem', color: '#64748b' }}>
+          <span>{t.executor || 'self'}</span>
+          <span style={{ color: '#475569' }}>{t.category}</span>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div style={{ padding: '1.25rem 1.5rem', maxWidth: '1400px', margin: '0 auto', width: '100%', boxSizing: 'border-box' }}>
@@ -459,28 +572,36 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
             })}
           </div>
 
-          <MicrotaskQuickAdd onCreated={onRefresh} />
+          <MicrotaskQuickAdd
+            onCreated={onRefresh}
+            isCommonView={isCommonView}
+            projects={projects}
+            defaultProject={defaultCreateProject}
+            disabled={isSubWorkspaceReadOnly}
+          />
 
-          <button
-            onClick={handleOpenSyncPreview}
-            disabled={syncingIndex}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.35rem',
-              padding: '0.4rem 0.8rem',
-              backgroundColor: '#1e293b',
-              border: '1px solid #334155',
-              borderRadius: '0.375rem',
-              color: '#cbd5e1',
-              cursor: syncingIndex ? 'not-allowed' : 'pointer',
-              fontSize: '0.85rem',
-              fontWeight: 500,
-            }}
-          >
-            {syncingIndex ? <Loader2 size={14} className="spin" /> : <FileCheck size={14} color="#818cf8" />}
-            <span>{syncingIndex ? 'Inspecting...' : 'Sync 00-INDEX.md'}</span>
-          </button>
+          {!isCommonView && (
+            <button
+              onClick={handleOpenSyncPreview}
+              disabled={syncingIndex || isSubWorkspaceReadOnly}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.35rem',
+                padding: '0.4rem 0.8rem',
+                backgroundColor: '#1e293b',
+                border: '1px solid #334155',
+                borderRadius: '0.375rem',
+                color: '#cbd5e1',
+                cursor: syncingIndex || isSubWorkspaceReadOnly ? 'not-allowed' : 'pointer',
+                fontSize: '0.85rem',
+                fontWeight: 500,
+              }}
+            >
+              {syncingIndex ? <Loader2 size={14} className="spin" /> : <FileCheck size={14} color="#818cf8" />}
+              <span>{syncingIndex ? 'Inspecting...' : 'Sync 00-INDEX.md'}</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -502,6 +623,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
           { label: 'Waiting/Blocked', count: stats.waiting, color: '#f59e0b' },
           { label: 'Delivered', count: stats.delivered, color: '#0ea5e9' },
           { label: 'Verified', count: stats.verified, color: '#10b981' },
+          ...(stats.conditional > 0 ? [{ label: 'Conditional', count: stats.conditional, color: '#f59e0b' }] : []),
           { label: 'Done', count: stats.done, color: '#475569' },
         ].map((kpi, idx, arr) => (
           <React.Fragment key={kpi.label}>
@@ -526,6 +648,9 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
       <SharedFilterBar
         filters={sharedFilters}
         onChange={setSharedFilters}
+        availableLabels={availableLabels}
+        availableProjects={projects}
+        showProjectControls={isCommonView}
         showGroupByLabel={viewMode === 'tree'}
       />
 
@@ -541,167 +666,190 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
             gap: '0.5rem',
           }}>
             <ArrowRight size={14} color="#818cf8" style={{ flexShrink: 0 }} />
-            <span>What to start next: emergent tasks marked next-up (initiative tasks join once the timeline engine lands).</span>
+            <span>
+              {isCommonView
+                ? 'Active tasks across workspace projects (ordered by priority).'
+                : 'What to start next: emergent tasks marked next-up (initiative tasks join once the timeline engine lands).'}
+            </span>
           </div>
 
           {queueTasks.length > 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              {queueTasks.map((t) => (
-                <div
-                  key={t.id}
-                  onClick={() => setSelectedTask(t)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.75rem',
-                    padding: '0.6rem 0.85rem',
-                    backgroundColor: '#1e293b',
-                    border: '1px solid #334155',
-                    borderRadius: '0.375rem',
-                    cursor: 'pointer',
-                    transition: 'border-color 0.15s ease, background-color 0.15s ease',
-                    boxSizing: 'border-box',
-                    width: '100%',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.borderColor = '#6366f1';
-                    e.currentTarget.style.backgroundColor = '#243046';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.borderColor = '#334155';
-                    e.currentTarget.style.backgroundColor = '#1e293b';
-                  }}
-                >
-                  {/* ID + Short Title + Micro + Kind */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}>
-                    <span
-                      style={{
-                        fontSize: '0.8rem',
-                        fontWeight: 700,
-                        color: '#818cf8',
-                        fontFamily: 'monospace',
-                        minWidth: '42px',
-                      }}
-                    >
-                      {t.id}
-                    </span>
-                    {t.category === 'micro' && (
+              {renderCardListWithGrouping(queueTasks, (t) => {
+                const warnings = getPlacementWarnings(t);
+                const idDisplay = isCommonView ? formatTaskIdentifier(t, true) : t.id;
+                return (
+                  <div
+                    key={t.qualified_id || `${t.project || ''}-${t.id}`}
+                    onClick={() => handleOpenTaskModal(t)}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '0.35rem',
+                      padding: '0.6rem 0.85rem',
+                      backgroundColor: '#1e293b',
+                      border: '1px solid #334155',
+                      borderRadius: '0.375rem',
+                      cursor: 'pointer',
+                      transition: 'border-color 0.15s ease, background-color 0.15s ease',
+                      boxSizing: 'border-box',
+                      width: '100%',
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = '#6366f1';
+                      e.currentTarget.style.backgroundColor = '#243046';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = '#334155';
+                      e.currentTarget.style.backgroundColor = '#1e293b';
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', width: '100%', flexWrap: 'wrap' }}>
+                      {/* Project Chip + ID + Short Title + Micro + Kind */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}>
+                        {isCommonView && t.project && (
+                          <ProjectChip project={t.project} size="xs" />
+                        )}
+                        <span
+                          style={{
+                            fontSize: '0.8rem',
+                            fontWeight: 700,
+                            color: '#818cf8',
+                            fontFamily: 'monospace',
+                            minWidth: '42px',
+                          }}
+                        >
+                          {idDisplay}
+                        </span>
+                        {t.category === 'micro' && (
+                          <span
+                            style={{
+                              fontSize: '0.6rem',
+                              fontWeight: 700,
+                              backgroundColor: '#27272a',
+                              color: '#a1a1aa',
+                              padding: '0.05rem 0.25rem',
+                              borderRadius: '0.2rem',
+                              textTransform: 'uppercase',
+                            }}
+                          >
+                            micro
+                          </span>
+                        )}
+                        {t.fields?.kind?.value ? (
+                          <KindBadge kind={String(t.fields.kind.value)} size={11} />
+                        ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative' ? (
+                          <KindBadge kind={t.kind} size={11} />
+                        ) : null}
+                      </div>
+
+                      {/* Title */}
                       <span
                         style={{
-                          fontSize: '0.6rem',
+                          fontSize: '0.85rem',
+                          fontWeight: 500,
+                          color: '#f8fafc',
+                          flex: 1,
+                          minWidth: '180px',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                        title={t.title}
+                      >
+                        {t.title}
+                      </span>
+
+                      <ConditionalBadge conditional={t.conditional} conditions={t.conditions} size="xs" />
+                      <PlacementWarningChip warnings={warnings} size="xs" />
+
+                      {/* Labels if present */}
+                      {t.labels && t.labels.length > 0 && (
+                        <LabelList labels={t.labels} maxVisible={2} size="xs" />
+                      )}
+
+                      {/* Priority chip */}
+                      <span
+                        style={{
+                          fontSize: '0.7rem',
                           fontWeight: 700,
-                          backgroundColor: '#27272a',
-                          color: '#a1a1aa',
-                          padding: '0.05rem 0.25rem',
+                          padding: '0.15rem 0.4rem',
                           borderRadius: '0.2rem',
-                          textTransform: 'uppercase',
+                          backgroundColor:
+                            t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
+                          color: '#fff',
+                          flexShrink: 0,
                         }}
                       >
-                        micro
+                        {t.priority}
                       </span>
+
+                      {/* Size chip if present */}
+                      {t.size && (
+                        <span
+                          style={{
+                            fontSize: '0.7rem',
+                            fontWeight: 600,
+                            padding: '0.1rem 0.35rem',
+                            borderRadius: '0.2rem',
+                            backgroundColor: '#0f172a',
+                            border: '1px solid #475569',
+                            color: '#cbd5e1',
+                            flexShrink: 0,
+                          }}
+                        >
+                          {t.size}
+                        </span>
+                      )}
+
+                      {/* Executor */}
+                      <span
+                        style={{
+                          fontSize: '0.75rem',
+                          color: '#94a3b8',
+                          flexShrink: 0,
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.25rem',
+                        }}
+                      >
+                        <span style={{ color: '#64748b' }}>Assigned:</span>
+                        <strong style={{ color: '#cbd5e1', fontWeight: 600 }}>{t.executor || 'self'}</strong>
+                      </span>
+
+                      {/* Handoff copy button */}
+                      <button
+                        onClick={(e) => copyHandoff(e, t.handoff, t.qualified_id || t.id, t.title)}
+                        title="Copy Handoff Prompt"
+                        style={{
+                          background: '#0f172a',
+                          border: '1px solid #334155',
+                          borderRadius: '0.25rem',
+                          padding: '0.25rem 0.5rem',
+                          color: copiedId === (t.qualified_id || t.id) ? '#10b981' : '#cbd5e1',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.25rem',
+                          fontSize: '0.75rem',
+                          flexShrink: 0,
+                          fontWeight: 500,
+                        }}
+                      >
+                        {copiedId === (t.qualified_id || t.id) ? <Check size={13} color="#10b981" /> : <Copy size={13} />}
+                        <span>{copiedId === (t.qualified_id || t.id) ? 'Copied' : 'Handoff'}</span>
+                      </button>
+                    </div>
+
+                    {isCommonView && t.project === '_workspace' && t.coordinates && t.coordinates.length > 0 && (
+                      <CoordinatesExpansionList
+                        coordinates={t.coordinates}
+                        onSelectTarget={onSelectCoordTarget}
+                      />
                     )}
-                    {t.fields?.kind?.value ? (
-                      <KindBadge kind={String(t.fields.kind.value)} size={11} />
-                    ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' ? (
-                      <KindBadge kind={t.kind} size={11} />
-                    ) : null}
                   </div>
-
-                  {/* Title */}
-                  <span
-                    style={{
-                      fontSize: '0.85rem',
-                      fontWeight: 500,
-                      color: '#f8fafc',
-                      flex: 1,
-                      minWidth: 0,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                    title={t.title}
-                  >
-                    {t.title}
-                  </span>
-
-                  {/* Labels if present */}
-                  {t.labels && t.labels.length > 0 && (
-                    <LabelList labels={t.labels} maxVisible={2} size="xs" />
-                  )}
-
-                  {/* Priority chip */}
-                  <span
-                    style={{
-                      fontSize: '0.7rem',
-                      fontWeight: 700,
-                      padding: '0.15rem 0.4rem',
-                      borderRadius: '0.2rem',
-                      backgroundColor:
-                        t.priority === 'P0' ? '#ef4444' : t.priority === 'P1' ? '#f59e0b' : '#64748b',
-                      color: '#fff',
-                      flexShrink: 0,
-                    }}
-                  >
-                    {t.priority}
-                  </span>
-
-                  {/* Size chip if present */}
-                  {t.size && (
-                    <span
-                      style={{
-                        fontSize: '0.7rem',
-                        fontWeight: 600,
-                        padding: '0.1rem 0.35rem',
-                        borderRadius: '0.2rem',
-                        backgroundColor: '#0f172a',
-                        border: '1px solid #475569',
-                        color: '#cbd5e1',
-                        flexShrink: 0,
-                      }}
-                    >
-                      {t.size}
-                    </span>
-                  )}
-
-                  {/* Executor */}
-                  <span
-                    style={{
-                      fontSize: '0.75rem',
-                      color: '#94a3b8',
-                      flexShrink: 0,
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.25rem',
-                    }}
-                  >
-                    <span style={{ color: '#64748b' }}>Assigned:</span>
-                    <strong style={{ color: '#cbd5e1', fontWeight: 600 }}>{t.executor || 'self'}</strong>
-                  </span>
-
-                  {/* Handoff copy button */}
-                  <button
-                    onClick={(e) => copyHandoff(e, t.handoff, t.id, t.title)}
-                    title="Copy Handoff Prompt"
-                    style={{
-                      background: '#0f172a',
-                      border: '1px solid #334155',
-                      borderRadius: '0.25rem',
-                      padding: '0.25rem 0.5rem',
-                      color: copiedId === t.id ? '#10b981' : '#cbd5e1',
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.25rem',
-                      fontSize: '0.75rem',
-                      flexShrink: 0,
-                      fontWeight: 500,
-                    }}
-                  >
-                    {copiedId === t.id ? <Check size={13} color="#10b981" /> : <Copy size={13} />}
-                    <span>{copiedId === t.id ? 'Copied' : 'Handoff'}</span>
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div style={{
@@ -827,7 +975,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                           Delivered — needs verification ({deliveredCards.length})
                         </div>
                         {deliveredCards.length > 0 ? (
-                          deliveredCards.map(renderKanbanCard)
+                          renderCardListWithGrouping(deliveredCards, renderKanbanCard)
                         ) : (
                           <div style={{ color: '#475569', fontSize: '0.75rem', textAlign: 'center', padding: '0.5rem 0', fontStyle: 'italic' }}>
                             No delivered tasks
@@ -852,7 +1000,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
                           Verified — ready to close ({verifiedCards.length})
                         </div>
                         {verifiedCards.length > 0 ? (
-                          verifiedCards.map(renderKanbanCard)
+                          renderCardListWithGrouping(verifiedCards, renderKanbanCard)
                         ) : (
                           <div style={{ color: '#475569', fontSize: '0.75rem', textAlign: 'center', padding: '0.5rem 0', fontStyle: 'italic' }}>
                             No verified tasks
@@ -901,7 +1049,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
 
                   {/* Cards list */}
                   <div style={{ padding: '0.5rem', flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    {colTasks.map(renderKanbanCard)}
+                    {renderCardListWithGrouping(colTasks, renderKanbanCard)}
                     {colTasks.length === 0 && (
                       <div style={{ color: '#475569', fontSize: '0.75rem', textAlign: 'center', padding: '1rem 0', fontStyle: 'italic' }}>
                         No tasks
@@ -921,16 +1069,22 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
           data={data}
           visibleStates={treeStates}
           onVisibleStatesChange={updateTreeStates}
-          onSelectTask={(task) => setSelectedTask(task)}
+          onSelectTask={handleOpenTaskModal}
           onRefresh={onRefresh}
           sharedFilters={sharedFilters}
+          isCommonView={isCommonView}
+          onSelectCoordTarget={onSelectCoordTarget}
         />
       )}
 
       {viewMode === 'timeline' && (
         <TimelineView
-          onSelectTask={(task) => setSelectedTask(task)}
+          onSelectTask={handleOpenTaskModal}
           onRefresh={onRefresh}
+          isCommonView={isCommonView}
+          projects={projects}
+          tasks={tasks}
+          sharedFilters={sharedFilters}
         />
       )}
 
@@ -939,8 +1093,13 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({ data, onRefresh 
         <TaskDetailModal
           task={selectedTask}
           tree={data?.tree}
-          onSelectTask={(task) => setSelectedTask(task)}
-          onClose={() => setSelectedTask(null)}
+          onSelectTask={handleOpenTaskModal}
+          onClose={() => {
+            if (isCommonView) {
+              setCurrentProject(null);
+            }
+            setSelectedTask(null);
+          }}
           onActionComplete={onRefresh}
           onIndexOutOfSync={() => setIndexOutOfSync(true)}
           onRequestSyncIndex={handleOpenSyncPreview}

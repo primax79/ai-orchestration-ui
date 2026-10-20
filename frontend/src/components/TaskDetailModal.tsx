@@ -20,7 +20,7 @@ import {
   Edit2,
 } from 'lucide-react';
 import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord, TreeNode, StructurePlanItem, TaskState, shortTitle } from '../types';
-import { api, taskStructureApi } from '../api';
+import { api, taskStructureApi, setCurrentProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
 import { TaskRunsPanel } from './TaskRunsPanel';
@@ -35,6 +35,7 @@ import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { LabelEditorModal } from './LabelEditorModal';
 import { PromoteDialog } from './PromoteDialog';
+import { ProjectChip, ConditionalBadge } from './ProjectBadges';
 import { ArrowUpRight } from 'lucide-react';
 
 interface TaskDetailModalProps {
@@ -138,6 +139,9 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
 
   // Sync currentTask when incoming prop changes
   useEffect(() => {
+    if (task.project) {
+      setCurrentProject(task.project);
+    }
     setCurrentTask(task);
   }, [task]);
 
@@ -798,6 +802,9 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               }}>
                 {currentTask.priority}
               </span>
+              {currentTask.project && (
+                <ProjectChip project={currentTask.project} size="xs" />
+              )}
               <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#818cf8' }}>{currentTask.id}</span>
               {!isEditingShortTitle ? (
                 <span
@@ -926,6 +933,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               }}>
                 {currentTask.state}
               </span>
+              <ConditionalBadge conditional={currentTask.conditional} conditions={currentTask.conditions} size="xs" />
 
               {/* Promote button if microtask */}
               {currentTask.category === 'micro' && (

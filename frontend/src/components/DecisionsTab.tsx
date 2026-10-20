@@ -19,14 +19,18 @@ import {
   X,
 } from 'lucide-react';
 import { QuestionItem, TaskItem, AnswerAndResumePreviewResponse, shortTitle } from '../types';
-import { api } from '../api';
+import { api, setCurrentProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { ConfirmDialog } from './ConfirmDialog';
+import { ProjectChip } from './ProjectBadges';
 
 interface DecisionsTabProps {
   tasks?: TaskItem[];
   onRefresh?: () => void;
+  isCommonView?: boolean;
 }
+
+const getQuestionKey = (q: QuestionItem) => (q.project ? `${q.project}/${q.id}` : q.id);
 
 function formatAge(dateStr: string): string {
   if (!dateStr || dateStr === '-') return '';
@@ -213,7 +217,11 @@ export function buildAnswerAndResumeSummary(
   return summary;
 }
 
-export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefresh }) => {
+export const DecisionsTab: React.FC<DecisionsTabProps> = ({
+  tasks = [],
+  onRefresh,
+  isCommonView = false,
+}) => {
   const [subTab, setSubTab] = useState<'open' | 'awaiting' | 'history'>('open');
   const [questions, setQuestions] = useState<QuestionItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -269,7 +277,9 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
     setLoading(true);
     setError(null);
     try {
-      const res = await api.getQuestions({ status: 'all' });
+      const res = isCommonView
+        ? await api.getWorkspaceQuestions({ status: 'all' })
+        : await api.getQuestions({ status: 'all' });
       if (res && res.questions) {
         setQuestions(res.questions);
       } else {
@@ -280,7 +290,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isCommonView]);
 
   useEffect(() => {
     loadQuestions();
@@ -451,10 +461,11 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
   };
 
   const handleOpenAnswerSubmit = (q: QuestionItem) => {
-    const choice = selectedChoices[q.id];
+    const qKey = getQuestionKey(q);
+    const choice = selectedChoices[qKey];
     if (!choice) return;
 
-    const text = answerTexts[q.id] || '';
+    const text = answerTexts[qKey] || '';
     if (choice === 'open' && !text.trim()) {
       return;
     }
@@ -480,27 +491,39 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
   const executeAnswer = async () => {
     if (!confirmingAnswer) return;
     const { question, choice, text } = confirmingAnswer;
+    if (question.project) {
+      setCurrentProject(question.project);
+    }
 
-    await api.answerQuestion(question.id, {
-      choice,
-      text,
-      by: 'owner',
-    });
+    try {
+      await api.answerQuestion(question.id, {
+        choice,
+        text,
+        by: 'owner',
+      });
 
-    setConfirmingAnswer(null);
-    await loadQuestions();
-    onRefresh?.();
+      setConfirmingAnswer(null);
+      if (isCommonView) setCurrentProject(null);
+      await loadQuestions();
+      onRefresh?.();
+    } finally {
+      if (isCommonView) setCurrentProject(null);
+    }
   };
 
   const executeApply = async () => {
     if (!applyingQuestion) return;
     setApplyingQuestion((prev) => (prev ? { ...prev, loading: true, error: undefined } : null));
     try {
+      if (applyingQuestion.question.project) {
+        setCurrentProject(applyingQuestion.question.project);
+      }
       const res = await api.applyQuestion(applyingQuestion.question.id, {
         ref: applyingQuestion.ref,
         by: applyingQuestion.by || 'owner',
         note: applyingQuestion.note,
       });
+      if (isCommonView) setCurrentProject(null);
       if (res && res.ok) {
         setApplyingQuestion(null);
         await loadQuestions();
@@ -511,6 +534,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
         );
       }
     } catch (e: any) {
+      if (isCommonView) setCurrentProject(null);
       setApplyingQuestion((prev) =>
         prev ? { ...prev, loading: false, error: e.message || String(e) } : null
       );
@@ -518,10 +542,11 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
   };
 
   const handleAnswerAndResumeClick = async (q: QuestionItem) => {
-    const choice = selectedChoices[q.id];
+    const qKey = getQuestionKey(q);
+    const choice = selectedChoices[qKey];
     if (!choice) return;
 
-    const text = answerTexts[q.id] || '';
+    const text = answerTexts[qKey] || '';
     if (choice === 'open' && !text.trim()) {
       return;
     }
@@ -536,9 +561,12 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
       }
     }
 
-    setResumeLoading(q.id);
+    setResumeLoading(qKey);
     setResumeError(null);
     try {
+      if (q.project) {
+        setCurrentProject(q.project);
+      }
       const preview = await (api as any).previewAnswerAndResume(q.id, {
         choice,
         text: text.trim() ? text : undefined,
@@ -557,6 +585,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
     } catch (err: any) {
       setResumeError(err.message || 'Error previewing run continuation');
     } finally {
+      if (isCommonView) setCurrentProject(null);
       setResumeLoading(null);
     }
   };
@@ -565,6 +594,9 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
     if (!confirmingAnswerAndResume) return;
     const { question, choice, text, preview } = confirmingAnswerAndResume;
     try {
+      if (question.project) {
+        setCurrentProject(question.project);
+      }
       await (api as any).answerAndResume(question.id, {
         choice,
         text,
@@ -572,9 +604,11 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
         by: 'owner',
       });
       setConfirmingAnswerAndResume(null);
+      if (isCommonView) setCurrentProject(null);
       await loadQuestions();
       onRefresh?.();
     } catch (err: any) {
+      if (isCommonView) setCurrentProject(null);
       setResumeError(err.message || 'Failed to answer and resume run');
     }
   };
@@ -582,13 +616,21 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
   const executeWithdraw = async () => {
     if (!withdrawingQuestion || !withdrawingQuestion.reason.trim()) return;
 
-    await api.withdrawQuestion(withdrawingQuestion.question.id, {
-      reason: withdrawingQuestion.reason.trim(),
-      by: 'owner',
-    });
-    setWithdrawingQuestion(null);
-    await loadQuestions();
-    onRefresh?.();
+    try {
+      if (withdrawingQuestion.question.project) {
+        setCurrentProject(withdrawingQuestion.question.project);
+      }
+      await api.withdrawQuestion(withdrawingQuestion.question.id, {
+        reason: withdrawingQuestion.reason.trim(),
+        by: 'owner',
+      });
+      setWithdrawingQuestion(null);
+      if (isCommonView) setCurrentProject(null);
+      await loadQuestions();
+      onRefresh?.();
+    } finally {
+      if (isCommonView) setCurrentProject(null);
+    }
   };
 
   return (
@@ -899,9 +941,10 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                   {/* Question Cards within group */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                     {group.questions.map((q) => {
-                      const isContextOpen = !!expandedContext[q.id];
-                      const selectedChoice = selectedChoices[q.id];
-                      const currentText = answerTexts[q.id] || '';
+                      const qKey = getQuestionKey(q);
+                      const isContextOpen = !!expandedContext[qKey];
+                      const selectedChoice = selectedChoices[qKey];
+                      const currentText = answerTexts[qKey] || '';
                       const isOpenAnswer = q.open_answer === 'yes';
                       const hasOriginRun = Boolean(q.origin_run && q.origin_run.trim() !== '-');
                       const canSubmit =
@@ -909,7 +952,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
 
                       return (
                         <div
-                          key={q.id}
+                          key={qKey}
                           style={{
                             backgroundColor: '#1e293b',
                             borderRadius: '0.75rem',
@@ -927,7 +970,10 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                               marginBottom: '0.75rem',
                             }}
                           >
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                              {isCommonView && q.project && (
+                                <ProjectChip project={q.project} size="xs" />
+                              )}
                         <span
                           style={{
                             fontSize: '0.85rem',
@@ -940,7 +986,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                             fontFamily: 'monospace',
                           }}
                         >
-                          {q.id}
+                          {isCommonView && q.project ? `${q.project}/${q.id}` : q.id}
                         </span>
                                 <span
                                   style={{
@@ -1049,9 +1095,9 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                                 overflow: 'hidden',
                               }}
                             >
-                              <button
-                                onClick={() => toggleContext(q.id)}
-                                style={{
+                            <button
+                              onClick={() => toggleContext(qKey)}
+                              style={{
                                   width: '100%',
                                   display: 'flex',
                                   alignItems: 'center',
@@ -1133,10 +1179,10 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                                     >
                                       <input
                                         type="radio"
-                                        name={`question-${q.id}`}
+                                        name={`question-${qKey}`}
                                         value={opt.label}
                                         checked={isSelected}
-                                        onChange={() => handleSelectChoice(q.id, opt.label)}
+                                        onChange={() => handleSelectChoice(qKey, opt.label)}
                                         style={{ marginTop: '0.2rem', cursor: 'pointer' }}
                                       />
                                       <div style={{ flex: 1, fontSize: '0.85rem', lineHeight: 1.4 }}>
@@ -1190,10 +1236,10 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                                 >
                                   <input
                                     type="radio"
-                                    name={`question-${q.id}`}
+                                    name={`question-${qKey}`}
                                     value="open"
                                     checked={selectedChoice === 'open'}
-                                    onChange={() => handleSelectChoice(q.id, 'open')}
+                                    onChange={() => handleSelectChoice(qKey, 'open')}
                                     style={{ marginTop: '0.2rem', cursor: 'pointer' }}
                                   />
                                   <div style={{ flex: 1, fontSize: '0.85rem' }}>
@@ -1223,7 +1269,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                                 </div>
                                 <textarea
                                   value={currentText}
-                                  onChange={(e) => handleTextChange(q.id, e.target.value)}
+                                  onChange={(e) => handleTextChange(qKey, e.target.value)}
                                   placeholder={
                                     selectedChoice === 'open'
                                       ? 'Type your custom decision or instruction here (required)...'
@@ -1282,7 +1328,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                               {hasOriginRun && (
                                 <button
                                   onClick={() => handleAnswerAndResumeClick(q)}
-                                  disabled={!canSubmit || resumeLoading === q.id}
+                                  disabled={!canSubmit || resumeLoading === qKey}
                                   style={{
                                     display: 'flex',
                                     alignItems: 'center',
@@ -1290,15 +1336,15 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                                     padding: '0.45rem 1rem',
                                     borderRadius: '0.375rem',
                                     border: '1px solid #6366f1',
-                                    backgroundColor: canSubmit && resumeLoading !== q.id ? '#312e81' : '#1e1b4b',
-                                    color: canSubmit && resumeLoading !== q.id ? '#c7d2fe' : '#475569',
+                                    backgroundColor: canSubmit && resumeLoading !== qKey ? '#312e81' : '#1e1b4b',
+                                    color: canSubmit && resumeLoading !== qKey ? '#c7d2fe' : '#475569',
                                     fontSize: '0.85rem',
                                     fontWeight: 600,
-                                    cursor: canSubmit && resumeLoading !== q.id ? 'pointer' : 'not-allowed',
+                                    cursor: canSubmit && resumeLoading !== qKey ? 'pointer' : 'not-allowed',
                                     boxShadow: canSubmit ? '0 4px 6px -1px rgba(99, 102, 241, 0.25)' : 'none',
                                   }}
                                 >
-                                  {resumeLoading === q.id ? (
+                                  {resumeLoading === qKey ? (
                                     <Loader2 size={14} className="spin" />
                                   ) : (
                                     <Play size={14} />
@@ -1382,10 +1428,11 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               {awaitingQuestions.map((q) => {
                 const blockedTaskId = q.blocks && q.blocks.trim() !== '-' ? q.blocks : null;
+                const qKey = getQuestionKey(q);
 
                 return (
                   <div
-                    key={q.id}
+                    key={qKey}
                     style={{
                       backgroundColor: '#1e293b',
                       borderRadius: '0.5rem',
@@ -1405,7 +1452,10 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                         gap: '0.5rem',
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                        {isCommonView && q.project && (
+                          <ProjectChip project={q.project} size="xs" />
+                        )}
                         <span
                           style={{
                             fontSize: '0.85rem',
@@ -1418,7 +1468,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                             fontFamily: 'monospace',
                           }}
                         >
-                          {q.id}
+                          {isCommonView && q.project ? `${q.project}/${q.id}` : q.id}
                         </span>
                         <span
                           style={{
@@ -1647,11 +1697,12 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
               {filteredHistory.map((q) => {
                 const isAnswered = q.status === 'answered';
                 const isWithdrawn = q.status === 'withdrawn';
-                const isContextOpen = !!expandedContext[q.id];
+                const qKey = getQuestionKey(q);
+                const isContextOpen = !!expandedContext[qKey];
 
                 return (
                   <div
-                    key={q.id}
+                    key={qKey}
                     style={{
                       backgroundColor: '#1e293b',
                       borderRadius: '0.75rem',
@@ -1668,7 +1719,10 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                         marginBottom: '0.75rem',
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                        {isCommonView && q.project && (
+                          <ProjectChip project={q.project} size="xs" />
+                        )}
                         <span
                           style={{
                             fontSize: '0.85rem',
@@ -1681,7 +1735,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                             fontFamily: 'monospace',
                           }}
                         >
-                          {q.id}
+                          {isCommonView && q.project ? `${q.project}/${q.id}` : q.id}
                         </span>
 
                         <span
@@ -1764,19 +1818,20 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({ tasks = [], onRefres
                         }}
                       >
                         <button
-                          onClick={() => toggleContext(q.id)}
+                          onClick={() => toggleContext(qKey)}
                           style={{
                             width: '100%',
                             display: 'flex',
                             alignItems: 'center',
-                            justifyContent: 'space-between',
-                            padding: '0.5rem 0.75rem',
+                            gap: '0.4rem',
+                            padding: '0.4rem 0.75rem',
                             background: 'none',
                             border: 'none',
-                            color: '#cbd5e1',
+                            color: '#94a3b8',
+                            cursor: 'pointer',
                             fontSize: '0.75rem',
                             fontWeight: 600,
-                            cursor: 'pointer',
+                            textAlign: 'left',
                           }}
                         >
                           <span>Context</span>

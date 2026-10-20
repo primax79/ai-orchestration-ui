@@ -12,6 +12,7 @@ import { TaskGraphNode, TaskSize, shortTitle } from '../types';
 import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { PromoteDialog } from './PromoteDialog';
+import { ConditionalBadge } from './ProjectBadges';
 
 interface TimelineCardProps {
   node: TaskGraphNode;
@@ -699,6 +700,13 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({
       >
         {node.title}
       </div>
+
+      {/* Conditional badge */}
+      {node.conditional && (
+        <div style={{ marginTop: '0.15rem' }}>
+          <ConditionalBadge conditional={node.conditional} conditions={node.conditions} size="xs" />
+        </div>
+      )}
 
       {/* Labels */}
       {node.labels && node.labels.length > 0 && (

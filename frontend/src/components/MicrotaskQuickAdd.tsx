@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Plus, Zap, Loader2, AlertCircle, X, Check } from 'lucide-react';
-import { TaskKind, Priority, CreateMicrotaskResponse } from '../types';
-import { microtaskAndLabelsApi } from '../api';
+import { TaskKind, Priority, CreateMicrotaskResponse, WorkspaceProjectInfo } from '../types';
+import { microtaskAndLabelsApi, setCurrentProject } from '../api';
 import { KIND_CONFIGS } from './KindBadge';
 
 interface MicrotaskQuickAddProps {
@@ -9,6 +9,10 @@ interface MicrotaskQuickAddProps {
   defaultKind?: TaskKind;
   buttonLabel?: string;
   style?: React.CSSProperties;
+  isCommonView?: boolean;
+  projects?: WorkspaceProjectInfo[];
+  defaultProject?: string | null;
+  disabled?: boolean;
 }
 
 const ALL_KINDS: TaskKind[] = ['bug', 'chore', 'docs', 'feature', 'fix', 'investigation'];
@@ -19,8 +23,25 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
   defaultKind = 'chore',
   buttonLabel = 'Quick Microtask',
   style,
+  isCommonView = false,
+  projects = [],
+  defaultProject = null,
+  disabled = false,
 }) => {
+  const writableProjects = projects.filter((p) => p.kind !== 'sub_workspace');
   const [isOpen, setIsOpen] = useState(false);
+  const [targetProject, setTargetProject] = useState<string>(
+    defaultProject || (writableProjects.length === 1 ? writableProjects[0].id : writableProjects[0]?.id || '')
+  );
+
+  useEffect(() => {
+    if (defaultProject && writableProjects.some((p) => p.id === defaultProject)) {
+      setTargetProject(defaultProject);
+    } else if (!targetProject && writableProjects.length > 0) {
+      setTargetProject(writableProjects[0].id);
+    }
+  }, [defaultProject, projects]);
+
   const [title, setTitle] = useState('');
   const [shortTitle, setShortTitle] = useState('');
   const [kind, setKind] = useState<TaskKind>(defaultKind);
@@ -37,6 +58,10 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
       setError('Title is required');
       return;
     }
+    if (isCommonView && writableProjects.length > 0 && !targetProject) {
+      setError('Please select a target project');
+      return;
+    }
 
     setSubmitting(true);
     setError(null);
@@ -47,6 +72,9 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
       .filter((s) => s.length > 0);
 
     try {
+      if (isCommonView && targetProject) {
+        setCurrentProject(targetProject);
+      }
       const res = await microtaskAndLabelsApi.createMicrotask({
         title: title.trim(),
         short_title: shortTitle.trim() || undefined,
@@ -80,24 +108,30 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
     return (
       <button
         type="button"
-        onClick={() => setIsOpen(true)}
+        disabled={disabled}
+        onClick={() => !disabled && setIsOpen(true)}
+        title={disabled ? 'Sub-workspace is read-only' : undefined}
         style={{
           display: 'inline-flex',
           alignItems: 'center',
           gap: '0.35rem',
           padding: '0.4rem 0.75rem',
-          backgroundColor: '#4f46e5',
+          backgroundColor: disabled ? '#334155' : '#4f46e5',
           border: 'none',
           borderRadius: '0.375rem',
-          color: '#fff',
+          color: disabled ? '#94a3b8' : '#fff',
           fontSize: '0.8rem',
           fontWeight: 600,
-          cursor: 'pointer',
+          cursor: disabled ? 'not-allowed' : 'pointer',
           transition: 'background-color 0.15s ease',
           ...style,
         }}
-        onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#4338ca')}
-        onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = '#4f46e5')}
+        onMouseEnter={(e) => {
+          if (!disabled) e.currentTarget.style.backgroundColor = '#4338ca';
+        }}
+        onMouseLeave={(e) => {
+          if (!disabled) e.currentTarget.style.backgroundColor = '#4f46e5';
+        }}
       >
         <Plus size={14} />
         <span>{buttonLabel}</span>
@@ -164,6 +198,34 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
       )}
 
       <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+        {/* Project selector when in common view */}
+        {isCommonView && writableProjects.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            <span style={{ fontSize: '0.75rem', color: '#94a3b8', fontWeight: 600 }}>Project *:</span>
+            <select
+              value={targetProject}
+              onChange={(e) => setTargetProject(e.target.value)}
+              style={{
+                backgroundColor: '#1e293b',
+                border: '1px solid #4f46e5',
+                borderRadius: '0.3rem',
+                color: '#f8fafc',
+                fontSize: '0.8rem',
+                padding: '0.3rem 0.5rem',
+                cursor: 'pointer',
+                outline: 'none',
+                fontWeight: 600,
+              }}
+            >
+              {writableProjects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.id} ({p.kind})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
         {/* Title Input */}
         <div>
           <input

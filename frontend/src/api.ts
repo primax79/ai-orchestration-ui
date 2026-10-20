@@ -1,5 +1,6 @@
 import {
   TaskListResponse,
+  WorkspaceTasksResponse,
   WorkspaceInfo,
   EnvStatusResponse,
   OrchestrationConfigResponse,
@@ -81,6 +82,60 @@ export const isVsCode = typeof window !== 'undefined' && typeof window.acquireVs
 export const vscode = isVsCode && window.acquireVsCodeApi ? window.acquireVsCodeApi() : null;
 
 let messageSeq = 0;
+let currentProjectId: string | null = null;
+let fallbackProjectId: string | null = null;
+
+export function setCurrentProject(projectId: string | null): void {
+  currentProjectId = projectId ? projectId.trim() || null : null;
+}
+
+export function getCurrentProject(): string | null {
+  return currentProjectId;
+}
+
+export function setFallbackProject(projectId: string | null): void {
+  fallbackProjectId = projectId ? projectId.trim() || null : null;
+}
+
+export function getFallbackProject(): string | null {
+  return fallbackProjectId;
+}
+
+function isAggregateEndpoint(endpoint: string): boolean {
+  const path = endpoint.split('?')[0];
+  return path === '/api/workspace' || path.startsWith('/api/workspace/');
+}
+
+function isSetupConfigDoctorEndpoint(endpoint: string): boolean {
+  const path = endpoint.split('?')[0];
+  return (
+    path.startsWith('/api/setup') ||
+    path.startsWith('/api/config') ||
+    path.startsWith('/api/env') ||
+    path.startsWith('/api/token')
+  );
+}
+
+export function withProjectQuery(endpoint: string, explicitProject?: string | null): string {
+  if (isAggregateEndpoint(endpoint)) {
+    return endpoint;
+  }
+  const proj =
+    explicitProject !== undefined
+      ? explicitProject
+      : currentProjectId ?? (isSetupConfigDoctorEndpoint(endpoint) ? fallbackProjectId : null);
+  if (!proj) {
+    return endpoint;
+  }
+  const [path, qs] = endpoint.split('?');
+  const params = new URLSearchParams(qs || '');
+  if (!params.has('project')) {
+    params.set('project', proj);
+  }
+  const nextQs = params.toString();
+  return nextQs ? `${path}?${nextQs}` : path;
+}
+
 const pendingRequests = new Map<string, { resolve: (val: any) => void; reject: (err: any) => void }>();
 const wsMessageListeners = new Set<(msg: any) => void>();
 const wsStatusListeners = new Set<(status: 'connected' | 'disconnected') => void>();
@@ -110,12 +165,34 @@ if (typeof window !== 'undefined') {
   });
 }
 
+const AGGREGATE_VSCODE_TYPES = new Set([
+  'getWorkspace',
+  'switchWorkspace',
+  'getWorkspaceTasks',
+  'getWorkspaceQuestions',
+  'getWorkspaceInbox',
+  'getWorkspaceRuns',
+]);
+
 function sendVsCodeMessage<T>(type: string, payload?: any): Promise<T> {
   return new Promise((resolve, reject) => {
     if (!vscode) return reject(new ApiError('VS Code API not available', 500));
     const id = `req_${++messageSeq}_${Date.now()}`;
     pendingRequests.set(id, { resolve, reject });
-    vscode.postMessage({ id, type, payload });
+    let finalPayload = payload;
+    if (!AGGREGATE_VSCODE_TYPES.has(type)) {
+      const proj = currentProjectId ?? fallbackProjectId;
+      if (proj) {
+        if (finalPayload && typeof finalPayload === 'object' && !Array.isArray(finalPayload)) {
+          if (finalPayload.project === undefined) {
+            finalPayload = { ...finalPayload, project: proj };
+          }
+        } else if (finalPayload === undefined || finalPayload === null) {
+          finalPayload = { project: proj };
+        }
+      }
+    }
+    vscode.postMessage({ id, type, payload: finalPayload });
   });
 }
 
@@ -127,7 +204,7 @@ function getApiToken(): string | null {
 
 // Helper for HTTP fetch in standalone browser mode
 async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> {
-  const url = endpoint.startsWith('http') ? endpoint : endpoint;
+  const url = endpoint.startsWith('http') ? endpoint : withProjectQuery(endpoint);
   const token = getApiToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -197,6 +274,75 @@ export const api = {
     return apiFetch<WorkspaceInfo>('/api/workspace');
   },
 
+  async getWorkspaceTasks(filters?: {
+    project?: string[];
+    state?: string[];
+    kind?: string;
+    label?: string;
+    text?: string;
+    page?: number;
+    per_page?: number;
+  }): Promise<WorkspaceTasksResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<WorkspaceTasksResponse>('getWorkspaceTasks', filters);
+    }
+    const params = new URLSearchParams();
+    if (filters?.project && filters.project.length > 0) {
+      filters.project.forEach((p) => params.append('project', p));
+    }
+    if (filters?.state && filters.state.length > 0) {
+      filters.state.forEach((s) => params.append('state', s));
+    }
+    if (filters?.kind) {
+      params.set('kind', filters.kind);
+    }
+    if (filters?.label) {
+      params.set('label', filters.label);
+    }
+    if (filters?.text) {
+      params.set('text', filters.text);
+    }
+    if (filters?.page !== undefined) {
+      params.set('page', String(filters.page));
+    }
+    params.set('per_page', String(filters?.per_page ?? 500));
+    const qs = params.toString();
+    return apiFetch<WorkspaceTasksResponse>(qs ? `/api/workspace/tasks?${qs}` : '/api/workspace/tasks');
+  },
+
+  async getWorkspaceQuestions(params?: { status?: string; blocks?: string }): Promise<QuestionListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<QuestionListResponse>('getWorkspaceQuestions', params);
+    }
+    const searchParams = new URLSearchParams();
+    if (params?.status && params.status !== 'all') searchParams.set('status', params.status);
+    if (params?.blocks) searchParams.set('blocks', params.blocks);
+    const qs = searchParams.toString();
+    return apiFetch<QuestionListResponse>(qs ? `/api/workspace/questions?${qs}` : '/api/workspace/questions');
+  },
+
+  async getWorkspaceInbox(params?: { status?: string }): Promise<InboxListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<InboxListResponse>('getWorkspaceInbox', params || {});
+    }
+    const query = new URLSearchParams();
+    if (params?.status) query.set('status', params.status);
+    const qs = query.toString();
+    return apiFetch<InboxListResponse>(`/api/workspace/inbox${qs ? `?${qs}` : ''}`);
+  },
+
+  async getWorkspaceRuns(params?: { task?: string; note?: string; active?: boolean }): Promise<RunListResponse> {
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<RunListResponse>('getWorkspaceRuns', params);
+    }
+    const query = new URLSearchParams();
+    if (params?.task) query.set('task', params.task);
+    if (params?.note) query.set('note', params.note);
+    if (params?.active) query.set('active', '1');
+    const qs = query.toString();
+    return apiFetch<RunListResponse>(`/api/workspace/runs${qs ? `?${qs}` : ''}`);
+  },
+
   async switchWorkspace(workspacePath: string): Promise<{ ok: boolean }> {
     if (isVsCode && vscode) {
       return sendVsCodeMessage<{ ok: boolean }>('switchWorkspace', { workspacePath });
@@ -204,9 +350,9 @@ export const api = {
     throw new ApiError('Workspace switching is not supported in standalone browser mode. Start another server with the desired workspace.', 400);
   },
 
-  async getTasks(filters?: { kind?: string[]; label?: string[] }): Promise<TaskListResponse> {
+  async getTasks(filters?: { kind?: string[]; label?: string[] }, projectOverride?: string): Promise<TaskListResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskListResponse>('getTasks', filters);
+      return sendVsCodeMessage<TaskListResponse>('getTasks', projectOverride ? { ...(filters || {}), project: projectOverride } : filters);
     }
     const params = new URLSearchParams();
     if (filters?.kind) {
@@ -214,6 +360,9 @@ export const api = {
     }
     if (filters?.label) {
       filters.label.forEach((l) => params.append('label', l));
+    }
+    if (projectOverride) {
+      params.set('project', projectOverride);
     }
     const qs = params.toString();
     return apiFetch<TaskListResponse>(qs ? `/api/tasks?${qs}` : '/api/tasks');
@@ -324,7 +473,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, {
+      res = await fetch(withProjectQuery(`/api/tasks/${encodeURIComponent(taskId)}/attachments`), {
         method: 'POST',
         headers,
         body: formData,
@@ -348,9 +497,9 @@ export const api = {
     return res.json();
   },
 
-  async getTaskAttachment(taskId: string, name: string): Promise<Blob> {
+  async getTaskAttachment(taskId: string, name: string, projectOverride?: string): Promise<Blob> {
     if (isVsCode && vscode) {
-      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getTaskAttachment', { id: taskId, name });
+      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getTaskAttachment', { id: taskId, name, ...(projectOverride ? { project: projectOverride } : {}) });
       const byteCharacters = atob(res.data);
       const byteNumbers = new Array(byteCharacters.length);
       for (let i = 0; i < byteCharacters.length; i++) {
@@ -368,7 +517,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(name)}`, {
+      res = await fetch(withProjectQuery(`/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(name)}`, projectOverride), {
         headers,
       });
     } catch {
@@ -779,11 +928,12 @@ export const api = {
     return apiFetch<RunListResponse>(`/api/runs${qs ? `?${qs}` : ''}`);
   },
 
-  async getRun(runId: string): Promise<{ ok: boolean; run: RunRecord }> {
+  async getRun(runId: string, projectOverride?: string): Promise<{ ok: boolean; run: RunRecord }> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean; run: RunRecord }>('getRun', { runId });
+      return sendVsCodeMessage<{ ok: boolean; run: RunRecord }>('getRun', { runId, ...(projectOverride ? { project: projectOverride } : {}) });
     }
-    return apiFetch<{ ok: boolean; run: RunRecord }>(`/api/runs/${encodeURIComponent(runId)}`);
+    const qs = projectOverride ? `?project=${encodeURIComponent(projectOverride)}` : '';
+    return apiFetch<{ ok: boolean; run: RunRecord }>(`/api/runs/${encodeURIComponent(runId)}${qs}`);
   },
 
   async getRunLogs(runId: string, params?: { since_offset?: number; tail?: number }): Promise<RunLogsResponse> {
@@ -919,7 +1069,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(`/api/inbox/${encodeURIComponent(id)}/attachments`, {
+      res = await fetch(withProjectQuery(`/api/inbox/${encodeURIComponent(id)}/attachments`), {
         method: 'POST',
         headers,
         body: formData,
@@ -943,9 +1093,9 @@ export const api = {
     return res.json();
   },
 
-  async getInboxAttachment(id: string, name: string): Promise<Blob> {
+  async getInboxAttachment(id: string, name: string, projectOverride?: string): Promise<Blob> {
     if (isVsCode && vscode) {
-      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getInboxAttachment', { id, name });
+      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getInboxAttachment', { id, name, ...(projectOverride ? { project: projectOverride } : {}) });
       const byteCharacters = atob(res.data);
       const byteNumbers = new Array(byteCharacters.length);
       for (let i = 0; i < byteCharacters.length; i++) {
@@ -963,7 +1113,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(`/api/inbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(name)}`, {
+      res = await fetch(withProjectQuery(`/api/inbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(name)}`, projectOverride), {
         headers,
       });
     } catch {
@@ -1409,7 +1559,7 @@ import type {
 } from './types';
 
 export interface TimelineApiExtensions {
-  getTasksGraph(filters?: { kind?: string[]; label?: string[] }): Promise<TaskGraphResponse>;
+  getTasksGraph(filters?: { kind?: string[]; label?: string[] }, projectOverride?: string | null): Promise<TaskGraphResponse>;
   previewSetPriority(taskId: string, payload: SetPriorityPayload): Promise<TaskMutationPreviewResult>;
   setPriority(taskId: string, payload: SetPriorityPayload): Promise<any>;
   previewSetSize(taskId: string, payload: SetSizePayload): Promise<TaskMutationPreviewResult>;
@@ -1419,9 +1569,9 @@ export interface TimelineApiExtensions {
 }
 
 export const timelineApi: TimelineApiExtensions = {
-  async getTasksGraph(filters?: { kind?: string[]; label?: string[] }): Promise<TaskGraphResponse> {
+  async getTasksGraph(filters?: { kind?: string[]; label?: string[] }, projectOverride?: string | null): Promise<TaskGraphResponse> {
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskGraphResponse>('getGraph', filters);
+      return sendVsCodeMessage<TaskGraphResponse>('getGraph', projectOverride ? { ...(filters || {}), project: projectOverride } : filters);
     }
     const params = new URLSearchParams();
     if (filters?.kind) {
@@ -1429,6 +1579,9 @@ export const timelineApi: TimelineApiExtensions = {
     }
     if (filters?.label) {
       filters.label.forEach((l) => params.append('label', l));
+    }
+    if (projectOverride) {
+      params.set('project', projectOverride);
     }
     const qs = params.toString();
     return apiFetch<TaskGraphResponse>(qs ? `/api/tasks/graph?${qs}` : '/api/tasks/graph');
