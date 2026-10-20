@@ -2,13 +2,14 @@ import React, { useState, useEffect } from 'react';
 import { Target, Play, Plus, Loader2 } from 'lucide-react';
 import { UseCaseItem, ValidationCampaignResult } from '../types';
 import { UseCaseDetailModal } from './UseCaseDetailModal';
-import { api } from '../api';
+import { api, useProject } from '../api';
 
 interface UseCasesManagerProps {
   onRefresh: () => void;
 }
 
 export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) => {
+  const targetProject = useProject();
   const [useCases, setUseCases] = useState<UseCaseItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedUc, setSelectedUc] = useState<UseCaseItem | null>(null);
@@ -30,9 +31,10 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) =
   const [creating, setCreating] = useState(false);
 
   const loadUseCases = async () => {
+    if (!targetProject) return;
     setLoading(true);
     try {
-      const data = await api.getUseCases(statusFilter);
+      const data = await api.getUseCases(statusFilter, targetProject);
       setUseCases(data.use_cases || []);
     } catch (e) {
       console.error(e);
@@ -42,14 +44,16 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) =
   };
 
   useEffect(() => {
-    loadUseCases();
-  }, [statusFilter]);
+    if (targetProject) {
+      loadUseCases();
+    }
+  }, [statusFilter, targetProject]);
 
   const handleQuickValidate = async (e: React.MouseEvent, ucId: string) => {
     e.stopPropagation();
     setValidatingId(ucId);
     try {
-      await api.validateUseCase(ucId, { timeout: 60 });
+      await api.validateUseCase(ucId, { timeout: 60 }, targetProject);
       await loadUseCases();
       onRefresh();
     } catch (err: any) {
@@ -63,7 +67,7 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) =
     setRunningCampaign(true);
     setCampaignReport(null);
     try {
-      const res = await api.runValidationCampaign({ timeout: 60 });
+      const res = await api.runValidationCampaign({ timeout: 60 }, targetProject);
       setCampaignReport(res);
       await loadUseCases();
       onRefresh();
@@ -92,7 +96,7 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) =
         description: newDesc,
         scenario: newScenario,
         status: 'active',
-      });
+      }, targetProject);
       setShowCreateModal(false);
       setNewId('');
       setNewTitle('');

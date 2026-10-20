@@ -16,17 +16,21 @@ import {
   SetupPlanResponse,
   SetupApplyResponse,
 } from '../types';
-import { orchestratorConfigApi } from '../api';
+import { orchestratorConfigApi, useProject } from '../api';
 
 interface SetupWizardProps {
+  project?: string | null;
   onComplete: () => void;
   onDismiss?: () => void;
 }
 
 export const SetupWizard: React.FC<SetupWizardProps> = ({
+  project,
   onComplete,
   onDismiss,
 }) => {
+  const defaultProject = useProject();
+  const targetProject = project || defaultProject;
   // Wizard state
   const [orchestrator, setOrchestrator] = useState<string>('claude');
   const [orchestratorModel, setOrchestratorModel] = useState<string>('sonnet');
@@ -62,7 +66,7 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({
         executor_model: overrides?.execM ?? executorModel,
         verification_mode: overrides?.vMode ?? verificationMode,
         scope: overrides?.sc ?? scope,
-      });
+      }, targetProject);
       setPlan(res);
       // Sync defaults if initial
       if (!overrides && res.routing) {
@@ -78,8 +82,10 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({
   };
 
   useEffect(() => {
-    fetchPlan();
-  }, []);
+    if (targetProject) {
+      fetchPlan();
+    }
+  }, [targetProject]);
 
   // Handle Apply
   const handleApply = async () => {
@@ -96,7 +102,7 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({
         executor_model: executorModel || undefined,
         verification_mode: verificationMode,
         start_orchestrator: startOrchestrator,
-      });
+      }, targetProject);
       setApplyResult(res);
       setTimeout(() => {
         onComplete();

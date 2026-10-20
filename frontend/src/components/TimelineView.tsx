@@ -13,18 +13,30 @@ import {
   TaskGraphNode,
   TaskSize,
   SharedFilterState,
+  WorkspaceProjectInfo,
+  TaskItem,
 } from '../types';
-import { api, timelineApi } from '../api';
+import { api, timelineApi, useProject } from '../api';
 import { TimelineCard } from './TimelineCard';
 import { TimelineArrows, ArrowPosition } from './TimelineArrows';
 import { TimelineReadyQueue } from './TimelineReadyQueue';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { SharedFilterBar, getStoredSharedFilters, matchTaskFilters } from './SharedFilterBar';
 import { MicrotaskQuickAdd } from './MicrotaskQuickAdd';
+import {
+  ProjectChip,
+  ConditionalBadge,
+  CoordinatesExpansionList,
+  formatTaskIdentifier,
+} from './ProjectBadges';
 
 interface TimelineViewProps {
   onSelectTask?: (task: any) => void;
   onRefresh?: () => void;
+  isCommonView?: boolean;
+  projects?: WorkspaceProjectInfo[];
+  tasks?: TaskItem[];
+  sharedFilters?: SharedFilterState;
 }
 
 const TIMELINE_SHOW_DONE_KEY = 'ai-orch:timeline-show-done';
@@ -37,16 +49,26 @@ const getStoredShowDone = (): boolean => {
   }
 };
 
-export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefresh }) => {
+export const TimelineView: React.FC<TimelineViewProps> = ({
+  onSelectTask,
+  onRefresh,
+  isCommonView = false,
+  projects = [],
+  tasks = [],
+  sharedFilters: externalFilters,
+}) => {
+  const defaultProject = useProject();
   const [graph, setGraph] = useState<TaskGraphResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!isCommonView);
   const [error, setError] = useState<string | null>(null);
   const [showDone, setShowDone] = useState<boolean>(getStoredShowDone);
   const [groupFilter, setGroupFilter] = useState<string>('all');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [filterChainOnly, setFilterChainOnly] = useState(false);
   const [highlightHeaviestChain, setHighlightHeaviestChain] = useState(true);
-  const [sharedFilters, setSharedFilters] = useState<SharedFilterState>(getStoredSharedFilters);
+  const [localFilters, setLocalFilters] = useState<SharedFilterState>(getStoredSharedFilters);
+  const sharedFilters = externalFilters || localFilters;
+  const setSharedFilters = setLocalFilters;
 
   // Confirm dialog state for priority, size, deps
   const [confirmDialogState, setConfirmDialogState] = useState<{
@@ -65,16 +87,20 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
   const [containerDimensions, setContainerDimensions] = useState({ width: 0, height: 0 });
 
   const fetchGraph = useCallback(async () => {
+    if (isCommonView) {
+      setLoading(false);
+      return;
+    }
     try {
       setError(null);
-      const res = await timelineApi.getTasksGraph();
+      const res = await timelineApi.getTasksGraph(undefined, defaultProject);
       setGraph(res);
     } catch (err: any) {
       setError(err?.message || 'Failed to load task graph');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isCommonView, defaultProject]);
 
   useEffect(() => {
     fetchGraph();
@@ -303,7 +329,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
 
   // Priority edit handler
   const handleRequestSetPriority = async (taskId: string, priority: 'P0' | 'P1' | 'P2' | 'P3', reason?: string) => {
-    const prev = await timelineApi.previewSetPriority(taskId, { priority, reason });
+    const prev = await timelineApi.previewSetPriority(taskId, { priority, reason }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Set Priority on ${taskId} to ${priority}`,
@@ -311,13 +337,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setPriority(taskId, { priority, reason, expect_task_hash: h });
+        await timelineApi.setPriority(taskId, { priority, reason, expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetPriority(taskId, { priority, reason });
+        const p = await timelineApi.previewSetPriority(taskId, { priority, reason }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -325,7 +351,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
 
   // Size edit handler
   const handleRequestSetSize = async (taskId: string, size: TaskSize) => {
-    const prev = await timelineApi.previewSetSize(taskId, { size });
+    const prev = await timelineApi.previewSetSize(taskId, { size }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Set Size on ${taskId} to ${size}`,
@@ -333,13 +359,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setSize(taskId, { size, expect_task_hash: h });
+        await timelineApi.setSize(taskId, { size, expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetSize(taskId, { size });
+        const p = await timelineApi.previewSetSize(taskId, { size }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -347,7 +373,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
 
   // Add dependency handler
   const handleRequestAddDep = async (taskId: string, depId: string) => {
-    const prev = await timelineApi.previewSetDeps(taskId, { add: [depId] });
+    const prev = await timelineApi.previewSetDeps(taskId, { add: [depId] }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Add Dependency: ${depId} → ${taskId}`,
@@ -355,13 +381,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setDeps(taskId, { add: [depId], expect_task_hash: h });
+        await timelineApi.setDeps(taskId, { add: [depId], expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetDeps(taskId, { add: [depId] });
+        const p = await timelineApi.previewSetDeps(taskId, { add: [depId] }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -369,7 +395,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
 
   // Remove dependency handler
   const handleRequestRemoveDep = async (taskId: string, depId: string) => {
-    const prev = await timelineApi.previewSetDeps(taskId, { remove: [depId] });
+    const prev = await timelineApi.previewSetDeps(taskId, { remove: [depId] }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Remove Dependency: ${depId} → ${taskId}`,
@@ -377,13 +403,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setDeps(taskId, { remove: [depId], expect_task_hash: h });
+        await timelineApi.setDeps(taskId, { remove: [depId], expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetDeps(taskId, { remove: [depId] });
+        const p = await timelineApi.previewSetDeps(taskId, { remove: [depId] }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -395,6 +421,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
       // Pass standard task item structure so BacklogManager can open TaskDetailModal
       onSelectTask({
         id: node.id,
+        project: defaultProject || undefined,
         title: node.title,
         state: node.state,
         priority: node.priority,
@@ -587,17 +614,179 @@ export const TimelineView: React.FC<TimelineViewProps> = ({ onSelectTask, onRefr
       </div>
 
       {/* Shared Filter Bar */}
-      <div style={{ padding: '0.5rem 1rem 0' }}>
-        <SharedFilterBar
-          filters={sharedFilters}
-          onChange={setSharedFilters}
-          style={{ marginBottom: 0 }}
-        />
-      </div>
+      {!externalFilters && (
+        <div style={{ padding: '0.5rem 1rem 0' }}>
+          <SharedFilterBar
+            filters={sharedFilters}
+            onChange={setSharedFilters}
+            style={{ marginBottom: 0 }}
+          />
+        </div>
+      )}
 
       {/* Main Workspace Body */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative' }}>
-        {loading && !graph ? (
+        {isCommonView ? (
+          <div
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '1.25rem',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '1rem',
+            }}
+          >
+            {/* Cross-project coordinates summary if any _workspace tasks have coordinates */}
+            {tasks.some((t) => t.project === '_workspace' && t.coordinates && t.coordinates.length > 0) && (
+              <div
+                style={{
+                  backgroundColor: '#1e293b',
+                  border: '1px solid #4f46e5',
+                  borderRadius: '0.5rem',
+                  padding: '0.85rem 1rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.5rem',
+                }}
+              >
+                <div style={{ fontSize: '0.85rem', fontWeight: 700, color: '#c7d2fe' }}>
+                  Workspace Coordination Edges (coordinates:)
+                </div>
+                {tasks
+                  .filter((t) => t.project === '_workspace' && t.coordinates && t.coordinates.length > 0)
+                  .map((wt) => (
+                    <div
+                      key={wt.qualified_id || wt.id}
+                      onClick={() => onSelectTask?.(wt)}
+                      style={{
+                        padding: '0.5rem 0.75rem',
+                        backgroundColor: '#0f172a',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #334155',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem', fontWeight: 600, color: '#f8fafc' }}>
+                        <ProjectChip project="_workspace" size="xs" />
+                        <span style={{ fontFamily: 'monospace', color: '#818cf8' }}>{formatTaskIdentifier(wt, true)}</span>
+                        <span>— {wt.title}</span>
+                      </div>
+                      <CoordinatesExpansionList coordinates={wt.coordinates} compact={true} />
+                    </div>
+                  ))}
+              </div>
+            )}
+
+            {/* One lane per project */}
+            {(projects.length > 0
+              ? projects.map((p) => p.id)
+              : Array.from(new Set(tasks.map((t) => t.project || '_workspace')))
+            )
+              .filter((projId) =>
+                !sharedFilters.projects || sharedFilters.projects.length === 0 || sharedFilters.projects.includes(projId)
+              )
+              .map((projId) => {
+                const laneTasks = tasks.filter((t) => {
+                  if ((t.project || '_workspace') !== projId) return false;
+                  const isClosed = t.state === 'done' || t.state === 'done with a caveat' || t.state === 'dropped';
+                  if (!showDone && isClosed) return false;
+                  if (!matchTaskFilters(t, sharedFilters)) return false;
+                  return true;
+                });
+
+                return (
+                  <div
+                    key={projId}
+                    style={{
+                      backgroundColor: '#1e293b',
+                      border: '1px solid #334155',
+                      borderRadius: '0.5rem',
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        padding: '0.6rem 1rem',
+                        backgroundColor: '#0f172a',
+                        borderBottom: '1px solid #334155',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <ProjectChip project={projId} size="sm" />
+                        <span style={{ fontSize: '0.8rem', color: '#94a3b8' }}>
+                          Project Lane ({laneTasks.length} task{laneTasks.length === 1 ? '' : 's'})
+                        </span>
+                      </div>
+                    </div>
+
+                    {laneTasks.length === 0 ? (
+                      <div style={{ padding: '1rem', fontSize: '0.8rem', color: '#64748b', fontStyle: 'italic' }}>
+                        No visible tasks in this project lane.
+                      </div>
+                    ) : (
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+                          gap: '0.65rem',
+                          padding: '0.75rem',
+                        }}
+                      >
+                        {laneTasks.map((lt) => (
+                          <div
+                            key={lt.qualified_id || `${lt.project}-${lt.id}`}
+                            onClick={() => onSelectTask?.(lt)}
+                            style={{
+                              backgroundColor: '#0f172a',
+                              border: '1px solid #334155',
+                              borderRadius: '0.375rem',
+                              padding: '0.6rem 0.75rem',
+                              cursor: 'pointer',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '0.3rem',
+                            }}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.35rem' }}>
+                              <span style={{ fontFamily: 'monospace', fontSize: '0.75rem', fontWeight: 700, color: '#38bdf8' }}>
+                                {formatTaskIdentifier(lt, true)}
+                              </span>
+                              <span
+                                style={{
+                                  fontSize: '0.65rem',
+                                  fontWeight: 700,
+                                  padding: '0.08rem 0.3rem',
+                                  borderRadius: '0.2rem',
+                                  backgroundColor: lt.priority === 'P0' ? '#ef4444' : lt.priority === 'P1' ? '#f59e0b' : '#64748b',
+                                  color: '#fff',
+                                }}
+                              >
+                                {lt.priority}
+                              </span>
+                            </div>
+                            <div style={{ fontSize: '0.8rem', color: '#f8fafc', fontWeight: 500 }}>
+                              {lt.title}
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.35rem', marginTop: '0.2rem' }}>
+                              <span style={{ fontSize: '0.7rem', color: '#94a3b8' }}>{lt.state}</span>
+                              <ConditionalBadge conditional={lt.conditional} conditions={lt.conditions} size="xs" />
+                            </div>
+                            {lt.project === '_workspace' && lt.coordinates && lt.coordinates.length > 0 && (
+                              <CoordinatesExpansionList coordinates={lt.coordinates} compact={true} />
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+        ) : loading && !graph ? (
           <div
             style={{
               flex: 1,

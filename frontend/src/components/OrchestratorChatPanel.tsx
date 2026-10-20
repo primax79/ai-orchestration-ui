@@ -25,7 +25,7 @@ import {
   OrchestratorTurn,
   ProposedAction,
 } from '../types';
-import { api, orchestratorChatApi, proposedActionsApi } from '../api';
+import { api, orchestratorChatApi, proposedActionsApi, useProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { ConfirmDialog } from './ConfirmDialog';
 
@@ -49,6 +49,7 @@ const sortTurnsChronologically = (list: OrchestratorTurn[]): OrchestratorTurn[] 
 };
 
 export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ onNavigateTab: _onNavigateTab }) => {
+  const targetProject = useProject();
   const [status, setStatus] = useState<OrchestratorStatus | null>(null);
   const [turns, setTurns] = useState<OrchestratorTurn[]>([]);
   const [proposedActions, setProposedActions] = useState<ProposedAction[]>([]);
@@ -73,11 +74,12 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
 
   // Load Status, Conversation & Proposed Actions
   const loadData = useCallback(async () => {
+    if (!targetProject) return;
     try {
       const [stRes, convRes, propRes] = await Promise.all([
-        orchestratorChatApi.getOrchestratorStatus(),
-        orchestratorChatApi.getOrchestratorConversation({ limit: 100, order: 'asc' }),
-        api.getProposedActions(),
+        orchestratorChatApi.getOrchestratorStatus(targetProject),
+        orchestratorChatApi.getOrchestratorConversation({ limit: 100, order: 'asc' }, targetProject),
+        api.getProposedActions(targetProject),
       ]);
       setStatus(stRes);
       setTurns(sortTurnsChronologically(convRes.turns || []));
@@ -87,7 +89,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [targetProject]);
 
   useEffect(() => {
     loadData();
@@ -167,7 +169,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     setTurns((prev) => sortTurnsChronologically([...prev, optimisticTurn]));
 
     try {
-      await orchestratorChatApi.postOrchestratorChat(trimmed);
+      await orchestratorChatApi.postOrchestratorChat(trimmed, undefined, targetProject);
       await loadData();
     } catch (err: any) {
       // Refresh to get real state
@@ -190,9 +192,9 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     setActionLoading(true);
     try {
       if (status.status === 'paused') {
-        await orchestratorChatApi.resumeOrchestrator();
+        await orchestratorChatApi.resumeOrchestrator(targetProject);
       } else {
-        await orchestratorChatApi.pauseOrchestrator();
+        await orchestratorChatApi.pauseOrchestrator(targetProject);
       }
       await loadData();
     } catch {
@@ -205,7 +207,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
   const handleRotateConfirm = async () => {
     setActionLoading(true);
     try {
-      await orchestratorChatApi.rotateOrchestrator({ reason: 'owner_requested', no_handoff: false });
+      await orchestratorChatApi.rotateOrchestrator({ reason: 'owner_requested', no_handoff: false }, targetProject);
       await loadData();
     } catch {
       // Ignore
@@ -219,7 +221,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     if (!turnToCancel) return;
     setActionLoading(true);
     try {
-      await orchestratorChatApi.cancelOrchestratorTurn(turnToCancel);
+      await orchestratorChatApi.cancelOrchestratorTurn(turnToCancel, targetProject);
       await loadData();
     } catch {
       // Ignore
@@ -240,7 +242,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     try {
       const res = await proposedActionsApi.confirmProposedAction(act.action_id, {
         expect_hash: act.action_hash,
-      });
+      }, targetProject);
       setProposalActionStatus((prev) => ({
         ...prev,
         [act.action_id]: {
@@ -249,7 +251,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
         },
       }));
       setConfirmProposal(null);
-      const propRes = await api.getProposedActions();
+      const propRes = await api.getProposedActions(targetProject);
       setProposedActions(propRes.proposed_actions || []);
     } catch (err: any) {
       setProposalActionStatus((prev) => ({
@@ -273,7 +275,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
     try {
       const res = await proposedActionsApi.rejectProposedAction(act.action_id, {
         reason: rejectReason.trim(),
-      });
+      }, targetProject);
       setProposalActionStatus((prev) => ({
         ...prev,
         [act.action_id]: {
@@ -283,7 +285,7 @@ export const OrchestratorChatPanel: React.FC<OrchestratorChatPanelProps> = ({ on
       }));
       setRejectProposal(null);
       setRejectReason('');
-      const propRes = await api.getProposedActions();
+      const propRes = await api.getProposedActions(targetProject);
       setProposedActions(propRes.proposed_actions || []);
     } catch (err: any) {
       setProposalActionStatus((prev) => ({

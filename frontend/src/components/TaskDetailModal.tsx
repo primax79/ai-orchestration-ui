@@ -20,7 +20,7 @@ import {
   Edit2,
 } from 'lucide-react';
 import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord, TreeNode, StructurePlanItem, TaskState, shortTitle } from '../types';
-import { api, taskStructureApi } from '../api';
+import { api, taskStructureApi, useProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
 import { TaskRunsPanel } from './TaskRunsPanel';
@@ -35,12 +35,20 @@ import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { LabelEditorModal } from './LabelEditorModal';
 import { PromoteDialog } from './PromoteDialog';
+import {
+  ProjectChip,
+  ConditionalBadge,
+  PlacementWarningChip,
+  CoordinatesExpansionList,
+  getPlacementWarnings,
+} from './ProjectBadges';
 import { ArrowUpRight } from 'lucide-react';
 
 interface TaskDetailModalProps {
   task: TaskItem;
   tree?: Record<string, TreeNode>;
   onSelectTask?: (task: TaskItem) => void;
+  onSelectCoordTarget?: (project: string, taskId: string) => void;
   initialRunId?: string;
   onClose: () => void;
   onActionComplete: () => void;
@@ -87,6 +95,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   task,
   tree,
   onSelectTask,
+  onSelectCoordTarget,
   initialRunId,
   onClose,
   onActionComplete,
@@ -94,7 +103,9 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   onRequestSyncIndex,
   onNavigateToDecisions,
 }) => {
+  const defaultProject = useProject();
   const [currentTask, setCurrentTask] = useState<TaskItem>(task);
+  const taskProject = currentTask.project || task.project || defaultProject;
   const [taskRuns, setTaskRuns] = useState<RunRecord[]>([]);
   const [runsRefreshTrigger, setRunsRefreshTrigger] = useState<number>(0);
   const [activeRunId, setActiveRunId] = useState<string | undefined>(initialRunId);
@@ -280,7 +291,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     try {
       const prevRes = await api.previewSetShortTitle(currentTask.id, {
         short_title: trimmed,
-      });
+      }, taskProject);
       if (!prevRes.ok) {
         throw new Error(prevRes.error || 'Preview failed');
       }
@@ -288,7 +299,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       const applyRes = await api.setShortTitle(currentTask.id, {
         short_title: trimmed,
         expect_plan_hash: planHash,
-      });
+      }, taskProject);
       if (!applyRes.ok) {
         throw new Error(applyRes.error || 'Failed to save short title');
       }
@@ -317,7 +328,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         title: subtaskTitle.trim(),
         kind: subtaskKind,
         short_title: subtaskShortTitle.trim() || undefined,
-      });
+      }, taskProject);
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
       }
@@ -340,7 +351,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
 
   const handlePreviewExpand = async () => {
     try {
-      const res = await taskStructureApi.previewExpandTask(currentTask.id);
+      const res = await taskStructureApi.previewExpandTask(currentTask.id, taskProject);
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
       }
@@ -359,7 +370,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
 
   const handlePreviewCollapse = async () => {
     try {
-      const res = await taskStructureApi.previewCollapseTask(currentTask.id);
+      const res = await taskStructureApi.previewCollapseTask(currentTask.id, taskProject);
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
       }
@@ -387,11 +398,11 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         kind: extraPayload.kind,
         short_title: extraPayload.short_title,
         expect_plan_hash: hash,
-      });
+      }, taskProject);
     } else if (actionType === 'expand') {
-      await taskStructureApi.expandTask(currentTask.id, { expect_plan_hash: hash });
+      await taskStructureApi.expandTask(currentTask.id, { expect_plan_hash: hash }, taskProject);
     } else if (actionType === 'collapse') {
-      await taskStructureApi.collapseTask(currentTask.id, { expect_plan_hash: hash });
+      await taskStructureApi.collapseTask(currentTask.id, { expect_plan_hash: hash }, taskProject);
     }
 
     setStructureConfirmData(null);
@@ -421,7 +432,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         const info = getAttachmentInfo(name, currentTask.attachment_details);
         if (info.class === 'image') {
           try {
-            const blob = await api.getTaskAttachment(currentTask.id, name);
+            const blob = await api.getTaskAttachment(currentTask.id, name, taskProject);
             if (!active) return;
             const url = URL.createObjectURL(blob);
             urlsToRevoke.push(url);
@@ -442,14 +453,14 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       active = false;
       urlsToRevoke.forEach((u) => URL.revokeObjectURL(u));
     };
-  }, [currentTask.id, currentTask.bundle_sha256, isEmergentTask, currentTask.attachments]);
+  }, [currentTask.id, currentTask.bundle_sha256, isEmergentTask, currentTask.attachments, taskProject]);
 
   const handleUploadTaskFile = async (file: File) => {
     if (!isEmergentTask) return;
     try {
       setIsUploadingAttachment(true);
       setAttachmentError(null);
-      await api.uploadTaskAttachment(currentTask.id, file, file.name, currentTask.bundle_sha256);
+      await api.uploadTaskAttachment(currentTask.id, file, file.name, currentTask.bundle_sha256, taskProject);
       await reloadTaskDetailAndState();
       onActionComplete();
     } catch (err: any) {
@@ -466,7 +477,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     try {
       setIsUploadingAttachment(true);
       setAttachmentError(null);
-      await api.deleteTaskAttachment(currentTask.id, name, currentTask.bundle_sha256);
+      await api.deleteTaskAttachment(currentTask.id, name, currentTask.bundle_sha256, taskProject);
       await reloadTaskDetailAndState();
       onActionComplete();
     } catch (err: any) {
@@ -477,7 +488,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   };
 
   const handleDownloadTaskPdf = (name: string) => {
-    downloadAttachmentBlob(() => api.getTaskAttachment(currentTask.id, name), name).catch((err) => {
+    downloadAttachmentBlob(() => api.getTaskAttachment(currentTask.id, name, taskProject), name).catch((err) => {
       setAttachmentError(`Failed to download ${name}: ${err?.message || err}`);
     });
   };
@@ -495,39 +506,52 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
 
   const reloadTaskDetailAndState = useCallback(async () => {
     try {
-      const data = await api.getTaskDetail(task.id);
+      const data = await api.getTaskDetail(task.id, taskProject);
       setDetail(data);
     } catch (e: any) {
       setTransitionError(`Failed to load task specification: ${e.message}`);
     }
 
     try {
-      const res = await api.getTasks();
+      const res = await api.getTasks(undefined, taskProject);
       const all = res?.all_tasks || res?.emergent_tasks || [];
       const updated = all.find((t: TaskItem) => t.id === task.id);
       if (updated) {
-        setCurrentTask(updated);
+        setCurrentTask((prev) => ({
+          ...prev,
+          ...updated,
+          project: updated.project || taskProject || prev.project,
+          coordinates:
+            updated.coordinates && updated.coordinates.length > 0
+              ? updated.coordinates
+              : prev.coordinates,
+          conditional: updated.conditional || prev.conditional,
+          conditions:
+            updated.conditions && updated.conditions.length > 0
+              ? updated.conditions
+              : prev.conditions,
+        }));
       }
     } catch {
       // non-blocking
     }
-  }, [task.id]);
+  }, [task.id, taskProject]);
 
   const loadTaskRuns = useCallback(async () => {
     try {
-      const res = await api.listRuns({ task: task.id });
+      const res = await api.listRuns({ task: task.id }, taskProject);
       setTaskRuns(res.runs || []);
       return res.runs || [];
     } catch {
       return [];
     }
-  }, [task.id]);
+  }, [task.id, taskProject]);
 
   useEffect(() => {
     reloadTaskDetailAndState();
     loadTaskRuns();
     loadQuestions();
-  }, [task.id, reloadTaskDetailAndState, loadTaskRuns]);
+  }, [task.id, taskProject, reloadTaskDetailAndState, loadTaskRuns]);
 
   // WebSocket listener debounced 300ms on changed runs or tasks
   useEffect(() => {
@@ -564,7 +588,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const loadQuestions = async () => {
     setQuestionsLoading(true);
     try {
-      const res = await api.getQuestions({ blocks: task.id });
+      const res = await api.getQuestions({ blocks: task.id }, taskProject);
       if (res && res.questions) {
         setTaskQuestions(res.questions);
       } else {
@@ -654,7 +678,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         decider: 'owner',
         asked_by: 'owner',
       };
-      await api.askQuestion(payload);
+      await api.askQuestion(payload, taskProject);
       setShowAskForm(false);
       setAskQuestionText('');
       setAskQuestionShortTitle('');
@@ -679,7 +703,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     setLoading(true);
     setTransitionError(null);
     try {
-      const res = await api.transitionTask(task.id, newState, 'operator', verifier, reason);
+      const res = await api.transitionTask(task.id, newState, 'operator', verifier, reason, undefined, taskProject);
       if (res && res.index_in_sync === false) {
         setIndexOutOfSync(true);
         onIndexOutOfSync?.();
@@ -798,6 +822,9 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               }}>
                 {currentTask.priority}
               </span>
+              {currentTask.project && (
+                <ProjectChip project={currentTask.project} size="xs" />
+              )}
               <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#818cf8' }}>{currentTask.id}</span>
               {!isEditingShortTitle ? (
                 <span
@@ -926,6 +953,8 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               }}>
                 {currentTask.state}
               </span>
+              <ConditionalBadge conditional={currentTask.conditional} conditions={currentTask.conditions} size="xs" />
+              <PlacementWarningChip warnings={getPlacementWarnings(currentTask)} size="xs" />
 
               {/* Promote button if microtask */}
               {currentTask.category === 'micro' && (
@@ -1059,6 +1088,23 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
               </div>
             </div>
           </div>
+
+          {(currentTask.coordinates?.length || (currentTask as any).coordinates_refs?.length) ? (
+            <div style={{ marginBottom: '1.25rem' }}>
+              <CoordinatesExpansionList
+                coordinates={currentTask.coordinates}
+                task={currentTask}
+                onSelectTarget={
+                  onSelectCoordTarget
+                    ? (proj, tid) => {
+                        onClose();
+                        onSelectCoordTarget(proj, tid);
+                      }
+                    : undefined
+                }
+              />
+            </div>
+          ) : null}
 
           {/* Handoff prompt box */}
           {currentTask.handoff && (
@@ -1375,7 +1421,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                     <AttachmentItem
                       key={name}
                       name={name}
-                      context={{ type: 'task', id: currentTask.id }}
+                      context={{ type: 'task', id: currentTask.id, project: taskProject }}
                       details={currentTask.attachment_details}
                       thumbnailSize={64}
                       canRemove={true}
@@ -1936,6 +1982,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           {/* Agent Runs Panel */}
           <TaskRunsPanel
             task={currentTask}
+            project={taskProject}
             initialRunId={activeRunId || initialRunId}
             refreshTrigger={runsRefreshTrigger}
             onRunsLoaded={(loadedRuns) => setTaskRuns(loadedRuns)}
@@ -2314,6 +2361,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       {showRunDialog && (
         <RunDialog
           isOpen={true}
+          project={taskProject}
           task={currentTask}
           onClose={() => setShowRunDialog(false)}
           onRunStarted={async (newRunId) => {
@@ -2331,7 +2379,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         <TextViewerModal
           filename={viewingTextAttachment.filename}
           size={viewingTextAttachment.size}
-          fetchContent={() => api.getTaskAttachment(currentTask.id, viewingTextAttachment.filename)}
+          fetchContent={() => api.getTaskAttachment(currentTask.id, viewingTextAttachment.filename, taskProject)}
           onClose={() => setViewingTextAttachment(null)}
         />
       )}
@@ -2519,6 +2567,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       {showLabelEditor && (
         <LabelEditorModal
           taskId={currentTask.id}
+          project={taskProject}
           initialLabels={currentTask.labels}
           taskHash={currentTask.task_bundle_sha256}
           isOpen={true}
@@ -2535,6 +2584,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
       {showPromoteDialog && (
         <PromoteDialog
           taskId={currentTask.id}
+          project={taskProject}
           taskTitle={currentTask.title}
           taskHash={currentTask.task_bundle_sha256}
           isOpen={true}

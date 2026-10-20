@@ -20,7 +20,7 @@ import {
   TriggerFiring,
   ProposedAction,
 } from '../types';
-import { api, proposedActionsApi } from '../api';
+import { api, proposedActionsApi, useProject } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
 
 interface TriggersPageProps {
@@ -28,6 +28,7 @@ interface TriggersPageProps {
 }
 
 export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNavigateTab }) => {
+  const targetProject = useProject();
   const [triggersData, setTriggersData] = useState<TriggersListResponse | null>(null);
   const [statusData, setStatusData] = useState<TriggersStatusResponse | null>(null);
   const [history, setHistory] = useState<TriggerFiring[]>([]);
@@ -61,13 +62,14 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
   });
 
   const loadAll = useCallback(async () => {
+    if (!targetProject) return;
     setLoading(true);
     try {
       const [trigs, status, hist, props] = await Promise.all([
-        api.getTriggers(),
-        api.getTriggersStatus(),
-        api.getTriggersHistory({ limit: 30 }),
-        api.getProposedActions(),
+        api.getTriggers(targetProject),
+        api.getTriggersStatus(undefined, targetProject),
+        api.getTriggersHistory({ limit: 30 }, targetProject),
+        api.getProposedActions(targetProject),
       ]);
       setTriggersData(trigs);
       setStatusData(status);
@@ -78,7 +80,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [targetProject]);
 
   const handleConfirmProposal = async () => {
     if (!confirmProposal) return;
@@ -90,7 +92,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
     try {
       const res = await proposedActionsApi.confirmProposedAction(act.action_id, {
         expect_hash: act.action_hash,
-      });
+      }, targetProject);
       setProposalActionStatus((prev) => ({
         ...prev,
         [act.action_id]: {
@@ -99,7 +101,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
         },
       }));
       setConfirmProposal(null);
-      const propRes = await api.getProposedActions();
+      const propRes = await api.getProposedActions(targetProject);
       setProposedActions(propRes.proposed_actions || []);
     } catch (err: any) {
       setProposalActionStatus((prev) => ({
@@ -123,7 +125,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
     try {
       const res = await proposedActionsApi.rejectProposedAction(act.action_id, {
         reason: rejectReason.trim(),
-      });
+      }, targetProject);
       setProposalActionStatus((prev) => ({
         ...prev,
         [act.action_id]: {
@@ -133,7 +135,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
       }));
       setRejectProposal(null);
       setRejectReason('');
-      const propRes = await api.getProposedActions();
+      const propRes = await api.getProposedActions(targetProject);
       setProposedActions(propRes.proposed_actions || []);
     } catch (err: any) {
       setProposalActionStatus((prev) => ({
@@ -166,7 +168,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
   }) => {
     setActionLoading(true);
     try {
-      const previewRes = await api.previewToggleTrigger(options);
+      const previewRes = await api.previewToggleTrigger(options, targetProject);
       const isKillSwitch = options.kill_switch !== undefined;
       const targetName = isKillSwitch
         ? 'Global Triggers Kill Switch'
@@ -197,7 +199,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
       await api.toggleTrigger({
         ...confirmDialog.pendingToggle,
         expect_hash: confirmDialog.expectHash,
-      });
+      }, targetProject);
       setConfirmDialog((prev) => ({ ...prev, open: false }));
       await loadAll();
     } catch (e: any) {
@@ -210,7 +212,7 @@ export const TriggersPage: React.FC<TriggersPageProps> = ({ onNavigateTab: _onNa
   const handleRunOnce = async (dryRun = false) => {
     setActionLoading(true);
     try {
-      const res = await api.runTriggersOnce({ dry_run: dryRun });
+      const res = await api.runTriggersOnce({ dry_run: dryRun }, targetProject);
       alert(
         `Triggers run-once complete:\nStatus: ${res.status || 'ok'}\nEvents processed: ${
           res.events_processed ?? res.count ?? 0

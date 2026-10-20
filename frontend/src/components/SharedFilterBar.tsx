@@ -6,11 +6,13 @@ import {
   Tag,
   ChevronDown,
   RotateCcw,
+  FolderGit2,
 } from 'lucide-react';
-import { TaskKind, TaskState, SharedFilterState, LabelsResponse, LabelCountItem } from '../types';
+import { TaskKind, TaskState, SharedFilterState, LabelsResponse, LabelCountItem, WorkspaceProjectInfo } from '../types';
 import { KindBadge, KIND_CONFIGS } from './KindBadge';
 import { LabelChip } from './LabelChip';
-import { microtaskAndLabelsApi } from '../api';
+import { ProjectChip } from './ProjectBadges';
+import { microtaskAndLabelsApi, useProjectContext } from '../api';
 
 const SHARED_FILTERS_KEY = 'ai-orch:shared-filters';
 
@@ -21,6 +23,8 @@ export const DEFAULT_SHARED_FILTERS: SharedFilterState = {
   states: [],
   priority: 'all',
   groupByLabel: false,
+  projects: [],
+  groupByProject: false,
 };
 
 export const getStoredSharedFilters = (): SharedFilterState => {
@@ -36,6 +40,8 @@ export const getStoredSharedFilters = (): SharedFilterState => {
           states: Array.isArray(parsed.states) ? parsed.states : [],
           priority: parsed.priority || 'all',
           groupByLabel: Boolean(parsed.groupByLabel),
+          projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+          groupByProject: Boolean(parsed.groupByProject),
         };
       }
     }
@@ -57,6 +63,8 @@ interface SharedFilterBarProps {
   filters: SharedFilterState;
   onChange: (nextFilters: SharedFilterState) => void;
   availableLabels?: string[];
+  availableProjects?: WorkspaceProjectInfo[];
+  showProjectControls?: boolean;
   showGroupByLabel?: boolean;
   style?: React.CSSProperties;
 }
@@ -65,25 +73,65 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
   filters,
   onChange,
   availableLabels = [],
+  availableProjects = [],
+  showProjectControls = false,
   showGroupByLabel = false,
   style,
 }) => {
+  const { selectedProject, fallbackProject, isCommonView, projects: ctxProjects } = useProjectContext();
   const [showLabelDropdown, setShowLabelDropdown] = useState(false);
   const [showStateDropdown, setShowStateDropdown] = useState(false);
-  const [repoLabels, setRepoLabels] = useState<string[]>(availableLabels);
+  const [showProjectDropdown, setShowProjectDropdown] = useState(false);
+  const [fetchedLabels, setFetchedLabels] = useState<string[]>([]);
+
+  const projsToQuery = availableProjects.length > 0 ? availableProjects : ctxProjects;
+  const projectIdsKey = projsToQuery.map((p) => p.id).join(',');
 
   useEffect(() => {
     let isMounted = true;
-    microtaskAndLabelsApi.getLabels().then((res: LabelsResponse) => {
-      if (isMounted && res && Array.isArray(res.labels)) {
-        const set = new Set([...availableLabels, ...res.labels.map((l: LabelCountItem) => l.label)]);
-        setRepoLabels(Array.from(set).sort());
-      }
-    }).catch(() => {});
+    const isCommon = showProjectControls || isCommonView;
+    if (isCommon && projsToQuery.length > 0) {
+      Promise.all(
+        projsToQuery.map((p) =>
+          microtaskAndLabelsApi.getLabels(p.id).catch(() => ({ ok: false, labels: [] as LabelCountItem[] }))
+        )
+      )
+        .then((results) => {
+          if (!isMounted) return;
+          const set = new Set<string>();
+          results.forEach((res) => {
+            if (res && Array.isArray(res.labels)) {
+              res.labels.forEach((l: LabelCountItem) => set.add(l.label));
+            }
+          });
+          setFetchedLabels(Array.from(set).sort());
+        })
+        .catch(() => {});
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    const targetProj = selectedProject || fallbackProject;
+    if (!targetProj) {
+      return () => {
+        isMounted = false;
+      };
+    }
+    microtaskAndLabelsApi
+      .getLabels(targetProj)
+      .then((res: LabelsResponse) => {
+        if (isMounted && res && Array.isArray(res.labels)) {
+          setFetchedLabels(res.labels.map((l: LabelCountItem) => l.label));
+        }
+      })
+      .catch(() => {});
     return () => {
       isMounted = false;
     };
-  }, [availableLabels]);
+  }, [selectedProject, fallbackProject, isCommonView, showProjectControls, projectIdsKey]);
+
+  const repoLabels = Array.from(new Set([...availableLabels, ...fetchedLabels])).sort();
 
   const updateFilters = (patch: Partial<SharedFilterState>) => {
     const next = { ...filters, ...patch };
@@ -98,16 +146,27 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
       labels: [],
       states: [],
       priority: 'all',
+      projects: [],
     });
   };
+
+  const selectedProjects = filters.projects || [];
 
   const hasActiveFilters = Boolean(
     filters.search ||
     filters.kinds.length > 0 ||
     filters.labels.length > 0 ||
     filters.states.length > 0 ||
-    (filters.priority && filters.priority !== 'all')
+    (filters.priority && filters.priority !== 'all') ||
+    (showProjectControls && selectedProjects.length > 0)
   );
+
+  const toggleProject = (projId: string) => {
+    const nextProjects = selectedProjects.includes(projId)
+      ? selectedProjects.filter((p) => p !== projId)
+      : [...selectedProjects, projId];
+    updateFilters({ projects: nextProjects });
+  };
 
   const toggleKind = (kind: TaskKind) => {
     const nextKinds = filters.kinds.includes(kind)
@@ -245,8 +304,117 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
           </div>
         </div>
 
-        {/* Right Side: Labels Dropdown, State Dropdown, Clear */}
+        {/* Right Side: Project Dropdown, Labels Dropdown, State Dropdown, Group toggles, Clear */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', flexWrap: 'wrap' }}>
+          {/* Project Multi-Select Dropdown (Common View) */}
+          {showProjectControls && availableProjects.length > 0 && (
+            <div style={{ position: 'relative' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowProjectDropdown((v) => !v);
+                  setShowLabelDropdown(false);
+                  setShowStateDropdown(false);
+                }}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.25rem 0.55rem',
+                  borderRadius: '0.375rem',
+                  border: `1px solid ${selectedProjects.length > 0 ? '#10b981' : '#334155'}`,
+                  backgroundColor: selectedProjects.length > 0 ? 'rgba(16, 185, 129, 0.15)' : '#0f172a',
+                  color: selectedProjects.length > 0 ? '#6ee7b7' : '#cbd5e1',
+                  cursor: 'pointer',
+                  fontSize: '0.75rem',
+                  fontWeight: 500,
+                }}
+              >
+                <FolderGit2 size={13} color={selectedProjects.length > 0 ? '#10b981' : '#94a3b8'} />
+                <span>Projects {selectedProjects.length > 0 ? `(${selectedProjects.length})` : ''}</span>
+                <ChevronDown size={12} />
+              </button>
+
+              {showProjectDropdown && (
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    position: 'absolute',
+                    top: '100%',
+                    right: 0,
+                    marginTop: '0.35rem',
+                    backgroundColor: '#0f172a',
+                    border: '1px solid #334155',
+                    borderRadius: '0.375rem',
+                    padding: '0.5rem',
+                    zIndex: 50,
+                    minWidth: '220px',
+                    maxHeight: '260px',
+                    overflowY: 'auto',
+                    boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+                  }}
+                >
+                  <div style={{ fontSize: '0.72rem', color: '#94a3b8', fontWeight: 600, marginBottom: '0.4rem', borderBottom: '1px solid #1e293b', paddingBottom: '0.3rem' }}>
+                    Filter by project
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                    {availableProjects.map((proj) => {
+                      const selected = selectedProjects.includes(proj.id);
+                      return (
+                        <div
+                          key={proj.id}
+                          onClick={() => toggleProject(proj.id)}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '0.25rem 0.4rem',
+                            borderRadius: '0.25rem',
+                            backgroundColor: selected ? 'rgba(16, 185, 129, 0.15)' : 'transparent',
+                            cursor: 'pointer',
+                          }}
+                        >
+                          <ProjectChip project={proj.id} kind={proj.kind} size="xs" />
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => {}}
+                            style={{ cursor: 'pointer' }}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Group by project toggle (Common View) */}
+          {showProjectControls && (
+            <button
+              type="button"
+              onClick={() => updateFilters({ groupByProject: !filters.groupByProject })}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                padding: '0.25rem 0.55rem',
+                borderRadius: '0.375rem',
+                border: `1px solid ${filters.groupByProject ? '#10b981' : '#334155'}`,
+                backgroundColor: filters.groupByProject ? 'rgba(16, 185, 129, 0.2)' : '#0f172a',
+                color: filters.groupByProject ? '#d1fae5' : '#cbd5e1',
+                cursor: 'pointer',
+                fontSize: '0.75rem',
+                fontWeight: 600,
+              }}
+              title="Group tasks by project"
+            >
+              <FolderGit2 size={12} color={filters.groupByProject ? '#34d399' : '#94a3b8'} />
+              <span>Group by Project</span>
+            </button>
+          )}
+
           {/* Labels Dropdown Trigger */}
           <div style={{ position: 'relative' }}>
             <button
@@ -491,7 +659,10 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
 export function matchTaskFilters(
   task: {
     id: string;
+    project?: string;
+    qualified_id?: string;
     title: string;
+    short_title?: string;
     kind?: string;
     labels?: string[];
     state?: string;
@@ -502,14 +673,24 @@ export function matchTaskFilters(
   },
   filters: SharedFilterState
 ): boolean {
+  // Project filter
+  if (filters.projects && filters.projects.length > 0 && task.project) {
+    if (!filters.projects.includes(task.project)) {
+      return false;
+    }
+  }
+
   // Text search
   if (filters.search) {
     const q = filters.search.toLowerCase();
     const idMatch = task.id.toLowerCase().includes(q);
+    const qidMatch = (task.qualified_id || '').toLowerCase().includes(q);
+    const projMatch = (task.project || '').toLowerCase().includes(q);
     const titleMatch = task.title.toLowerCase().includes(q);
+    const shortMatch = (task.short_title || '').toLowerCase().includes(q);
     const catMatch = (task.category || task.group || '').toLowerCase().includes(q);
     const execMatch = (task.executor || '').toLowerCase().includes(q);
-    if (!idMatch && !titleMatch && !catMatch && !execMatch) {
+    if (!idMatch && !qidMatch && !projMatch && !titleMatch && !shortMatch && !catMatch && !execMatch) {
       return false;
     }
   }

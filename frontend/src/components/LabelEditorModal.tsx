@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Tag, Plus, X, Loader2, AlertCircle, Check } from 'lucide-react';
-import { microtaskAndLabelsApi } from '../api';
+import { microtaskAndLabelsApi, useProject } from '../api';
 import { LabelChip } from './LabelChip';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface LabelEditorModalProps {
   taskId: string;
+  project?: string | null;
   initialLabels?: string[];
   taskHash?: string;
   isOpen: boolean;
@@ -18,12 +19,15 @@ const LABEL_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
 
 export const LabelEditorModal: React.FC<LabelEditorModalProps> = ({
   taskId,
+  project,
   initialLabels = [],
   taskHash,
   isOpen,
   onClose,
   onSuccess,
 }) => {
+  const defaultProject = useProject();
+  const targetProject = project || defaultProject;
   const [labels, setLabels] = useState<string[]>(initialLabels);
   const [inputVal, setInputVal] = useState('');
   const [availableLabels, setAvailableLabels] = useState<Array<{ label: string; count: number }>>([]);
@@ -42,12 +46,13 @@ export const LabelEditorModal: React.FC<LabelEditorModalProps> = ({
       setConfirmData(null);
       fetchAvailableLabels();
     }
-  }, [isOpen, initialLabels]);
+  }, [isOpen, initialLabels, targetProject]);
 
   const fetchAvailableLabels = async () => {
+    if (!targetProject) return;
     setLoadingLabels(true);
     try {
-      const res = await microtaskAndLabelsApi.getLabels();
+      const res = await microtaskAndLabelsApi.getLabels(targetProject);
       if (res && Array.isArray(res.labels)) {
         setAvailableLabels(res.labels);
       }
@@ -93,7 +98,7 @@ export const LabelEditorModal: React.FC<LabelEditorModalProps> = ({
       const res = await microtaskAndLabelsApi.previewSetLabels(taskId, {
         to: labels,
         expect_task_hash: taskHash,
-      });
+      }, targetProject);
 
       const hashToUse = res.task_hash || res.hash || taskHash;
       setConfirmData({
@@ -115,7 +120,7 @@ export const LabelEditorModal: React.FC<LabelEditorModalProps> = ({
     const res = await microtaskAndLabelsApi.setLabels(taskId, {
       to: labels,
       expect_task_hash: hashToUse,
-    });
+    }, targetProject);
     setConfirmData(null);
     onSuccess(res.labels || labels);
     onClose();

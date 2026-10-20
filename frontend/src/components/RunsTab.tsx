@@ -12,19 +12,26 @@ import {
   Ban,
 } from 'lucide-react';
 import { TaskItem, RunRecord, shortTitle } from '../types';
-import { api } from '../api';
+import { api, useProject } from '../api';
+import { ProjectChip } from './ProjectBadges';
 
 interface RunsTabProps {
   onSelectRun: (task: TaskItem, runId: string) => void;
   tasks?: TaskItem[];
   refreshKey?: number;
+  isCommonView?: boolean;
+  selectedProject?: string | null;
 }
 
 export const RunsTab: React.FC<RunsTabProps> = ({
   onSelectRun,
   tasks = [],
   refreshKey = 0,
+  isCommonView = false,
+  selectedProject = null,
 }) => {
+  const defaultProject = useProject();
+  const effectiveProject = selectedProject || defaultProject;
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -39,14 +46,16 @@ export const RunsTab: React.FC<RunsTabProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await api.listRuns();
+      const res = isCommonView
+        ? await api.getWorkspaceRuns()
+        : await api.listRuns(undefined, effectiveProject);
       setRuns(res.runs || []);
     } catch (e: any) {
       setError(e?.data?.error || e?.message || String(e));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isCommonView, effectiveProject]);
 
   useEffect(() => {
     loadAllRuns();
@@ -61,10 +70,10 @@ export const RunsTab: React.FC<RunsTabProps> = ({
       const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'starting');
       for (const ar of activeRuns) {
         try {
-          const updated = await api.getRun(ar.run_id);
+          const updated = await api.getRun(ar.run_id, ar.project || effectiveProject);
           if (updated && updated.run) {
             setRuns((prev) =>
-              prev.map((item) => (item.run_id === updated.run.run_id ? updated.run : item))
+              prev.map((item) => (item.run_id === updated.run.run_id ? { ...updated.run, project: ar.project || updated.run.project } : item))
             );
           }
         } catch {
@@ -74,7 +83,7 @@ export const RunsTab: React.FC<RunsTabProps> = ({
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [runs]);
+  }, [runs, effectiveProject]);
 
   // WebSocket live reload debounced 300ms on changed runs or tasks
   useEffect(() => {
@@ -109,17 +118,23 @@ export const RunsTab: React.FC<RunsTabProps> = ({
   // Map task IDs to TaskItem objects
   const taskMap = useMemo(() => {
     const map = new Map<string, TaskItem>();
-    tasks.forEach((t) => map.set(t.id, t));
+    tasks.forEach((t) => {
+      map.set(t.id, t);
+      if (t.project) {
+        map.set(`${t.project}/${t.id}`, t);
+      }
+    });
     return map;
   }, [tasks]);
 
   const handleRowClick = async (run: RunRecord) => {
-    let targetTask = taskMap.get(run.task_id);
+    let targetTask = (run.project && taskMap.get(`${run.project}/${run.task_id}`)) || taskMap.get(run.task_id);
     if (!targetTask) {
       // Try to construct a minimal TaskItem if not in the cached list
       targetTask = {
         kind: 'emergent',
         id: run.task_id,
+        project: run.project || effectiveProject || undefined,
         title: `Task ${run.task_id}`,
         category: 'task',
         priority: 'P1',
@@ -471,10 +486,10 @@ export const RunsTab: React.FC<RunsTabProps> = ({
             </thead>
             <tbody>
               {filteredRuns.map((r) => {
-                const taskItem = taskMap.get(r.task_id);
+                const taskItem = (r.project && taskMap.get(`${r.project}/${r.task_id}`)) || taskMap.get(r.task_id);
                 return (
                   <tr
-                    key={r.run_id}
+                    key={`${r.project || ''}-${r.run_id}`}
                     onClick={() => handleRowClick(r)}
                     style={{
                       borderBottom: '1px solid #334155',
@@ -495,8 +510,13 @@ export const RunsTab: React.FC<RunsTabProps> = ({
 
                     {/* Task */}
                     <td style={{ padding: '0.75rem 1rem' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                        <span style={{ fontWeight: 700, color: '#818cf8' }}>{r.task_id}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+                        {isCommonView && r.project && (
+                          <ProjectChip project={r.project} size="xs" />
+                        )}
+                        <span style={{ fontWeight: 700, color: '#818cf8' }}>
+                          {isCommonView && r.project ? `${r.project}/${r.task_id}` : r.task_id}
+                        </span>
                         {taskItem && (
                           <span
                             style={{

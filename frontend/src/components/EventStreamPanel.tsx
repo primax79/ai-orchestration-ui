@@ -14,7 +14,7 @@ import {
   Check,
 } from 'lucide-react';
 import { OrchestrationEvent, EventsStatsResponse, OrchestratorTurnItem } from '../types';
-import { api } from '../api';
+import { api, useProject } from '../api';
 import { SessionChips } from './SessionChips';
 
 interface EventStreamPanelProps {
@@ -22,6 +22,7 @@ interface EventStreamPanelProps {
 }
 
 export const EventStreamPanel: React.FC<EventStreamPanelProps> = ({ onNavigateTab: _onNavigateTab }) => {
+  const targetProject = useProject();
   const [activeSubTab, setActiveSubTab] = useState<'events' | 'queue'>('events');
   const [events, setEvents] = useState<OrchestrationEvent[]>([]);
   const [stats, setStats] = useState<EventsStatsResponse | null>(null);
@@ -46,11 +47,12 @@ export const EventStreamPanel: React.FC<EventStreamPanelProps> = ({ onNavigateTa
 
   // Initial load of events & stats
   const loadInitialEvents = useCallback(async () => {
+    if (!targetProject) return;
     setLoading(true);
     try {
       const [eventsRes, statsRes] = await Promise.all([
-        api.getEvents({ limit: 100 }),
-        api.getEventsStats(),
+        api.getEvents({ limit: 100 }, targetProject),
+        api.getEventsStats(targetProject),
       ]);
       if (eventsRes && eventsRes.events) {
         setEvents(eventsRes.events);
@@ -66,12 +68,13 @@ export const EventStreamPanel: React.FC<EventStreamPanelProps> = ({ onNavigateTa
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [targetProject]);
 
   const loadQueue = useCallback(async () => {
+    if (!targetProject) return;
     setQueueLoading(true);
     try {
-      const res = await api.getOrchestratorQueue();
+      const res = await api.getOrchestratorQueue(targetProject);
       if (res && res.queue) {
         setQueueItems(res.queue);
       }
@@ -80,7 +83,7 @@ export const EventStreamPanel: React.FC<EventStreamPanelProps> = ({ onNavigateTa
     } finally {
       setQueueLoading(false);
     }
-  }, []);
+  }, [targetProject]);
 
   useEffect(() => {
     loadInitialEvents();

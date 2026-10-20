@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { X, Play, Loader2, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { UseCaseItem, shortTitle } from '../types';
-import { api } from '../api';
+import { api, useProject } from '../api';
 
 interface UseCaseDetailModalProps {
   useCase: UseCaseItem;
@@ -14,6 +14,7 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
   onClose,
   onRefresh,
 }) => {
+  const targetProject = useProject();
   const [validating, setValidating] = useState(false);
   const [valResult, setValResult] = useState<any>(null);
 
@@ -21,7 +22,7 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
     setValidating(true);
     setValResult(null);
     try {
-      const res = await api.validateUseCase(useCase.id, { timeout: 60 });
+      const res = await api.validateUseCase(useCase.id, { timeout: 60 }, targetProject);
       setValResult(res);
       onRefresh();
     } catch (e: any) {

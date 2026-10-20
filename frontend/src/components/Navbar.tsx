@@ -21,6 +21,8 @@ interface NavbarProps {
   activeTab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'orchestrator' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config';
   setActiveTab: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'orchestrator' | 'use-cases' | 'triggers' | 'events' | 'installer' | 'doctor' | 'config') => void;
   workspace: WorkspaceInfo | null;
+  selectedProject?: string | null;
+  onSelectProject?: (projectId: string | null) => void;
   onRefresh: () => void;
   isWsConnected: boolean;
   openQuestionsCount?: number;
@@ -32,6 +34,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeTab,
   setActiveTab,
   workspace,
+  selectedProject = null,
+  onSelectProject,
   onRefresh,
   isWsConnected,
   openQuestionsCount = 0,
@@ -269,34 +273,75 @@ export const Navbar: React.FC<NavbarProps> = ({
         }}
       >
         {workspace && (
-          <div
-            title={workspace.workspace_name}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.4rem',
-              padding: '0.3rem 0.6rem',
-              backgroundColor: '#0f172a',
-              borderRadius: '0.375rem',
-              border: '1px solid #334155',
-              color: '#cbd5e1',
-              maxWidth: isIconOnly ? '120px' : isShort ? '160px' : '220px',
-              minWidth: 0,
-              flexShrink: 1,
-              whiteSpace: 'nowrap',
-            }}
-          >
-            <FolderGit2 size={14} color="#818cf8" style={{ flexShrink: 0 }} />
-            <span
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: 0, flexShrink: 1 }}>
+            <div
+              title={workspace.workspace_name}
               style={{
-                fontWeight: 600,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.4rem',
+                padding: '0.3rem 0.6rem',
+                backgroundColor: '#0f172a',
+                borderRadius: '0.375rem',
+                border: '1px solid #334155',
+                color: '#cbd5e1',
+                maxWidth: isIconOnly ? '120px' : isShort ? '160px' : '220px',
+                minWidth: 0,
+                flexShrink: 1,
                 whiteSpace: 'nowrap',
               }}
             >
-              {workspace.workspace_name}
-            </span>
+              <FolderGit2 size={14} color="#818cf8" style={{ flexShrink: 0 }} />
+              <span
+                style={{
+                  fontWeight: 600,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {workspace.workspace_name}
+              </span>
+            </div>
+
+            {workspace.projects && workspace.projects.length > 1 && onSelectProject && (
+              <select
+                aria-label="Project selector"
+                title="Switch project or view all projects"
+                value={selectedProject || '__all__'}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  onSelectProject(val === '__all__' ? null : val);
+                }}
+                style={{
+                  padding: '0.3rem 0.5rem',
+                  backgroundColor: '#0f172a',
+                  border: '1px solid #4f46e5',
+                  borderRadius: '0.375rem',
+                  color: '#f8fafc',
+                  fontSize: '0.8rem',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  maxWidth: isIconOnly ? '130px' : '210px',
+                  outline: 'none',
+                }}
+              >
+                <option value="__all__">All projects ({workspace.projects.length})</option>
+                {workspace.projects.map((p) => {
+                  const isSub = p.kind === 'sub_workspace';
+                  const kindSuffix = isSub
+                    ? ' (sub_workspace — read-only)'
+                    : p.kind === '_workspace'
+                    ? ' (_workspace)'
+                    : ' (project)';
+                  return (
+                    <option key={p.id} value={p.id}>
+                      {p.id}{kindSuffix}
+                    </option>
+                  );
+                })}
+              </select>
+            )}
           </div>
         )}
 
