@@ -130,42 +130,64 @@ def compute_tree_hash(tasks_dir: pathlib.Path) -> str:
     return h.hexdigest()
 
 
+CANONICAL_COUNT_STATES: tuple[str, ...] = (
+    "open",
+    "in progress",
+    "waiting",
+    "blocked",
+    "paused",
+    "bounced",
+    "delivered",
+    "verified",
+    "done",
+    "dropped",
+)
+
+
+def canonicalize_task_state(raw_state: str | None) -> str:
+    if not raw_state:
+        return "open"
+    s = str(raw_state).strip().lower()
+    s = re.sub(r"\s*\(\d{4}-\d{2}-\d{2}\)$", "", s).strip("`").strip()
+    s_norm = s.replace("_", " ").replace("-", " ")
+    if s_norm in ("open", "todo", "draft"):
+        return "open"
+    if s_norm in ("in progress", "doing", "started"):
+        return "in progress"
+    if s_norm in ("waiting", "wait"):
+        return "waiting"
+    if s_norm in ("blocked", "block"):
+        return "blocked"
+    if s_norm in ("paused", "pause"):
+        return "paused"
+    if s_norm in ("bounced", "bounce"):
+        return "bounced"
+    if s_norm in ("delivered", "deliver"):
+        return "delivered"
+    if s_norm in ("verified", "verify"):
+        return "verified"
+    if s_norm in ("done", "done with a caveat", "completed", "closed"):
+        return "done"
+    if s_norm in ("dropped", "drop", "abandoned", "cancelled"):
+        return "dropped"
+    return s_norm
+
+
+def count_tasks_by_canonical_state(tasks: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {st: 0 for st in CANONICAL_COUNT_STATES}
+    counts["total"] = 0
+    for t in tasks:
+        raw_st = t.get("canonical_state") or t.get("state")
+        cst = canonicalize_task_state(raw_st)
+        if cst in counts:
+            counts[cst] += 1
+        counts["total"] += 1
+    return counts
+
+
 def fast_count_project_tasks(tasks_dir: pathlib.Path) -> dict[str, int]:
-    counts: dict[str, int] = {
-        "todo": 0,
-        "in_progress": 0,
-        "waiting": 0,
-        "delivered": 0,
-        "verified": 0,
-        "done": 0,
-    }
-    if not tasks_dir.is_dir():
-        return counts
-
-    status_re = re.compile(
-        r"(?:-\s+\*\*Status:\*\*\s*`([^`]+)`|-\s+status:\s*`?([a-zA-Z_-]+)`?|\bstatus:\s*`?([a-zA-Z_-]+)`?)",
-        re.IGNORECASE,
-    )
-
-    try:
-        for root, dirs, files in os.walk(str(tasks_dir)):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("_inbox", "questions")]
-            for f in files:
-                if f.endswith(".md") and f != "00-INDEX.md":
-                    fp = pathlib.Path(root) / f
-                    try:
-                        text = fp.read_text(encoding="utf-8")
-                        for m in status_re.finditer(text):
-                            st_val = m.group(1) or m.group(2) or m.group(3)
-                            if st_val:
-                                st_norm = st_val.strip().lower().replace("-", "_").replace(" ", "_")
-                                if st_norm in ("open", "draft"):
-                                    st_norm = "todo"
-                                counts[st_norm] = counts.get(st_norm, 0) + 1
-                    except OSError:
-                        pass
-    except Exception:
-        pass
+    counts: dict[str, int] = {st: 0 for st in CANONICAL_COUNT_STATES}
+    counts["total"] = 0
     return counts
 
 
@@ -232,6 +254,24 @@ class ProjectResolver:
         tasks: list[dict[str, Any]] = []
         if code == 0 and isinstance(data, dict):
             tasks = data.get("all_tasks") or data.get("tasks") or []
+            # Merge coordinates from emergent_tasks or tree if not present on all_tasks items
+            emergent_map = {
+                et["id"]: et.get("coordinates")
+                for et in (data.get("emergent_tasks") or [])
+                if isinstance(et, dict) and et.get("id") and et.get("coordinates")
+            }
+            tree_map = {
+                nid: n.get("coordinates")
+                for nid, n in (data.get("tree") or {}).items()
+                if isinstance(n, dict) and n.get("coordinates")
+            }
+            for t in tasks:
+                tid = t.get("id")
+                if not t.get("coordinates"):
+                    if tid in emergent_map and emergent_map[tid]:
+                        t["coordinates"] = emergent_map[tid]
+                    elif tid in tree_map and tree_map[tid]:
+                        t["coordinates"] = tree_map[tid]
         self._tasks_cache[cache_key] = tasks
         return tasks
 
@@ -242,17 +282,7 @@ class ProjectResolver:
             return self._counts_cache[cache_key]
 
         tasks = await self.load_project_tasks(proj, run_ai_orch_fn)
-        counts: dict[str, int] = {
-            "todo": 0,
-            "in_progress": 0,
-            "waiting": 0,
-            "delivered": 0,
-            "verified": 0,
-        }
-        for t in tasks:
-            st = str(t.get("state") or t.get("canonical_state") or "todo").lower()
-            st_norm = st.replace("-", "_").replace(" ", "_")
-            counts[st_norm] = counts.get(st_norm, 0) + 1
+        counts = count_tasks_by_canonical_state(tasks)
         self._counts_cache[cache_key] = counts
         return counts
 
@@ -594,6 +624,10 @@ class ProjectResolver:
     def _get_db_path(self) -> pathlib.Path:
         if self.config_dir:
             return self.config_dir / "broker" / "registry.sqlite"
+        if "AI_ORCHESTRATION_CONFIG" in os.environ and os.environ["AI_ORCHESTRATION_CONFIG"].strip():
+            p = pathlib.Path(os.environ["AI_ORCHESTRATION_CONFIG"]).expanduser().resolve()
+            cfg_dir = p.parent if (p.is_file() or p.suffix == ".toml") else p
+            return cfg_dir / "broker" / "registry.sqlite"
         if "AI_ORCH_CONFIG_DIR" in os.environ and os.environ["AI_ORCH_CONFIG_DIR"].strip():
             return pathlib.Path(os.environ["AI_ORCH_CONFIG_DIR"]).expanduser().resolve() / "broker" / "registry.sqlite"
         if "AI_ORCH_HOME" in os.environ and os.environ["AI_ORCH_HOME"].strip():

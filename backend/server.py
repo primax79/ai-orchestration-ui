@@ -51,6 +51,8 @@ try:
         fast_count_project_tasks,
         fast_count_questions,
         fast_count_inbox,
+        sanitize_slug,
+        canonicalize_task_state,
     )
 except ImportError:
     from projects import (
@@ -63,6 +65,8 @@ except ImportError:
         fast_count_project_tasks,
         fast_count_questions,
         fast_count_inbox,
+        sanitize_slug,
+        canonicalize_task_state,
     )
 
 UI_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -82,6 +86,11 @@ def get_ai_orch_bin() -> pathlib.Path:
 
 
 def get_config_dir() -> pathlib.Path:
+    if "AI_ORCHESTRATION_CONFIG" in os.environ and os.environ["AI_ORCHESTRATION_CONFIG"].strip():
+        p = pathlib.Path(os.environ["AI_ORCHESTRATION_CONFIG"]).expanduser().resolve()
+        if p.is_file() or p.suffix == ".toml":
+            return p.parent
+        return p
     if "AI_ORCH_CONFIG_DIR" in os.environ and os.environ["AI_ORCH_CONFIG_DIR"].strip():
         return pathlib.Path(os.environ["AI_ORCH_CONFIG_DIR"]).expanduser().resolve()
     if "AI_ORCH_HOME" in os.environ and os.environ["AI_ORCH_HOME"].strip():
@@ -987,9 +996,10 @@ async def api_get_workspace(request: Request) -> JSONResponse:
     resolver = state.get_resolver()
     mode, projects, sub_workspaces = resolver.get_workspace_info()
 
+    project_counts = await asyncio.gather(*[resolver.get_project_counts(p, run_ai_orch) for p in projects])
+
     projects_summary = []
-    for p in projects:
-        counts = fast_count_project_tasks(p.tasks_dir)
+    for p, counts in zip(projects, project_counts):
         open_q = fast_count_questions(p.tasks_dir)
         inbox_n = fast_count_inbox(p.tasks_dir)
         projects_summary.append({
@@ -1044,32 +1054,83 @@ async def api_get_workspace_tasks(request: Request) -> JSONResponse:
             kind = t.get("kind") or ("initiative_task" if "." in tid and not tid.startswith("T") else ("emergent" if tid.startswith("T") else "initiative"))
 
             coords = list(t.get("coordinates") or [])
-            resolved_coords = []
+            if not coords:
+                coords = list(t.get("coordinates_refs") or [])
+            if not coords and t.get("coordinates_raw"):
+                raw = t.get("coordinates_raw")
+                if isinstance(raw, str):
+                    coords = [x.strip() for x in raw.split(",") if x.strip()]
+                elif isinstance(raw, list):
+                    coords = raw
+            if not coords and isinstance(t.get("headers"), dict) and t["headers"].get("coordinates"):
+                raw = t["headers"]["coordinates"]
+                if isinstance(raw, str):
+                    coords = [x.strip() for x in raw.split(",") if x.strip()]
+                elif isinstance(raw, list):
+                    coords = raw
+            if not coords and isinstance(t.get("fields"), dict) and t["fields"].get("coordinates"):
+                f_val = t["fields"]["coordinates"]
+                if isinstance(f_val, dict):
+                    f_val = f_val.get("value")
+                if isinstance(f_val, str):
+                    coords = [x.strip() for x in f_val.split(",") if x.strip()]
+                elif isinstance(f_val, list):
+                    coords = f_val
+
+            resolved_coords: list[dict[str, Any]] = []
             for c in coords:
+                target_proj = None
+                target_id = None
+                fallback_state = "open"
+                fallback_short_title = ""
+
                 if isinstance(c, dict):
                     target_proj = c.get("project")
                     target_id = c.get("id")
-                    target_t = tasks_by_proj_and_id.get(target_proj, {}).get(target_id)
-                    entry = dict(c)
-                    if target_t:
-                        entry["state"] = target_t.get("state") or target_t.get("canonical_state") or "todo"
-                        entry["short_title"] = target_t.get("short_title") or target_t.get("short") or target_t.get("title", "")
-                        entry["title"] = target_t.get("title", "")
-                    resolved_coords.append(entry)
+                    fallback_state = c.get("state") or "open"
+                    fallback_short_title = c.get("short_title") or c.get("short") or c.get("title") or ""
                 elif isinstance(c, str):
-                    try:
-                        p_part, id_part = c.split("/", 1)
-                        target_t = tasks_by_proj_and_id.get(p_part, {}).get(id_part)
-                        entry = {"project": p_part, "id": id_part}
-                        if target_t:
-                            entry["state"] = target_t.get("state") or target_t.get("canonical_state") or "todo"
-                            entry["short_title"] = target_t.get("short_title") or target_t.get("short") or target_t.get("title", "")
-                            entry["title"] = target_t.get("title", "")
-                        resolved_coords.append(entry)
-                    except ValueError:
-                        resolved_coords.append({"ref": c})
-                else:
-                    resolved_coords.append(c)
+                    c_clean = c.strip()
+                    if "/" in c_clean:
+                        target_proj, target_id = c_clean.split("/", 1)
+                    elif ":" in c_clean:
+                        target_proj, target_id = c_clean.split(":", 1)
+                    if target_proj:
+                        target_proj = target_proj.strip()
+                    if target_id:
+                        target_id = target_id.strip()
+
+                if target_proj and target_id:
+                    target_t = None
+                    target_actual_proj = target_proj
+                    if target_proj in tasks_by_proj_and_id and target_id in tasks_by_proj_and_id[target_proj]:
+                        target_t = tasks_by_proj_and_id[target_proj][target_id]
+                    else:
+                        for proj_obj in projects:
+                            aliases = {proj_obj.id, proj_obj.path, proj_obj.root.name, sanitize_slug(proj_obj.id), sanitize_slug(proj_obj.root.name)}
+                            if target_proj in aliases and proj_obj.id in tasks_by_proj_and_id:
+                                if target_id in tasks_by_proj_and_id[proj_obj.id]:
+                                    target_t = tasks_by_proj_and_id[proj_obj.id][target_id]
+                                    target_actual_proj = proj_obj.id
+                                    break
+
+                    if target_t:
+                        raw_st = target_t.get("canonical_state") or target_t.get("state") or fallback_state
+                        resolved_state = canonicalize_task_state(raw_st)
+                        resolved_short = target_t.get("short_title") or target_t.get("short") or target_t.get("title") or fallback_short_title
+                        resolved_coords.append({
+                            "project": target_actual_proj,
+                            "id": target_id,
+                            "short_title": resolved_short,
+                            "state": resolved_state,
+                        })
+                    else:
+                        resolved_coords.append({
+                            "project": target_proj,
+                            "id": target_id,
+                            "short_title": fallback_short_title,
+                            "state": canonicalize_task_state(fallback_state),
+                        })
 
             item = {
                 "project": p.id,

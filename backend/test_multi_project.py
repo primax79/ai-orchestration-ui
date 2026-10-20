@@ -94,6 +94,53 @@ Task description.
     (tasks_dir / "00-INDEX.md").write_text(index_content, encoding="utf-8")
 
 
+def _create_emergent_task(
+    tasks_dir: pathlib.Path,
+    task_id: str,
+    title: str,
+    category: str = "architecture",
+    state: str = "open",
+    coordinates: list[str] | None = None,
+    short: str | None = None,
+):
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    cat_dir = tasks_dir / category
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    slug = title.lower().replace(" ", "-")
+    coords_line = f"- coordinates: {', '.join(coordinates)}\n" if coordinates else ""
+    short_line = f"- short: {short}\n" if short else ""
+    content = f"""# {task_id} {title}
+
+- id: {task_id}
+- title: {title}
+- category: {category}
+- priority: P2
+- state: {state}
+{short_line}{coords_line}- handoff: -
+
+## Goal
+{title} goal.
+
+## Steps
+Step 1.
+
+## Verification
+Verification.
+"""
+    (cat_dir / f"{task_id}-{slug}.md").write_text(content, encoding="utf-8")
+    index_file = tasks_dir / "00-INDEX.md"
+    entry = f"- [{task_id}: {title}]({category}/{task_id}-{slug}.md)\n"
+    if index_file.is_file():
+        text = index_file.read_text(encoding="utf-8")
+        if "## Emergent Tasks" not in text:
+            text += f"\n## Emergent Tasks\n\n{entry}"
+        else:
+            text += entry
+        index_file.write_text(text, encoding="utf-8")
+    else:
+        index_file.write_text(f"# Task Index\n\n## Emergent Tasks\n\n{entry}", encoding="utf-8")
+
+
 def test_scratch_workspace_discovery_and_exclusions(auth_headers):
     """Test scratch workspace like d4science-python-library: 4 projects, 1 git-ignored scratch copy."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -450,6 +497,183 @@ def test_watcher_broadcasts_project_field(auth_headers, monkeypatch):
             state.workspace = old_ws
 
 
+def test_scratch_registered_workspace_canonical_counts_and_coordinates(monkeypatch):
+    """Regression test for 16.9a:
+    1. Per-project counts must come from the engine and be keyed ONLY by canonical states (+ total).
+    2. Coordinates in _workspace tasks must resolve against target projects live task lists.
+    Uses scratch registered workspace with isolated AI_ORCHESTRATION_CONFIG.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ws_path = pathlib.Path(tmp_dir).resolve()
+        cfg_dir = ws_path / ".config" / "ai-orchestration"
+        broker_dir = cfg_dir / "broker"
+        broker_dir.mkdir(parents=True, exist_ok=True)
+
+        # Isolated AI_ORCHESTRATION_CONFIG pointing to orchestration.toml
+        toml_path = cfg_dir / "orchestration.toml"
+        toml_path.write_text("# Scratch orchestration config\n", encoding="utf-8")
+        monkeypatch.setenv("AI_ORCHESTRATION_CONFIG", str(toml_path))
+
+        # Setup SQLite registry
+        import sqlite3
+        db_path = broker_dir / "registry.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE workspaces (
+                uuid TEXT PRIMARY KEY,
+                slug TEXT UNIQUE NOT NULL,
+                canonical_path TEXT NOT NULL,
+                device INTEGER,
+                inode INTEGER,
+                registered_at TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE projects (
+                uuid TEXT PRIMARY KEY,
+                slug TEXT NOT NULL,
+                rel_path TEXT NOT NULL,
+                workspace_uuid TEXT NOT NULL
+            )
+        """)
+        ws_uuid = "12345678-1234-5678-1234-567812345678"
+        conn.execute(
+            "INSERT INTO workspaces VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            (ws_uuid, "scratch-ws", str(ws_path), 0, 0),
+        )
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?)",
+            ("11111111-1111-1111-1111-111111111111", "_workspace", ".", ws_uuid),
+        )
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?)",
+            ("22222222-2222-2222-2222-222222222222", "proj-a", "proj-a", ws_uuid),
+        )
+        conn.execute(
+            "INSERT INTO projects VALUES (?, ?, ?, ?)",
+            ("33333333-3333-3333-3333-333333333333", "proj-b", "proj-b", ws_uuid),
+        )
+        conn.commit()
+        conn.close()
+
+        # Project A tasks: multiple states (open, in progress, blocked, done, done with a caveat)
+        _create_minimal_task_tree(
+            ws_path / "proj-a" / "tasks",
+            "01", "alpha", "01.1", "Task Alpha",
+            state="in_progress", kind="initiative_task"
+        )
+        _create_minimal_task_tree(
+            ws_path / "proj-a" / "tasks",
+            "02", "beta", "02.1", "Task Beta",
+            state="done", kind="initiative_task"
+        )
+        _create_emergent_task(
+            ws_path / "proj-a" / "tasks",
+            "T010", "Emergent Blocked", category="architecture",
+            state="blocked", short="emergent blocked"
+        )
+        _create_emergent_task(
+            ws_path / "proj-a" / "tasks",
+            "T011", "Emergent Done Caveat", category="architecture",
+            state="done with a caveat", short="emergent caveat"
+        )
+
+        # Project B tasks:
+        _create_minimal_task_tree(
+            ws_path / "proj-b" / "tasks",
+            "01", "gamma", "01.1", "Task Gamma Delivered",
+            state="delivered", kind="initiative_task"
+        )
+
+        # Workspace tasks:
+        # 1. Emergent task T002 coordinating proj-a/T010 and proj-b/01.1
+        _create_emergent_task(
+            ws_path / "tasks",
+            "T002", "Coordination Emergent", category="coordination",
+            state="open", short="coord emergent",
+            coordinates=["proj-a/T010", "proj-b/01.1"]
+        )
+        # 2. Initiative task 00.1 coordinating proj-a/01.1
+        _create_minimal_task_tree(
+            ws_path / "tasks",
+            "00", "coordination", "00.1", "Coordination Initiative",
+            state="open", kind="initiative_task",
+            coordinates=["proj-a/01.1"]
+        )
+
+        old_ws = state.workspace
+        state.workspace = ws_path
+        reg_headers = {"X-AI-Orch-Token": get_or_create_token()}
+        try:
+            client = TestClient(app)
+
+            # 1. Test GET /api/workspace
+            res_ws = client.get("/api/workspace", headers=reg_headers)
+            assert res_ws.status_code == 200
+            ws_data = res_ws.json()
+            assert ws_data["mode"] == "registered"
+
+            projects_map = {p["id"]: p for p in ws_data["projects"]}
+            assert "_workspace" in projects_map
+            assert "proj-a" in projects_map
+            assert "proj-b" in projects_map
+
+            expected_keys = {
+                "open", "in progress", "waiting", "blocked", "paused",
+                "bounced", "delivered", "verified", "done", "dropped", "total"
+            }
+
+            # Check proj-a counts
+            counts_a = projects_map["proj-a"]["counts"]
+            assert set(counts_a.keys()) == expected_keys
+            assert counts_a["in progress"] == 1
+            assert counts_a["blocked"] == 1
+            # done(1) + done with a caveat(1) = 2
+            assert counts_a["done"] == 2
+            assert counts_a["total"] == 4
+
+            # Check proj-b counts
+            counts_b = projects_map["proj-b"]["counts"]
+            assert set(counts_b.keys()) == expected_keys
+            assert counts_b["delivered"] == 1
+            assert counts_b["total"] == 1
+
+            # Check _workspace counts
+            counts_ws = projects_map["_workspace"]["counts"]
+            assert set(counts_ws.keys()) == expected_keys
+            assert counts_ws["open"] == 2
+            assert counts_ws["total"] == 2
+
+            # 2. Test GET /api/workspace/tasks (coordinates resolution)
+            res_tasks = client.get("/api/workspace/tasks", headers=reg_headers)
+            assert res_tasks.status_code == 200
+            tasks_list = res_tasks.json()["tasks"]
+
+            t_emergent = next(t for t in tasks_list if t["qualified_id"] == "_workspace/T002")
+            assert len(t_emergent["coordinates"]) == 2
+            c_a = next(c for c in t_emergent["coordinates"] if c["project"] == "proj-a")
+            assert c_a["id"] == "T010"
+            assert c_a["state"] == "blocked"
+            assert c_a["short_title"] == "emergent blocked"
+
+            c_b = next(c for c in t_emergent["coordinates"] if c["project"] == "proj-b")
+            assert c_b["id"] == "01.1"
+            assert c_b["state"] == "delivered"
+            assert c_b["short_title"] == "Task Gamma Delivered"
+
+            t_init = next(t for t in tasks_list if t["qualified_id"] == "_workspace/00.1")
+            assert len(t_init["coordinates"]) == 1
+            c_init = t_init["coordinates"][0]
+            assert c_init["project"] == "proj-a"
+            assert c_init["id"] == "01.1"
+            assert c_init["state"] == "in progress"
+            assert c_init["short_title"] == "Task Alpha"
+
+        finally:
+            state.workspace = old_ws
+
+
 def test_real_d4science_python_library_read_only(auth_headers):
     """Read-only test against real /Users/Alfredo/works/d4science-python-library."""
     real_path = pathlib.Path("/Users/Alfredo/works/d4science-python-library")
@@ -465,16 +689,35 @@ def test_real_d4science_python_library_read_only(auth_headers):
         res_ws = client.get("/api/workspace", headers=auth_headers)
         assert res_ws.status_code == 200, res_ws.text
         data = res_ws.json()
-        assert data["mode"] == "discovered"
+        assert data["mode"] == "registered"
         projects = data["projects"]
         project_ids = [p["id"] for p in projects]
 
         print(f"\n[Real d4science-python-library] Discovered {len(projects)} projects: {project_ids}")
-        assert len(projects) == 4
+        assert len(projects) == 5
+        assert "_workspace" in project_ids
         assert "d4science-python-iam" in project_ids
         assert "d4science-python-legacy-is" in project_ids
         assert "d4science-python-library" in project_ids
         assert "d4science-python-resource-registry" in project_ids
+
+        expected_canonical_states = {
+            "open", "in progress", "waiting", "blocked", "paused",
+            "bounced", "delivered", "verified", "done", "dropped", "total"
+        }
+
+        # Check counts per project
+        for p in projects:
+            assert set(p["counts"].keys()) == expected_canonical_states
+
+        lib_p = next(p for p in projects if p["id"] == "d4science-python-library")
+        assert lib_p["counts"]["total"] == 48
+        assert lib_p["counts"]["done"] == 38
+        assert lib_p["counts"]["open"] == 6
+        assert lib_p["counts"]["in progress"] == 1
+        assert lib_p["counts"]["waiting"] == 1
+        assert lib_p["counts"]["blocked"] == 1
+        assert lib_p["counts"]["bounced"] == 1
 
         # 2. Timing test for GET /api/workspace/tasks
         # First call (cold cache)
@@ -483,6 +726,23 @@ def test_real_d4science_python_library_read_only(auth_headers):
         t_cold = time.perf_counter() - t0
         assert res_tasks_cold.status_code == 200
         print(f"[Real d4science-python-library] /api/workspace/tasks cold duration: {t_cold * 1000:.2f} ms")
+
+        # Verify coordinates resolved in live aggregate
+        cold_tasks = res_tasks_cold.json()["tasks"]
+        t2 = next(t for t in cold_tasks if t["qualified_id"] == "_workspace/T002")
+        assert len(t2["coordinates"]) == 1
+        assert t2["coordinates"][0]["project"] == "d4science-python-library"
+        assert t2["coordinates"][0]["id"] == "T046"
+        assert t2["coordinates"][0]["short_title"] == "split plugins"
+        assert t2["coordinates"][0]["state"] == "blocked"
+
+        t3 = next(t for t in cold_tasks if t["qualified_id"] == "_workspace/T003")
+        assert len(t3["coordinates"]) == 2
+        assert any(c["project"] == "d4science-python-iam" and c["id"] == "T001" and c["state"] == "open" for c in t3["coordinates"])
+        assert any(c["project"] == "d4science-python-library" and c["id"] == "T044" and c["state"] == "waiting" for c in t3["coordinates"])
+
+        t4 = next(t for t in cold_tasks if t["qualified_id"] == "_workspace/T004")
+        assert len(t4["coordinates"]) == 4
 
         # Second call (warm cache)
         t1 = time.perf_counter()

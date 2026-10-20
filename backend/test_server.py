@@ -152,11 +152,13 @@ async def test_slow_cli_non_blocking(monkeypatch):
         stub_path = tmp_path / "stub_slow.py"
         stub_path.write_text(
             "import os, pathlib, sys, time\n"
-            f"pathlib.Path({str(started_file)!r}).touch()\n"
+            f"started = pathlib.Path({str(started_file)!r})\n"
             f"release_path = pathlib.Path({str(release_file)!r})\n"
-            "deadline = time.monotonic() + 15.0\n"
-            "while not release_path.exists() and time.monotonic() < deadline:\n"
-            "    time.sleep(0.01)\n"
+            "if '--kind' in sys.argv:\n"
+            "    started.touch()\n"
+            "    deadline = time.monotonic() + 15.0\n"
+            "    while not release_path.exists() and time.monotonic() < deadline:\n"
+            "        time.sleep(0.01)\n"
             'print(\'{"tasks": [], "initiatives": [], "stats": {"total": 0}}\')\n',
             encoding="utf-8",
         )
@@ -173,7 +175,7 @@ async def test_slow_cli_non_blocking(monkeypatch):
                 async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as async_client:
                     # Launch slow CLI request
                     slow_task = asyncio.create_task(
-                        async_client.get("/api/tasks", headers={"X-AI-Orch-Token": token})
+                        async_client.get("/api/tasks?kind=initiative", headers={"X-AI-Orch-Token": token})
                     )
                     # Poll until slow CLI process is running
                     deadline = time.monotonic() + 10.0
