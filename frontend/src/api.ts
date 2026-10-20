@@ -321,6 +321,21 @@ export const api = {
     return apiFetch<WorkspaceTasksResponse>(qs ? `/api/workspace/tasks?${qs}` : '/api/workspace/tasks');
   },
 
+  // Reads every page of the aggregate, so the common view is never silently truncated
+  async getAllWorkspaceTasks(filters?: { state?: string[] }): Promise<WorkspaceTasksResponse> {
+    const perPage = 500;
+    const first = await api.getWorkspaceTasks({ ...filters, page: 1, per_page: perPage });
+    const items = [...(first.tasks || first.items || [])];
+    const total = first.total ?? items.length;
+    for (let page = 2; items.length < total; page++) {
+      const next = await api.getWorkspaceTasks({ ...filters, page, per_page: perPage });
+      const batch = next.tasks || next.items || [];
+      if (batch.length === 0) break;
+      items.push(...batch);
+    }
+    return { ...first, tasks: items, items, page: 1, per_page: items.length };
+  },
+
   async getWorkspaceQuestions(params?: { status?: string; blocks?: string }): Promise<QuestionListResponse> {
     if (isVsCode && vscode) {
       return sendVsCodeMessage<QuestionListResponse>('getWorkspaceQuestions', params);

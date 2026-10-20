@@ -90,6 +90,9 @@ interface BacklogManagerProps {
   selectedProject?: string | null;
   onOpenTask?: (task: TaskItem) => void;
   onSelectCoordTarget?: (project: string, taskId: string) => void;
+  includeClosed?: boolean;
+  closedCount?: number;
+  onIncludeClosedChange?: (next: boolean) => void;
 }
 
 export const BacklogManager: React.FC<BacklogManagerProps> = ({
@@ -100,6 +103,9 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   selectedProject = null,
   onOpenTask,
   onSelectCoordTarget,
+  includeClosed = false,
+  closedCount = 0,
+  onIncludeClosedChange,
 }) => {
   const defaultProject = useProject();
   const effectiveProject = selectedProject || defaultProject;
@@ -533,6 +539,28 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
           <span style={{ fontSize: '0.85rem', color: '#94a3b8', backgroundColor: '#1e293b', padding: '0.2rem 0.6rem', borderRadius: '1rem', border: '1px solid #334155' }}>
             {stats.total} total task(s)
           </span>
+          {isCommonView && onIncludeClosedChange && (
+            <button
+              type="button"
+              onClick={() => onIncludeClosedChange(!includeClosed)}
+              title="Closed tasks (verified, done, dropped) are loaded only on request"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.35rem',
+                fontSize: '0.8rem',
+                padding: '0.2rem 0.6rem',
+                borderRadius: '1rem',
+                border: '1px solid #334155',
+                backgroundColor: includeClosed ? '#334155' : '#1e293b',
+                color: includeClosed ? '#f8fafc' : '#cbd5e1',
+                cursor: 'pointer',
+              }}
+            >
+              {includeClosed ? <EyeOff size={13} color="#94a3b8" /> : <Eye size={13} color="#94a3b8" />}
+              <span>{includeClosed ? `Hide closed (${closedCount})` : `Include closed (${closedCount})`}</span>
+            </button>
+          )}
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>

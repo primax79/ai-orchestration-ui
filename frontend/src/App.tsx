@@ -30,6 +30,9 @@ import {
 } from './types';
 
 const SELECTED_PROJECT_KEY = 'ai-orch:selected-project';
+const INCLUDE_CLOSED_KEY = 'ai-orch:common-include-closed';
+const ACTIVE_STATES = ['open', 'in progress', 'waiting', 'blocked', 'paused', 'bounced', 'delivered'];
+const CLOSED_COUNT_KEYS = ['verified', 'done', 'dropped'];
 
 function readInitialProjectSelection(): string | null {
   try {
@@ -143,6 +146,23 @@ export const App: React.FC = () => {
 
   const validatedInitialProjectRef = useRef(false);
 
+  // Common view: closed tasks are loaded only on request
+  const [includeClosed, setIncludeClosed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(INCLUDE_CLOSED_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const handleIncludeClosedChange = useCallback((next: boolean) => {
+    setIncludeClosed(next);
+    try {
+      localStorage.setItem(INCLUDE_CLOSED_KEY, String(next));
+    } catch {
+      // ignore
+    }
+  }, []);
+
   const projectsList = workspace?.projects || [];
   const projectsCount = projectsList.length;
   const isMultiProject = projectsCount > 1;
@@ -227,7 +247,7 @@ export const App: React.FC = () => {
     setTasksError(null);
     try {
       if (isCommonView) {
-        const agg = await api.getWorkspaceTasks({ per_page: 500 });
+        const agg = await api.getAllWorkspaceTasks(includeClosed ? undefined : { state: ACTIVE_STATES });
         const rawList = agg.tasks || agg.items || [];
         const normalized: TaskItem[] = rawList.map((r: any) => {
           const st = (r.state || r.canonical_state || 'open') as TaskState;
@@ -295,7 +315,16 @@ export const App: React.FC = () => {
     } finally {
       setTasksLoading(false);
     }
-  }, [workspace, isCommonView, effectiveProject, fallbackProject]);
+  }, [workspace, isCommonView, effectiveProject, fallbackProject, includeClosed]);
+
+  const closedTasksCount = useMemo(
+    () =>
+      projectsList.reduce(
+        (sum, p) => sum + CLOSED_COUNT_KEYS.reduce((s, k) => s + ((p.counts as Record<string, number> | undefined)?.[k] || 0), 0),
+        0
+      ),
+    [projectsList]
+  );
 
   const loadQuestionsCount = useCallback(async () => {
     if (!workspace) return;
@@ -520,6 +549,18 @@ export const App: React.FC = () => {
     reloadHandlersRef.current.loadConfig();
   }, [hasWorkspaceLoaded, selectedProject, isCommonView, projectsCount]);
 
+  // Toggling closed tasks reloads only the common-view task list
+  const includeClosedMountedRef = useRef(false);
+  useEffect(() => {
+    if (!includeClosedMountedRef.current) {
+      includeClosedMountedRef.current = true;
+      return;
+    }
+    if (hasWorkspaceLoaded && isCommonView) {
+      reloadHandlersRef.current.loadTasks();
+    }
+  }, [includeClosed]);
+
   const projectContextValue = useMemo(
     () => ({
       selectedProject: effectiveProject,
@@ -577,6 +618,9 @@ export const App: React.FC = () => {
                   isCommonView={isCommonView}
                   projects={workspace?.projects || []}
                   selectedProject={selectedProject}
+                  includeClosed={includeClosed}
+                  closedCount={closedTasksCount}
+                  onIncludeClosedChange={handleIncludeClosedChange}
                   onSelectCoordTarget={(proj, _tid) => {
                     handleSelectProject(proj);
                   }}
