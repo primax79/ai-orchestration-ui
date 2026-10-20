@@ -40,6 +40,35 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+try:
+    from backend.projects import (
+        ProjectInfo,
+        ProjectResolver,
+        ProjectRequiredError,
+        UnknownProjectError,
+        OutsideWorkspaceError,
+        compute_tree_hash,
+        fast_count_project_tasks,
+        fast_count_questions,
+        fast_count_inbox,
+        sanitize_slug,
+        canonicalize_task_state,
+    )
+except ImportError:
+    from projects import (
+        ProjectInfo,
+        ProjectResolver,
+        ProjectRequiredError,
+        UnknownProjectError,
+        OutsideWorkspaceError,
+        compute_tree_hash,
+        fast_count_project_tasks,
+        fast_count_questions,
+        fast_count_inbox,
+        sanitize_slug,
+        canonicalize_task_state,
+    )
+
 UI_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
@@ -57,6 +86,11 @@ def get_ai_orch_bin() -> pathlib.Path:
 
 
 def get_config_dir() -> pathlib.Path:
+    if "AI_ORCHESTRATION_CONFIG" in os.environ and os.environ["AI_ORCHESTRATION_CONFIG"].strip():
+        p = pathlib.Path(os.environ["AI_ORCHESTRATION_CONFIG"]).expanduser().resolve()
+        if p.is_file() or p.suffix == ".toml":
+            return p.parent
+        return p
     if "AI_ORCH_CONFIG_DIR" in os.environ and os.environ["AI_ORCH_CONFIG_DIR"].strip():
         return pathlib.Path(os.environ["AI_ORCH_CONFIG_DIR"]).expanduser().resolve()
     if "AI_ORCH_HOME" in os.environ and os.environ["AI_ORCH_HOME"].strip():
@@ -174,15 +208,105 @@ class AuthAndHostMiddleware:
             await self.app(scope, receive, send)
 
 
+class ProjectScopeMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path == "/api" or path.startswith("/api/"):
+                if path.startswith("/api/workspace"):
+                    await self.app(scope, receive, send)
+                    return
+
+                qs = parse_qs(scope.get("query_string", b"").decode("latin1"))
+                project_param = qs.get("project", [""])[0] or None
+                try:
+                    proj = state.resolve_project(project_param)
+                    if "state" not in scope:
+                        scope["state"] = {}
+                    scope["state"]["project"] = proj
+                except ProjectRequiredError:
+                    response = JSONResponse({"error": "project-required"}, status_code=400)
+                    await response(scope, receive, send)
+                    return
+                except UnknownProjectError:
+                    response = JSONResponse({"error": "unknown-project"}, status_code=404)
+                    await response(scope, receive, send)
+                    return
+                except OutsideWorkspaceError:
+                    response = JSONResponse({"error": "outside-workspace-root"}, status_code=400)
+                    await response(scope, receive, send)
+                    return
+
+            await self.app(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
 class OrchestrationState:
     def __init__(self, workspace: pathlib.Path):
-        self.workspace = workspace.resolve()
+        self._workspace = workspace.resolve()
+        self._resolver = ProjectResolver(self._workspace, get_config_dir(), get_ai_orch_bin())
         self.active_websockets: set[WebSocket] = set()
         self.watcher_task: asyncio.Task | None = None
         self.last_event_seq: int = 0
+        self.last_event_seq_per_project: dict[str, int] = {}
         self.polling_events_lock = asyncio.Lock()
 
+    @property
+    def workspace(self) -> pathlib.Path:
+        return self._workspace
+
+    @workspace.setter
+    def workspace(self, new_ws: pathlib.Path | str) -> None:
+        p = pathlib.Path(new_ws).resolve()
+        self._workspace = p
+        self._resolver.update_workspace(p, get_config_dir(), get_ai_orch_bin())
+
+    def get_resolver(self) -> ProjectResolver:
+        self._resolver.config_dir = get_config_dir()
+        self._resolver.ai_orch_bin = get_ai_orch_bin()
+        return self._resolver
+
+    def get_projects(self) -> list[ProjectInfo]:
+        return self.get_resolver().get_projects()
+
+    def get_workspace_info(self) -> tuple[str, list[ProjectInfo], list[dict[str, Any]]]:
+        return self.get_resolver().get_workspace_info()
+
+    def resolve_project(self, project_id: str | None = None) -> ProjectInfo:
+        return self.get_resolver().resolve_project(project_id)
+
+    def resolve_project_from_request(self, request: Request) -> ProjectInfo:
+        if hasattr(request.state, "project") and request.state.project is not None:
+            return request.state.project
+        proj_param = request.query_params.get("project")
+        proj = self.resolve_project(proj_param)
+        request.state.project = proj
+        return proj
+
+    def project_root(self, arg: str | Request | None = None) -> pathlib.Path:
+        if isinstance(arg, Request):
+            return self.resolve_project_from_request(arg).root
+        return self.get_resolver().project_root(arg)
+
+    def tasks_dir(self, arg: str | Request | None = None) -> pathlib.Path:
+        if isinstance(arg, Request):
+            return self.resolve_project_from_request(arg).tasks_dir
+        return self.get_resolver().tasks_dir(arg)
+
     async def broadcast(self, message: dict[str, Any]) -> None:
+        if message.get("type") == "changed" and "project" not in message:
+            try:
+                projects = self.get_projects()
+                if len(projects) == 1:
+                    message["project"] = projects[0].id
+                else:
+                    message["project"] = "_workspace"
+            except Exception:
+                pass
         stale = set()
         for ws in list(self.active_websockets):
             try:
@@ -195,25 +319,44 @@ class OrchestrationState:
         if self.polling_events_lock.locked():
             return []
         async with self.polling_events_lock:
-            code, data = await run_ai_orch([
-                "events", "tail",
-                "--since", str(self.last_event_seq),
-                "--workspace", str(self.workspace),
-                "--json",
-            ])
-            if code != 0 or not isinstance(data, dict) or not data.get("ok"):
-                return []
-            events = data.get("events", [])
-            for ev in events:
-                seq = int(ev.get("seq", 0))
-                if seq > self.last_event_seq:
-                    self.last_event_seq = seq
-                await self.broadcast({
-                    "type": "event",
-                    "seq": seq,
-                    "event": ev,
-                })
-            return events
+            all_events = []
+            try:
+                projects = self.get_projects()
+            except Exception:
+                projects = []
+            if not projects:
+                projects = [ProjectInfo(
+                    id="_workspace",
+                    path=".",
+                    kind="project",
+                    root=self.workspace,
+                    tasks_dir=self.workspace / "tasks",
+                )]
+            for p in projects:
+                last_seq = self.last_event_seq_per_project.get(p.id, self.last_event_seq)
+                code, data = await run_ai_orch([
+                    "events", "tail",
+                    "--since", str(last_seq),
+                    "--workspace", str(p.root),
+                    "--json",
+                ])
+                if code == 0 and isinstance(data, dict) and data.get("ok"):
+                    events = data.get("events", [])
+                    for ev in events:
+                        seq = int(ev.get("seq", 0))
+                        if seq > last_seq:
+                            last_seq = seq
+                            self.last_event_seq_per_project[p.id] = seq
+                        if seq > self.last_event_seq:
+                            self.last_event_seq = seq
+                        await self.broadcast({
+                            "type": "event",
+                            "project": p.id,
+                            "seq": seq,
+                            "event": ev,
+                        })
+                    all_events.extend(events)
+            return all_events
 
 
 state = OrchestrationState(get_initial_workspace())
@@ -579,7 +722,7 @@ class SPAStaticFiles(StaticFiles):
 # Watcher Background Task
 # ---------------------------------------------------------------------------
 
-def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) -> dict[str, float]:
+def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path, projects: list[ProjectInfo] | None = None) -> dict[str, float]:
     mtimes: dict[str, float] = {}
 
     global_cfg = config_dir / "orchestration.toml"
@@ -589,91 +732,116 @@ def snapshot_watched_files(workspace: pathlib.Path, config_dir: pathlib.Path) ->
     except OSError:
         pass
 
-    local_cfg = workspace / ".ai-orchestration.local.toml"
-    try:
-        if local_cfg.is_file():
-            mtimes[f"config:{local_cfg}"] = local_cfg.stat().st_mtime
-    except OSError:
-        pass
-
-    tasks_dir = workspace / "tasks"
-    if tasks_dir.is_dir():
+    if projects is None:
         try:
-            mtimes[f"tasks:{tasks_dir}"] = tasks_dir.stat().st_mtime
-            questions_dir = tasks_dir / "questions"
-            if questions_dir.is_dir():
-                mtimes[f"questions:{questions_dir}"] = questions_dir.stat().st_mtime
-            inbox_dir = tasks_dir / "_inbox"
-            if inbox_dir.is_dir():
-                mtimes[f"inbox:{inbox_dir}"] = inbox_dir.stat().st_mtime
-                for p in inbox_dir.rglob("*"):
-                    try:
-                        mtimes[f"inbox:{p}"] = p.stat().st_mtime
-                    except OSError:
-                        pass
-            for p in tasks_dir.rglob("*.md"):
-                try:
-                    if p.is_file():
-                        if "questions" in p.parts:
-                            mtimes[f"questions:{p}"] = p.stat().st_mtime
-                        elif "_inbox" in p.parts:
-                            pass
-                        else:
-                            mtimes[f"tasks:{p}"] = p.stat().st_mtime
-                except OSError:
-                    pass
+            resolver = ProjectResolver(workspace, config_dir)
+            projects = resolver.get_projects()
+        except Exception:
+            projects = []
+
+    if not projects:
+        projects = [ProjectInfo(
+            id="_workspace",
+            path=".",
+            kind="project",
+            root=workspace,
+            tasks_dir=workspace / "tasks",
+        )]
+
+    for proj in projects:
+        p_root = proj.root
+        local_cfg = p_root / ".ai-orchestration.local.toml"
+        try:
+            if local_cfg.is_file():
+                mtimes[f"{proj.id}:config:{local_cfg}"] = local_cfg.stat().st_mtime
         except OSError:
             pass
 
-    runs_dir = workspace / ".ai-orchestration" / "runs"
-    if runs_dir.is_dir():
+        ws_cfg = p_root / "orchestration.toml"
         try:
-            mtimes[f"runs:{runs_dir}"] = runs_dir.stat().st_mtime
-            for p in runs_dir.iterdir():
-                try:
-                    if p.is_dir():
-                        run_json = p / "run.json"
-                        if run_json.is_file():
-                            mtimes[f"runs:{run_json}"] = run_json.stat().st_mtime
-                except OSError:
-                    pass
+            if ws_cfg.is_file():
+                mtimes[f"{proj.id}:config:{ws_cfg}"] = ws_cfg.stat().st_mtime
         except OSError:
             pass
 
-    ai_orch_dir = workspace / ".ai-orchestration"
-    if ai_orch_dir.is_dir():
-        for sub in ("events.jsonl", "events_manifest.json", "manifest.json", "orchestrator.json"):
-            ef = ai_orch_dir / sub
+        tasks_dir = proj.tasks_dir
+        if tasks_dir.is_dir():
             try:
-                if ef.is_file():
-                    mtimes[f"orchestrator:{ef}" if sub == "orchestrator.json" else f"events:{ef}"] = ef.stat().st_mtime
-            except OSError:
-                pass
-        for sub_dir, area in (
-            ("sessions", "sessions"),
-            ("notifications", "notifications"),
-            ("proposed_actions", "triggers"),
-            ("orchestrator", "orchestrator"),
-        ):
-            target_d = ai_orch_dir / sub_dir
-            if target_d.is_dir():
-                try:
-                    mtimes[f"{area}:{target_d}"] = target_d.stat().st_mtime
-                    for p in target_d.rglob("*.json"):
+                mtimes[f"{proj.id}:tasks:{tasks_dir}"] = tasks_dir.stat().st_mtime
+                questions_dir = tasks_dir / "questions"
+                if questions_dir.is_dir():
+                    mtimes[f"{proj.id}:questions:{questions_dir}"] = questions_dir.stat().st_mtime
+                inbox_dir = tasks_dir / "_inbox"
+                if inbox_dir.is_dir():
+                    mtimes[f"{proj.id}:inbox:{inbox_dir}"] = inbox_dir.stat().st_mtime
+                    for p in inbox_dir.rglob("*"):
                         try:
-                            if p.is_file():
-                                mtimes[f"{area}:{p}"] = p.stat().st_mtime
+                            mtimes[f"{proj.id}:inbox:{p}"] = p.stat().st_mtime
                         except OSError:
                             pass
+                for p in tasks_dir.rglob("*.md"):
+                    try:
+                        if p.is_file():
+                            if "questions" in p.parts:
+                                mtimes[f"{proj.id}:questions:{p}"] = p.stat().st_mtime
+                            elif "_inbox" in p.parts:
+                                pass
+                            else:
+                                mtimes[f"{proj.id}:tasks:{p}"] = p.stat().st_mtime
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
+        runs_dir = p_root / ".ai-orchestration" / "runs"
+        if runs_dir.is_dir():
+            try:
+                mtimes[f"{proj.id}:runs:{runs_dir}"] = runs_dir.stat().st_mtime
+                for p in runs_dir.iterdir():
+                    try:
+                        if p.is_dir():
+                            run_json = p / "run.json"
+                            if run_json.is_file():
+                                mtimes[f"{proj.id}:runs:{run_json}"] = run_json.stat().st_mtime
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
+        ai_orch_dir = p_root / ".ai-orchestration"
+        if ai_orch_dir.is_dir():
+            for sub in ("events.jsonl", "events_manifest.json", "manifest.json", "orchestrator.json"):
+                ef = ai_orch_dir / sub
+                try:
+                    if ef.is_file():
+                        mtimes[f"{proj.id}:orchestrator:{ef}" if sub == "orchestrator.json" else f"{proj.id}:events:{ef}"] = ef.stat().st_mtime
                 except OSError:
                     pass
+            for sub_dir, area in (
+                ("sessions", "sessions"),
+                ("notifications", "notifications"),
+                ("proposed_actions", "triggers"),
+                ("orchestrator", "orchestrator"),
+            ):
+                target_d = ai_orch_dir / sub_dir
+                if target_d.is_dir():
+                    try:
+                        mtimes[f"{proj.id}:{area}:{target_d}"] = target_d.stat().st_mtime
+                        for p in target_d.rglob("*.json"):
+                            try:
+                                if p.is_file():
+                                    mtimes[f"{proj.id}:{area}:{p}"] = p.stat().st_mtime
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
 
     return mtimes
 
 
 async def _polling_watcher_loop() -> None:
     poll_interval = float(os.environ.get("AI_ORCH_WATCH_INTERVAL", "1.0"))
-    last_snapshot = snapshot_watched_files(state.workspace, get_config_dir())
+    last_snapshot = snapshot_watched_files(state.workspace, get_config_dir(), state.get_projects())
 
     while True:
         try:
@@ -682,64 +850,43 @@ async def _polling_watcher_loop() -> None:
                 await state.check_and_push_events()
             except Exception:
                 pass
-            current_snapshot = snapshot_watched_files(state.workspace, get_config_dir())
+            current_snapshot = snapshot_watched_files(state.workspace, get_config_dir(), state.get_projects())
 
-            changed_areas: set[str] = set()
+            changed_per_project: dict[str, set[str]] = {}
             all_keys = set(last_snapshot.keys()) | set(current_snapshot.keys())
             for k in all_keys:
                 if last_snapshot.get(k) != current_snapshot.get(k):
-                    if k.startswith("config:"):
-                        changed_areas.add("config")
-                    elif k.startswith("questions:"):
-                        changed_areas.add("questions")
-                        changed_areas.add("tasks")
-                    elif k.startswith("inbox:"):
-                        changed_areas.add("inbox")
-                    elif k.startswith("tasks:"):
-                        changed_areas.add("tasks")
-                    elif k.startswith("runs:"):
-                        changed_areas.add("runs")
-                    elif k.startswith("events:"):
-                        changed_areas.add("events")
-                    elif k.startswith("sessions:"):
-                        changed_areas.add("sessions")
-                    elif k.startswith("triggers:"):
-                        changed_areas.add("triggers")
-                    elif k.startswith("notifications:"):
-                        changed_areas.add("notifications")
-                    elif k.startswith("queue:") or k.startswith("orchestrator:"):
-                        changed_areas.add("queue")
-                        changed_areas.add("orchestrator")
+                    parts = k.split(":", 2)
+                    if len(parts) >= 3:
+                        proj_id, area = parts[0], parts[1]
+                        changed_per_project.setdefault(proj_id, set()).add(area)
+                        if area == "questions":
+                            changed_per_project[proj_id].add("tasks")
+                        elif area in ("queue", "orchestrator"):
+                            changed_per_project[proj_id].add("queue")
+                            changed_per_project[proj_id].add("orchestrator")
+                    elif k.startswith("config:"):
+                        projects = state.get_projects()
+                        p_id = projects[0].id if projects else "_workspace"
+                        changed_per_project.setdefault(p_id, set()).add("config")
 
-            if changed_areas:
+            if changed_per_project:
                 await asyncio.sleep(0.3)
-                debounce_snapshot = snapshot_watched_files(state.workspace, get_config_dir())
+                debounce_snapshot = snapshot_watched_files(state.workspace, get_config_dir(), state.get_projects())
                 for k in set(debounce_snapshot.keys()) | set(current_snapshot.keys()):
                     if debounce_snapshot.get(k) != current_snapshot.get(k):
-                        if k.startswith("config:"):
-                            changed_areas.add("config")
-                        elif k.startswith("questions:"):
-                            changed_areas.add("questions")
-                            changed_areas.add("tasks")
-                        elif k.startswith("inbox:"):
-                            changed_areas.add("inbox")
-                        elif k.startswith("tasks:"):
-                            changed_areas.add("tasks")
-                        elif k.startswith("runs:"):
-                            changed_areas.add("runs")
-                        elif k.startswith("events:"):
-                            changed_areas.add("events")
-                        elif k.startswith("sessions:"):
-                            changed_areas.add("sessions")
-                        elif k.startswith("triggers:"):
-                            changed_areas.add("triggers")
-                        elif k.startswith("notifications:"):
-                            changed_areas.add("notifications")
-                        elif k.startswith("queue:") or k.startswith("orchestrator:"):
-                            changed_areas.add("queue")
-                            changed_areas.add("orchestrator")
+                        parts = k.split(":", 2)
+                        if len(parts) >= 3:
+                            proj_id, area = parts[0], parts[1]
+                            changed_per_project.setdefault(proj_id, set()).add(area)
+                            if area == "questions":
+                                changed_per_project[proj_id].add("tasks")
+                            elif area in ("queue", "orchestrator"):
+                                changed_per_project[proj_id].add("queue")
+                                changed_per_project[proj_id].add("orchestrator")
                 last_snapshot = debounce_snapshot
-                await state.broadcast({"type": "changed", "areas": sorted(list(changed_areas))})
+                for proj_id, areas in changed_per_project.items():
+                    await state.broadcast({"type": "changed", "project": proj_id, "areas": sorted(list(areas))})
             else:
                 last_snapshot = current_snapshot
         except asyncio.CancelledError:
@@ -757,9 +904,21 @@ async def _watchfiles_watcher_loop() -> None:
         watch_dirs.append(config_dir)
 
     async for changes in watchfiles.awatch(*[str(d) for d in watch_dirs], debounce=300):
-        areas: set[str] = set()
+        changed_per_proj: dict[str, set[str]] = {}
+        projects = state.get_projects()
         for _, path_str in changes:
             p = pathlib.Path(path_str)
+            matched_proj = None
+            for pr in projects:
+                try:
+                    p.resolve().relative_to(pr.root.resolve())
+                    matched_proj = pr
+                    break
+                except ValueError:
+                    pass
+            proj_id = matched_proj.id if matched_proj else (projects[0].id if projects else "_workspace")
+
+            areas = changed_per_proj.setdefault(proj_id, set())
             if p.name in ("orchestration.toml", ".ai-orchestration.local.toml"):
                 areas.add("config")
             elif "tasks" in p.parts:
@@ -788,8 +947,10 @@ async def _watchfiles_watcher_loop() -> None:
                     areas.add("orchestrator")
                 if "notifications" in p.parts:
                     areas.add("notifications")
-        if areas:
-            await state.broadcast({"type": "changed", "areas": sorted(list(areas))})
+
+        for proj_id, areas in changed_per_proj.items():
+            if areas:
+                await state.broadcast({"type": "changed", "project": proj_id, "areas": sorted(list(areas))})
 
 
 async def watcher_loop() -> None:
@@ -832,14 +993,291 @@ async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 
 async def api_get_workspace(request: Request) -> JSONResponse:
+    resolver = state.get_resolver()
+    mode, projects, sub_workspaces = resolver.get_workspace_info()
+
+    project_counts = await asyncio.gather(*[resolver.get_project_counts(p, run_ai_orch) for p in projects])
+
+    projects_summary = []
+    for p, counts in zip(projects, project_counts):
+        open_q = fast_count_questions(p.tasks_dir)
+        inbox_n = fast_count_inbox(p.tasks_dir)
+        projects_summary.append({
+            "id": p.id,
+            "path": p.path,
+            "kind": p.kind,
+            "uuid": p.uuid,
+            "counts": counts,
+            "open_questions": open_q,
+            "inbox_notes": inbox_n,
+        })
+
     tasks_dir = state.workspace / "tasks"
     has_tasks = tasks_dir.is_dir()
+
     return JSONResponse({
+        "root": str(state.workspace),
         "workspace_path": str(state.workspace),
         "workspace_name": state.workspace.name,
+        "mode": mode,
+        "registered": mode == "registered",
+        "discovered": mode == "discovered",
+        "single": mode == "single",
         "has_tasks_dir": has_tasks,
         "tasks_path": str(tasks_dir) if has_tasks else None,
+        "projects": projects_summary,
+        "sub_workspaces": sub_workspaces,
     })
+
+
+async def api_get_workspace_tasks(request: Request) -> JSONResponse:
+    resolver = state.get_resolver()
+    _, projects, _ = resolver.get_workspace_info()
+
+    project_tasks_list = await asyncio.gather(*[resolver.load_project_tasks(p, run_ai_orch) for p in projects])
+
+    tasks_by_proj_and_id: dict[str, dict[str, dict[str, Any]]] = {}
+    for p, p_tasks in zip(projects, project_tasks_list):
+        p_map = {}
+        for t in p_tasks:
+            tid = str(t.get("id", ""))
+            p_map[tid] = t
+        tasks_by_proj_and_id[p.id] = p_map
+
+    flattened_tasks: list[dict[str, Any]] = []
+    for p, p_tasks in zip(projects, project_tasks_list):
+        for t in p_tasks:
+            tid = str(t.get("id", ""))
+            short = t.get("short")
+            short_title = t.get("short_title") or short or t.get("title", "")
+            raw_state = t.get("state") or t.get("canonical_state") or "todo"
+            kind = t.get("kind") or ("initiative_task" if "." in tid and not tid.startswith("T") else ("emergent" if tid.startswith("T") else "initiative"))
+
+            coords = list(t.get("coordinates") or [])
+            if not coords:
+                coords = list(t.get("coordinates_refs") or [])
+            if not coords and t.get("coordinates_raw"):
+                raw = t.get("coordinates_raw")
+                if isinstance(raw, str):
+                    coords = [x.strip() for x in raw.split(",") if x.strip()]
+                elif isinstance(raw, list):
+                    coords = raw
+            if not coords and isinstance(t.get("headers"), dict) and t["headers"].get("coordinates"):
+                raw = t["headers"]["coordinates"]
+                if isinstance(raw, str):
+                    coords = [x.strip() for x in raw.split(",") if x.strip()]
+                elif isinstance(raw, list):
+                    coords = raw
+            if not coords and isinstance(t.get("fields"), dict) and t["fields"].get("coordinates"):
+                f_val = t["fields"]["coordinates"]
+                if isinstance(f_val, dict):
+                    f_val = f_val.get("value")
+                if isinstance(f_val, str):
+                    coords = [x.strip() for x in f_val.split(",") if x.strip()]
+                elif isinstance(f_val, list):
+                    coords = f_val
+
+            resolved_coords: list[dict[str, Any]] = []
+            for c in coords:
+                target_proj = None
+                target_id = None
+                fallback_state = "open"
+                fallback_short_title = ""
+
+                if isinstance(c, dict):
+                    target_proj = c.get("project")
+                    target_id = c.get("id")
+                    fallback_state = c.get("state") or "open"
+                    fallback_short_title = c.get("short_title") or c.get("short") or c.get("title") or ""
+                elif isinstance(c, str):
+                    c_clean = c.strip()
+                    if "/" in c_clean:
+                        target_proj, target_id = c_clean.split("/", 1)
+                    elif ":" in c_clean:
+                        target_proj, target_id = c_clean.split(":", 1)
+                    if target_proj:
+                        target_proj = target_proj.strip()
+                    if target_id:
+                        target_id = target_id.strip()
+
+                if target_proj and target_id:
+                    target_t = None
+                    target_actual_proj = target_proj
+                    if target_proj in tasks_by_proj_and_id and target_id in tasks_by_proj_and_id[target_proj]:
+                        target_t = tasks_by_proj_and_id[target_proj][target_id]
+                    else:
+                        for proj_obj in projects:
+                            aliases = {proj_obj.id, proj_obj.path, proj_obj.root.name, sanitize_slug(proj_obj.id), sanitize_slug(proj_obj.root.name)}
+                            if target_proj in aliases and proj_obj.id in tasks_by_proj_and_id:
+                                if target_id in tasks_by_proj_and_id[proj_obj.id]:
+                                    target_t = tasks_by_proj_and_id[proj_obj.id][target_id]
+                                    target_actual_proj = proj_obj.id
+                                    break
+
+                    if target_t:
+                        raw_st = target_t.get("canonical_state") or target_t.get("state") or fallback_state
+                        resolved_state = canonicalize_task_state(raw_st)
+                        resolved_short = target_t.get("short_title") or target_t.get("short") or target_t.get("title") or fallback_short_title
+                        resolved_coords.append({
+                            "project": target_actual_proj,
+                            "id": target_id,
+                            "short_title": resolved_short,
+                            "state": resolved_state,
+                        })
+                    else:
+                        resolved_coords.append({
+                            "project": target_proj,
+                            "id": target_id,
+                            "short_title": fallback_short_title,
+                            "state": canonicalize_task_state(fallback_state),
+                        })
+
+            item = {
+                "project": p.id,
+                "id": tid,
+                "qualified_id": f"{p.id}/{tid}",
+                "title": t.get("title", ""),
+                "short": short,
+                "short_title": short_title,
+                "state": raw_state,
+                "priority": t.get("priority", "P2"),
+                "kind": kind,
+                "labels": list(t.get("labels") or []),
+                "coordinates": resolved_coords,
+            }
+            flattened_tasks.append(item)
+
+    filter_projects = [x.strip() for k in request.query_params.getlist("project") for x in k.split(",") if x.strip()]
+    filter_states = [x.strip().lower() for k in request.query_params.getlist("state") for x in k.split(",") if x.strip()]
+    filter_kind = request.query_params.get("kind")
+    filter_label = request.query_params.get("label")
+    filter_text = request.query_params.get("text")
+
+    filtered = []
+    for item in flattened_tasks:
+        if filter_projects and item["project"] not in filter_projects:
+            continue
+        if filter_states:
+            st_clean = item["state"].lower().replace("-", "_").replace(" ", "_")
+            matches_state = False
+            for fs in filter_states:
+                fs_clean = fs.replace("-", "_").replace(" ", "_")
+                if st_clean == fs_clean or item["state"].lower() == fs:
+                    matches_state = True
+                    break
+            if not matches_state:
+                continue
+        if filter_kind and item["kind"].lower() != filter_kind.strip().lower():
+            continue
+        if filter_label:
+            fl = filter_label.strip()
+            if fl not in item.get("labels", []):
+                continue
+        if filter_text:
+            query = filter_text.strip().lower()
+            haystack = f"{item['title']} {item['short_title']} {item['id']} {item['qualified_id']}".lower()
+            if query not in haystack:
+                continue
+        filtered.append(item)
+
+    try:
+        page = max(1, int(request.query_params.get("page", 1)))
+    except (ValueError, TypeError):
+        page = 1
+
+    try:
+        per_page = max(1, min(500, int(request.query_params.get("per_page") or request.query_params.get("limit") or 50)))
+    except (ValueError, TypeError):
+        per_page = 50
+
+    total = len(filtered)
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
+    paged = filtered[start_idx:end_idx]
+
+    return JSONResponse({
+        "ok": True,
+        "tasks": paged,
+        "items": paged,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    })
+
+
+async def api_get_workspace_questions(request: Request) -> JSONResponse:
+    resolver = state.get_resolver()
+    _, projects, _ = resolver.get_workspace_info()
+
+    async def get_proj_questions(p: ProjectInfo) -> list[dict[str, Any]]:
+        cmd = ["questions", "list", "--tasks-dir", str(p.tasks_dir), "--json"]
+        status = request.query_params.get("status")
+        if status:
+            cmd.extend(["--status", status])
+        blocks = request.query_params.get("blocks")
+        if blocks:
+            cmd.extend(["--blocks", blocks])
+        code, data = await run_ai_orch(cmd)
+        items: list[dict[str, Any]] = []
+        if code == 0 and isinstance(data, dict):
+            items = data.get("questions") or data.get("items") or []
+        for item in items:
+            item["project"] = p.id
+        return items
+
+    results = await asyncio.gather(*[get_proj_questions(p) for p in projects])
+    all_questions = [q for sublist in results for q in sublist]
+    return JSONResponse({"ok": True, "questions": all_questions, "items": all_questions})
+
+
+async def api_get_workspace_inbox(request: Request) -> JSONResponse:
+    resolver = state.get_resolver()
+    _, projects, _ = resolver.get_workspace_info()
+
+    async def get_proj_inbox(p: ProjectInfo) -> list[dict[str, Any]]:
+        cmd = ["inbox", "list", "--tasks-dir", str(p.tasks_dir), "--json"]
+        status = request.query_params.get("status")
+        if status:
+            cmd.extend(["--status", status])
+        code, data = await run_ai_orch(cmd)
+        items: list[dict[str, Any]] = []
+        if code == 0 and isinstance(data, dict):
+            items = data.get("notes") or data.get("items") or []
+        for item in items:
+            item["project"] = p.id
+        return items
+
+    results = await asyncio.gather(*[get_proj_inbox(p) for p in projects])
+    all_notes = [n for sublist in results for n in sublist]
+    return JSONResponse({"ok": True, "notes": all_notes, "items": all_notes})
+
+
+async def api_get_workspace_runs(request: Request) -> JSONResponse:
+    resolver = state.get_resolver()
+    _, projects, _ = resolver.get_workspace_info()
+
+    async def get_proj_runs(p: ProjectInfo) -> list[dict[str, Any]]:
+        cmd = ["run", "list", "--workspace", str(p.root), "--json"]
+        task = request.query_params.get("task")
+        if task:
+            cmd.extend(["--task", task])
+        note = request.query_params.get("note")
+        if note:
+            cmd.extend(["--note", note])
+        active = request.query_params.get("active")
+        if active is not None and active.lower() in ("1", "true", "yes", ""):
+            cmd.append("--active")
+        code, data = await run_ai_orch(cmd)
+        items: list[dict[str, Any]] = []
+        if code == 0 and isinstance(data, dict):
+            items = data.get("runs") or data.get("items") or []
+        for item in items:
+            item["project"] = p.id
+        return items
+
+    results = await asyncio.gather(*[get_proj_runs(p) for p in projects])
+    all_runs = [r for sublist in results for r in sublist]
+    return JSONResponse({"ok": True, "runs": all_runs, "items": all_runs})
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +1285,7 @@ async def api_get_workspace(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_list_tasks(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     if not tasks_dir.is_dir():
         return JSONResponse({"tasks": [], "initiatives": [], "stats": {"total": 0}, "message": "No tasks/ directory in current workspace"})
     cmd = ["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"]
@@ -866,7 +1304,7 @@ async def api_list_tasks(request: Request) -> JSONResponse:
 
 
 async def api_validate_tasks(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["tasks", "validate", "--tasks-dir", str(tasks_dir), "--json"])
     status_code = 504 if code == 504 else (200 if code == 0 else 400)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -916,7 +1354,7 @@ async def _resolve_current_task_hash(tasks_dir: pathlib.Path, task_id: str) -> s
 
 
 async def api_get_tasks_graph(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     if not tasks_dir.is_dir():
         return JSONResponse({"ok": True, "nodes": [], "nodes_by_id": {}, "edges": [], "columns": {}, "ready_queue": [], "heaviest_chain": [], "totals": {}}, status_code=200)
     cmd = ["tasks", "graph", "--tasks-dir", str(tasks_dir), "--json"]
@@ -963,7 +1401,7 @@ async def _handle_set_priority(request: Request, is_preview: bool = False) -> JS
     if not is_preview and not expect_task_hash:
         return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "set-priority", task_id, priority, "--tasks-dir", str(tasks_dir), "--json"]
     if is_preview:
         cmd.append("--dry-run")
@@ -1023,7 +1461,7 @@ async def _handle_set_size(request: Request, is_preview: bool = False) -> JSONRe
     if not is_preview and not expect_task_hash:
         return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "set-size", task_id, size, "--tasks-dir", str(tasks_dir), "--json"]
     if is_preview:
         cmd.append("--dry-run")
@@ -1087,7 +1525,7 @@ async def _handle_set_deps(request: Request, is_preview: bool = False) -> JSONRe
     if not is_preview and not expect_task_hash:
         return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "set-deps", task_id, "--tasks-dir", str(tasks_dir), "--json"]
     if add_ids:
         cmd.extend(["--add", *add_ids])
@@ -1155,7 +1593,7 @@ async def _handle_set_kind(request: Request, is_preview: bool = False) -> JSONRe
     if not is_preview and not expect_task_hash:
         return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "set-kind", task_id, kind, "--tasks-dir", str(tasks_dir), "--json"]
     if is_preview:
         cmd.append("--dry-run")
@@ -1235,7 +1673,7 @@ async def _handle_set_labels(request: Request, is_preview: bool = False) -> JSON
     if not is_preview and not expect_task_hash:
         return JSONResponse({"error": "expect_task_hash is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "set-labels", task_id, "--tasks-dir", str(tasks_dir), "--json"]
     if add_labels:
         cmd.extend(["--add", *add_labels])
@@ -1307,7 +1745,7 @@ async def _handle_set_short(request: Request, is_preview: bool = False) -> JSONR
     if not is_preview and not expect_plan_hash:
         return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "set-short", task_id, short_title, "--tasks-dir", str(tasks_dir), "--json"]
     if is_preview:
         cmd.append("--dry-run")
@@ -1343,7 +1781,7 @@ async def api_set_short(request: Request) -> JSONResponse:
 
 
 async def api_list_labels(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     if not tasks_dir.is_dir():
         return JSONResponse({"ok": True, "tasks_dir": str(tasks_dir), "labels": [], "counts": {}}, status_code=200)
     code, data = await run_ai_orch(["tasks", "labels", "--tasks-dir", str(tasks_dir), "--json"])
@@ -1377,7 +1815,7 @@ async def api_create_microtask(request: Request) -> JSONResponse:
     if priority not in VALID_PRIORITIES:
         return JSONResponse({"error": f"Invalid priority {priority!r}, expected one of {', '.join(sorted(VALID_PRIORITIES))}"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = [
         "tasks", "micro",
         "--title", title,
@@ -1435,7 +1873,7 @@ async def _handle_promote(request: Request, is_preview: bool = False) -> JSONRes
     if not category:
         category = "maintenance"
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     target_file = None
     for pdir in (tasks_dir / "micro", tasks_dir / "done" / "micro"):
         if pdir.is_dir():
@@ -1505,7 +1943,7 @@ async def api_inbox_to_microtask(request: Request) -> JSONResponse:
     except Exception:
         body = {}
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     show_code, show_data = await run_ai_orch(["inbox", "show", note_id, "--tasks-dir", str(tasks_dir), "--json"])
     if show_code != 0 or not isinstance(show_data, dict) or not show_data.get("ok"):
         return JSONResponse({"error": f"Note {note_id} not found"}, status_code=404)
@@ -1581,7 +2019,7 @@ async def _handle_child_add(request: Request, is_preview: bool = False) -> JSONR
         return JSONResponse({"error": "title is required"}, status_code=400)
     kind = str(body.get("kind") or "feature").strip()
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "child", "add", parent_id, "--title", title, "--kind", kind, "--tasks-dir", str(tasks_dir), "--json"]
     short_title = str(body.get("short_title") or body.get("short") or "").strip()
     if short_title:
@@ -1638,7 +2076,7 @@ async def _handle_expand(request: Request, is_preview: bool = False) -> JSONResp
     if not node_id or not TASK_MUTATION_ID_RE.match(node_id):
         return JSONResponse({"error": f"Invalid node id {node_id!r}"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "expand", node_id, "--tasks-dir", str(tasks_dir), "--json"]
     if is_preview:
         cmd.append("--dry-run")
@@ -1689,7 +2127,7 @@ async def _handle_collapse(request: Request, is_preview: bool = False) -> JSONRe
     if not node_id or not TASK_MUTATION_ID_RE.match(node_id):
         return JSONResponse({"error": f"Invalid node id {node_id!r}"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "collapse", node_id, "--tasks-dir", str(tasks_dir), "--json"]
     if is_preview:
         cmd.append("--dry-run")
@@ -1744,7 +2182,7 @@ async def _handle_reopen(request: Request, is_preview: bool = False) -> JSONResp
     if not reason:
         return JSONResponse({"error": "reason is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "reopen", node_id, "--reason", reason, "--tasks-dir", str(tasks_dir), "--json"]
     if is_preview:
         cmd.append("--dry-run")
@@ -1795,7 +2233,7 @@ async def api_transition_task(request: Request) -> JSONResponse:
     if not task_id or not new_state:
         return JSONResponse({"error": "task_id and new_state are required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "transition", str(task_id), str(new_state), "--tasks-dir", str(tasks_dir), "--json"]
     if body.get("actor"):
         cmd.extend(["--actor", str(body["actor"])])
@@ -1826,7 +2264,7 @@ async def api_transition_task(request: Request) -> JSONResponse:
 
 
 async def api_preview_sync_index(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--check", "--json"])
     if code == 504:
         return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=504)
@@ -1845,7 +2283,7 @@ async def api_sync_index(request: Request) -> JSONResponse:
     if not expect_hash:
         return JSONResponse({"error": "expect_hash is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--apply", "--expect-hash", str(expect_hash), "--json"]
     code, data = await run_ai_orch(cmd)
     if code == 0:
@@ -1889,7 +2327,7 @@ async def api_get_task_detail(request: Request) -> JSONResponse:
     task_id = request.path_params["task_id"]
     if not TASK_DETAIL_ID_RE.match(task_id):
         return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
 
     # Initiative tasks (NN.T) and synthetic initiative cards (INIT-NN) live in plan.md.
     if not task_id.startswith("T"):
@@ -2098,7 +2536,7 @@ async def api_upload_task_attachment(request: Request) -> JSONResponse:
                     return JSONResponse({"error": "Attachment exceeds 10 MB limit"}, status_code=413)
                 temp_f.write(chunk)
 
-        tasks_dir = state.workspace / "tasks"
+        tasks_dir = state.tasks_dir(request)
         cmd = ["tasks", "attach", task_id, "--file", str(temp_path), "--tasks-dir", str(tasks_dir), "--json"]
 
         name = form.get("name")
@@ -2152,7 +2590,7 @@ async def api_get_task_attachment(request: Request) -> Response:
     if not ATTACHMENT_NAME_RE.match(name):
         return JSONResponse({"error": f"Invalid attachment name {name!r}"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"])
     if code != 0 or not isinstance(data, dict):
         return JSONResponse({"error": f"Task {task_id} not found"}, status_code=404)
@@ -2189,7 +2627,7 @@ async def api_get_task_attachment(request: Request) -> Response:
 
     folder_path = pathlib.Path(folder_path_str)
     if not folder_path.is_absolute():
-        folder_path = (state.workspace / folder_path).resolve()
+        folder_path = (state.project_root(request) / folder_path).resolve()
     else:
         folder_path = folder_path.resolve()
 
@@ -2231,7 +2669,7 @@ async def api_delete_task_attachment(request: Request) -> JSONResponse:
         except Exception:
             pass
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["tasks", "detach", task_id, "--name", name, "--tasks-dir", str(tasks_dir), "--json"]
     if expect_task_hash:
         cmd.extend(["--expect-task-hash", str(expect_task_hash)])
@@ -2261,7 +2699,7 @@ QUESTION_ID_RE = re.compile(r"^Q\d{3,}$")
 
 
 async def api_list_questions(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "list", "--tasks-dir", str(tasks_dir), "--json"]
     status = request.query_params.get("status")
     if status:
@@ -2280,7 +2718,7 @@ async def api_get_question(request: Request) -> JSONResponse:
     if not QUESTION_ID_RE.match(question_id):
         return JSONResponse({"error": f"Invalid question ID {question_id!r}, must match ^Q\\d{{3,}}$"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "show", question_id, "--tasks-dir", str(tasks_dir), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
@@ -2302,7 +2740,7 @@ async def api_ask_question(request: Request) -> JSONResponse:
     except Exception:
         body = {}
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "ask", "--tasks-dir", str(tasks_dir), "--json"]
 
     if body.get("from_task"):
@@ -2384,7 +2822,7 @@ async def api_answer_question(request: Request) -> JSONResponse:
     if not choice:
         return JSONResponse({"error": "choice is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "answer", question_id, "--choice", str(choice), "--tasks-dir", str(tasks_dir), "--json"]
 
     text = body.get("text")
@@ -2418,7 +2856,7 @@ async def api_withdraw_question(request: Request) -> JSONResponse:
     if not reason or not str(reason).strip():
         return JSONResponse({"error": "reason is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "withdraw", question_id, "--reason", str(reason).strip(), "--tasks-dir", str(tasks_dir), "--json"]
     if body.get("by"):
         cmd.extend(["--by", str(body["by"])])
@@ -2431,7 +2869,7 @@ async def api_withdraw_question(request: Request) -> JSONResponse:
 
 
 async def api_list_questions_awaiting_application(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["questions", "list", "--tasks-dir", str(tasks_dir), "--status", "answered", "--json"])
     if code != 0:
         status_code = map_cli_status(code, data)
@@ -2451,7 +2889,7 @@ async def api_apply_question(request: Request) -> JSONResponse:
     except Exception:
         body = {}
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "apply", question_id, "--tasks-dir", str(tasks_dir), "--json"]
     if body.get("by"):
         cmd.extend(["--by", str(body["by"])])
@@ -2480,7 +2918,7 @@ async def api_apply_question(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_env_status(request: Request) -> JSONResponse:
-    code, data = await run_ai_orch(["env", "status", "--workspace", str(state.workspace), "--json"])
+    code, data = await run_ai_orch(["env", "status", "--workspace", str(state.project_root(request)), "--json"])
     if code != 0:
         return JSONResponse({"error": data} if not isinstance(data, dict) else data, status_code=504 if code == 504 else 500)
     return JSONResponse(data)
@@ -2498,7 +2936,7 @@ async def api_preview_install_skills(request: Request) -> JSONResponse:
     plugins = body.get("plugins")
     overwrite = body.get("overwrite")
 
-    cmd = ["env", "install-skills", "--scope", scope, "--repo", repo, "--workspace", str(state.workspace), "--dry-run", "--json"]
+    cmd = ["env", "install-skills", "--scope", scope, "--repo", repo, "--workspace", str(state.project_root(request)), "--dry-run", "--json"]
     cmd.extend(["--assistants", *assistants])
     if link:
         cmd.append("--link")
@@ -2532,7 +2970,7 @@ async def api_install_skills(request: Request) -> JSONResponse:
         "env", "install-skills",
         "--scope", scope,
         "--repo", repo,
-        "--workspace", str(state.workspace),
+        "--workspace", str(state.project_root(request)),
         "--expect-plan-hash", str(expect_plan_hash),
         "--json",
     ]
@@ -2561,7 +2999,7 @@ async def api_preview_register_mcp(request: Request) -> JSONResponse:
     scope = body.get("scope", "global")
     provision_venv = body.get("provision_venv", False)
 
-    cmd = ["env", "register-mcp", server, "--scope", scope, "--workspace", str(state.workspace), "--dry-run", "--json"]
+    cmd = ["env", "register-mcp", server, "--scope", scope, "--workspace", str(state.project_root(request)), "--dry-run", "--json"]
     cmd.extend(["--assistants", *assistants])
     if provision_venv:
         cmd.append("--provision-venv")
@@ -2588,7 +3026,7 @@ async def api_register_mcp(request: Request) -> JSONResponse:
     cmd = [
         "env", "register-mcp", server,
         "--scope", scope,
-        "--workspace", str(state.workspace),
+        "--workspace", str(state.project_root(request)),
         "--expect-plan-hash", str(expect_plan_hash),
         "--json",
     ]
@@ -2614,7 +3052,7 @@ async def api_preview_remove_skill(request: Request) -> JSONResponse:
     if not skill or not assistant:
         return JSONResponse({"error": "skill and assistant are required"}, status_code=400)
 
-    cmd = ["env", "remove-skill", str(skill), "--assistant", str(assistant), "--scope", scope, "--workspace", str(state.workspace), "--dry-run", "--json"]
+    cmd = ["env", "remove-skill", str(skill), "--assistant", str(assistant), "--scope", scope, "--workspace", str(state.project_root(request)), "--dry-run", "--json"]
     code, data = await run_ai_orch(cmd)
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -2639,7 +3077,7 @@ async def api_remove_skill(request: Request) -> JSONResponse:
         "env", "remove-skill", str(skill),
         "--assistant", str(assistant),
         "--scope", scope,
-        "--workspace", str(state.workspace),
+        "--workspace", str(state.project_root(request)),
         "--expect-plan-hash", str(expect_plan_hash),
         "--json",
     ]
@@ -2651,7 +3089,7 @@ async def api_remove_skill(request: Request) -> JSONResponse:
 
 
 async def api_preview_resolve_conflicts(request: Request) -> JSONResponse:
-    cmd = ["env", "resolve-conflicts", "--workspace", str(state.workspace), "--dry-run", "--json"]
+    cmd = ["env", "resolve-conflicts", "--workspace", str(state.project_root(request)), "--dry-run", "--json"]
     code, data = await run_ai_orch(cmd)
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -2666,7 +3104,7 @@ async def api_resolve_conflicts(request: Request) -> JSONResponse:
     if not expect_plan_hash:
         return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
 
-    cmd = ["env", "resolve-conflicts", "--workspace", str(state.workspace), "--expect-plan-hash", str(expect_plan_hash), "--json"]
+    cmd = ["env", "resolve-conflicts", "--workspace", str(state.project_root(request)), "--expect-plan-hash", str(expect_plan_hash), "--json"]
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.broadcast({"type": "conflicts_resolved"})
@@ -2711,7 +3149,7 @@ async def api_fetch_repos(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_config_show(request: Request) -> JSONResponse:
-    code, data = await run_ai_orch(["config", "show", "--workspace", str(state.workspace), "--json"])
+    code, data = await run_ai_orch(["config", "show", "--workspace", str(state.project_root(request)), "--json"])
     if code != 0:
         return JSONResponse({"error": data} if not isinstance(data, dict) else data, status_code=504 if code == 504 else 500)
     return JSONResponse(data)
@@ -2738,7 +3176,7 @@ async def api_preview_config_set_profile(request: Request) -> JSONResponse:
     if body.get("scope"):
         cmd.extend(["--scope", str(body["scope"])])
     if body.get("scope") == "project":
-        cmd.extend(["--workspace", str(state.workspace)])
+        cmd.extend(["--workspace", str(state.project_root(request))])
 
     code, data = await run_ai_orch(cmd)
     status_code = map_cli_status(code, data)
@@ -2770,7 +3208,7 @@ async def api_config_set_profile(request: Request) -> JSONResponse:
     if body.get("scope"):
         cmd.extend(["--scope", str(body["scope"])])
     if body.get("scope") == "project":
-        cmd.extend(["--workspace", str(state.workspace)])
+        cmd.extend(["--workspace", str(state.project_root(request))])
 
     code, data = await run_ai_orch(cmd)
     if code == 0:
@@ -2787,7 +3225,7 @@ async def api_preview_config_set_routing(request: Request) -> JSONResponse:
     scope = body.get("scope", "global")
     cmd = ["config", "set-routing", "--scope", scope, "--diff", "--json"]
     if scope == "project":
-        cmd.extend(["--workspace", str(state.workspace)])
+        cmd.extend(["--workspace", str(state.project_root(request))])
     if body.get("orchestrator"):
         cmd.extend(["--orchestrator", str(body["orchestrator"])])
     if body.get("executor"):
@@ -2814,7 +3252,7 @@ async def api_config_set_routing(request: Request) -> JSONResponse:
     scope = body.get("scope", "global")
     cmd = ["config", "set-routing", "--scope", scope, "--expect-hash", str(expect_hash), "--json"]
     if scope == "project":
-        cmd.extend(["--workspace", str(state.workspace)])
+        cmd.extend(["--workspace", str(state.project_root(request))])
     if body.get("orchestrator"):
         cmd.extend(["--orchestrator", str(body["orchestrator"])])
     if body.get("executor"):
@@ -2832,13 +3270,13 @@ async def api_config_set_routing(request: Request) -> JSONResponse:
 
 
 async def api_render_agents_md(request: Request) -> JSONResponse:
-    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--json"])
+    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.project_root(request)), "--json"])
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_preview_agents_md(request: Request) -> JSONResponse:
-    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.workspace), "--diff", "--json"])
+    code, data = await run_ai_orch(["render-agents-md", "--workspace", str(state.project_root(request)), "--diff", "--json"])
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
@@ -2854,7 +3292,7 @@ async def api_apply_agents_md(request: Request) -> JSONResponse:
 
     cmd = [
         "render-agents-md",
-        "--workspace", str(state.workspace),
+        "--workspace", str(state.project_root(request)),
         "--apply",
         "--expect-hash", str(expect_hash),
         "--json",
@@ -2885,9 +3323,9 @@ async def api_run_options(request: Request) -> JSONResponse:
     if note:
         if not NOTE_ID_RE.match(note):
             return JSONResponse({"error": f"Invalid note ID {note!r}"}, status_code=400)
-        cmd = ["run", "options", "--note", str(note), "--workspace", str(state.workspace), "--json"]
+        cmd = ["run", "options", "--note", str(note), "--workspace", str(state.project_root(request)), "--json"]
     else:
-        cmd = ["run", "options", "--task", str(task), "--workspace", str(state.workspace), "--json"]
+        cmd = ["run", "options", "--task", str(task), "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -2909,7 +3347,7 @@ async def api_run_preview(request: Request) -> JSONResponse:
     else:
         target_args = ["--task", str(task)]
 
-    cmd = ["run", "preview", *target_args, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "preview", *target_args, "--workspace", str(state.project_root(request)), "--json"]
     if body.get("mode"):
         cmd.extend(["--mode", str(body["mode"])])
     if body.get("tool"):
@@ -2965,7 +3403,7 @@ async def api_run_start(request: Request) -> JSONResponse:
         *target_args,
         "--expect-plan-hash", str(expect_plan_hash),
         "--requested-by", "ui",
-        "--workspace", str(state.workspace),
+        "--workspace", str(state.project_root(request)),
         "--json",
     ]
     if body.get("mode"):
@@ -3010,7 +3448,7 @@ async def api_run_continue(request: Request) -> JSONResponse:
         "run", "start",
         "--continue", run_id,
         "--requested-by", "ui",
-        "--workspace", str(state.workspace),
+        "--workspace", str(state.project_root(request)),
         "--json",
     ]
     if body.get("instructions"):
@@ -3105,7 +3543,7 @@ async def api_preview_answer_and_resume(request: Request) -> JSONResponse:
     if not choice:
         return JSONResponse({"error": "choice is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "show", question_id, "--tasks-dir", str(tasks_dir), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
@@ -3117,7 +3555,7 @@ async def api_preview_answer_and_resume(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"Question {question_id} is already {q_data.get('status')}"}, status_code=400)
 
     origin_run = q_data.get("origin_run") or q_data.get("origin-run")
-    is_cont, reason, run_record = _check_origin_run_continuable(state.workspace, origin_run)
+    is_cont, reason, run_record = _check_origin_run_continuable(state.project_root(request), origin_run)
 
     text = body.get("text")
     if not is_cont:
@@ -3167,7 +3605,7 @@ async def api_answer_and_resume(request: Request) -> JSONResponse:
     if not choice:
         return JSONResponse({"error": "choice is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["questions", "show", question_id, "--tasks-dir", str(tasks_dir), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
@@ -3179,7 +3617,7 @@ async def api_answer_and_resume(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"Question {question_id} is already {q_data.get('status')}"}, status_code=400)
 
     origin_run = q_data.get("origin_run") or q_data.get("origin-run")
-    is_cont, reason, run_record = _check_origin_run_continuable(state.workspace, origin_run)
+    is_cont, reason, run_record = _check_origin_run_continuable(state.project_root(request), origin_run)
 
     text = body.get("text")
     text_str = str(text) if text is not None else None
@@ -3233,7 +3671,7 @@ async def api_answer_and_resume(request: Request) -> JSONResponse:
             "--instructions", prompt,
             "--expect-plan-hash", plan_hash,
             "--requested-by", "ui",
-            "--workspace", str(state.workspace),
+            "--workspace", str(state.project_root(request)),
             "--json",
         ]
         r_code, r_data = await run_ai_orch(continue_cmd, timeout=60.0)
@@ -3274,7 +3712,7 @@ async def api_answer_and_resume(request: Request) -> JSONResponse:
 
 
 async def api_list_runs(request: Request) -> JSONResponse:
-    cmd = ["run", "list", "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "list", "--workspace", str(state.project_root(request)), "--json"]
     task = request.query_params.get("task")
     if task:
         cmd.extend(["--task", task])
@@ -3296,7 +3734,7 @@ async def api_get_run(request: Request) -> JSONResponse:
     run_id = request.path_params["id"]
     if not RUN_ID_RE.match(run_id):
         return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
-    cmd = ["run", "show", run_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "show", run_id, "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
         err_str = ""
@@ -3315,7 +3753,7 @@ async def api_get_run_logs(request: Request) -> JSONResponse:
     run_id = request.path_params["id"]
     if not RUN_ID_RE.match(run_id):
         return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
-    cmd = ["run", "logs", run_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "logs", run_id, "--workspace", str(state.project_root(request)), "--json"]
     since_offset = request.query_params.get("since_offset")
     if since_offset is not None and since_offset != "":
         cmd.extend(["--since-offset", str(since_offset)])
@@ -3341,7 +3779,7 @@ async def api_cancel_run(request: Request) -> JSONResponse:
     run_id = request.path_params["id"]
     if not RUN_ID_RE.match(run_id):
         return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
-    cmd = ["run", "cancel", run_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "cancel", run_id, "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd, timeout=60.0)
     if code != 0:
         err_str = ""
@@ -3365,7 +3803,7 @@ async def api_mark_delivered_run(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         body = {}
-    cmd = ["run", "mark-delivered", run_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "mark-delivered", run_id, "--workspace", str(state.project_root(request)), "--json"]
     expect_hash = body.get("expect_task_hash") or body.get("expect_task_sha256")
     if expect_hash:
         cmd.extend(["--expect-task-hash", str(expect_hash)])
@@ -3387,9 +3825,9 @@ async def api_apply_verdict_run(request: Request) -> JSONResponse:
         body = {}
     panel_id = body.get("panel_id")
     if panel_id:
-        cmd = ["run", "apply-verdict", "--panel", str(panel_id), "--workspace", str(state.workspace), "--json"]
+        cmd = ["run", "apply-verdict", "--panel", str(panel_id), "--workspace", str(state.project_root(request)), "--json"]
     else:
-        cmd = ["run", "apply-verdict", run_id, "--workspace", str(state.workspace), "--json"]
+        cmd = ["run", "apply-verdict", run_id, "--workspace", str(state.project_root(request)), "--json"]
 
     expect_hash = body.get("expect_task_hash") or body.get("expect_task_sha256")
     if expect_hash:
@@ -3410,7 +3848,7 @@ async def api_cleanup_run(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         body = {}
-    cmd = ["run", "cleanup", run_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "cleanup", run_id, "--workspace", str(state.project_root(request)), "--json"]
     if body.get("discard"):
         cmd.append("--discard")
     if body.get("dry_run"):
@@ -3428,7 +3866,7 @@ async def api_get_triage_proposal(request: Request) -> JSONResponse:
     run_id = request.path_params["id"]
     if not RUN_ID_RE.match(run_id):
         return JSONResponse({"error": f"Invalid run ID {run_id!r}"}, status_code=400)
-    cmd = ["run", "show", run_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "show", run_id, "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
         err_str = ""
@@ -3457,7 +3895,7 @@ async def api_get_triage_proposal(request: Request) -> JSONResponse:
 
     proposal = run_record.get("triage_proposal") or run_record.get("proposal")
     if proposal is None:
-        proposal_file = state.workspace / ".ai-orchestration" / "runs" / run_id / "triage-proposal.json"
+        proposal_file = state.project_root(request) / ".ai-orchestration" / "runs" / run_id / "triage-proposal.json"
         if proposal_file.is_file():
             try:
                 proposal = json.loads(proposal_file.read_text(encoding="utf-8"))
@@ -3498,7 +3936,7 @@ async def api_accept_triage_run(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         body = {}
-    cmd = ["run", "accept-triage", run_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["run", "accept-triage", run_id, "--workspace", str(state.project_root(request)), "--json"]
     only = body.get("only")
     if only is not None:
         if isinstance(only, (list, tuple)):
@@ -3536,7 +3974,7 @@ async def api_accept_triage_run(request: Request) -> JSONResponse:
                         status_code=400,
                     )
 
-        tmp_dir = state.workspace / ".ai-orchestration" / "tmp"
+        tmp_dir = state.project_root(request) / ".ai-orchestration" / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -3590,7 +4028,7 @@ async def api_accept_triage_run(request: Request) -> JSONResponse:
 
 
 async def api_list_inbox_notes(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "list", "--tasks-dir", str(tasks_dir), "--json"]
     status = request.query_params.get("status")
     if status:
@@ -3605,7 +4043,7 @@ async def api_get_inbox_note(request: Request) -> JSONResponse:
     if not NOTE_ID_RE.match(note_id):
         return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "show", note_id, "--tasks-dir", str(tasks_dir), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
@@ -3631,7 +4069,7 @@ async def api_add_inbox_note(request: Request) -> JSONResponse:
     if not title or not str(title).strip():
         return JSONResponse({"error": "title is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "add", "--title", str(title).strip(), "--tasks-dir", str(tasks_dir), "--json"]
 
     if body.get("kind"):
@@ -3677,7 +4115,7 @@ async def api_edit_inbox_note(request: Request) -> JSONResponse:
     except Exception:
         body = {}
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "edit", note_id, "--tasks-dir", str(tasks_dir), "--json"]
 
     if "title" in body:
@@ -3769,7 +4207,7 @@ async def api_upload_inbox_attachment(request: Request) -> JSONResponse:
                     return JSONResponse({"error": "Attachment exceeds 10 MB limit"}, status_code=413)
                 temp_f.write(chunk)
 
-        tasks_dir = state.workspace / "tasks"
+        tasks_dir = state.tasks_dir(request)
         cmd = ["inbox", "attach", note_id, "--file", str(temp_path), "--tasks-dir", str(tasks_dir), "--json"]
         if getattr(upload_file, "filename", None):
             stem = pathlib.Path(upload_file.filename).stem
@@ -3818,7 +4256,7 @@ async def api_delete_inbox_attachment(request: Request) -> JSONResponse:
     if not ATTACHMENT_NAME_RE.match(name):
         return JSONResponse({"error": f"Invalid attachment name {name!r}"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "detach", note_id, "--name", name, "--tasks-dir", str(tasks_dir), "--json"]
     expect_hash = (
         request.query_params.get("expect_hash")
@@ -3862,7 +4300,7 @@ async def api_get_inbox_attachment(request: Request) -> Response:
     if not ATTACHMENT_NAME_RE.match(name):
         return JSONResponse({"error": f"Invalid attachment name {name!r}"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["inbox", "show", note_id, "--tasks-dir", str(tasks_dir), "--json"])
     if code != 0 or not isinstance(data, dict) or not data.get("ok"):
         return JSONResponse({"error": f"Note {note_id} not found"}, status_code=404)
@@ -3901,7 +4339,7 @@ async def api_resolve_inbox_note(request: Request) -> JSONResponse:
     if not produced or not str(produced).strip():
         return JSONResponse({"error": "produced is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "resolve", note_id, "--produced", str(produced).strip(), "--tasks-dir", str(tasks_dir), "--json"]
     if body.get("by"):
         cmd.extend(["--by", str(body["by"])])
@@ -3937,7 +4375,7 @@ async def api_discard_inbox_note(request: Request) -> JSONResponse:
     if not reason or not str(reason).strip():
         return JSONResponse({"error": "reason is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "discard", note_id, "--reason", str(reason).strip(), "--tasks-dir", str(tasks_dir), "--json"]
 
     code, data = await run_ai_orch(cmd)
@@ -3962,7 +4400,7 @@ async def api_reopen_inbox_note(request: Request) -> JSONResponse:
     if not NOTE_ID_RE.match(note_id):
         return JSONResponse({"error": f"Invalid note ID {note_id!r}, must match ^N\\d{{3,}}$"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = ["inbox", "reopen", note_id, "--tasks-dir", str(tasks_dir), "--json"]
 
     code, data = await run_ai_orch(cmd)
@@ -4000,7 +4438,7 @@ async def api_inbox_to_task(request: Request) -> JSONResponse:
     if not title or not str(title).strip():
         return JSONResponse({"error": "title is required"}, status_code=400)
 
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = [
         "tasks", "new",
         "--from-note", note_id,
@@ -4046,21 +4484,21 @@ async def api_inbox_to_task(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_list_use_cases(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["use-cases", "list", "--tasks-dir", str(tasks_dir), "--json"])
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 500)
 
 
 async def api_get_use_case(request: Request) -> JSONResponse:
     uc_id = request.path_params["uc_id"]
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["use-cases", "show", uc_id, "--tasks-dir", str(tasks_dir), "--json"])
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 404)
 
 
 async def api_create_use_case(request: Request) -> JSONResponse:
     body = await request.json()
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     cmd = [
         "use-cases", "create",
         "--id", str(body.get("id", "")),
@@ -4083,7 +4521,7 @@ async def api_create_use_case(request: Request) -> JSONResponse:
 
 async def api_validate_use_case(request: Request) -> JSONResponse:
     uc_id = request.path_params["uc_id"]
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     body = {}
     try:
         body = await request.json()
@@ -4099,7 +4537,7 @@ async def api_validate_use_case(request: Request) -> JSONResponse:
 
 
 async def api_run_campaign(request: Request) -> JSONResponse:
-    tasks_dir = state.workspace / "tasks"
+    tasks_dir = state.tasks_dir(request)
     body = {}
     try:
         body = await request.json()
@@ -4118,7 +4556,7 @@ async def api_run_campaign(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_list_events(request: Request) -> JSONResponse:
-    cmd = ["events", "tail", "--workspace", str(state.workspace), "--json"]
+    cmd = ["events", "tail", "--workspace", str(state.project_root(request)), "--json"]
     since = request.query_params.get("since")
     if since is not None and since.strip():
         try:
@@ -4145,7 +4583,7 @@ async def api_list_events(request: Request) -> JSONResponse:
 
 
 async def api_get_events_stats(request: Request) -> JSONResponse:
-    code, data = await run_ai_orch(["events", "stats", "--workspace", str(state.workspace), "--json"])
+    code, data = await run_ai_orch(["events", "stats", "--workspace", str(state.project_root(request)), "--json"])
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
@@ -4155,7 +4593,7 @@ async def api_get_events_stats(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_list_sessions(request: Request) -> JSONResponse:
-    cmd = ["sessions", "list", "--workspace", str(state.workspace), "--json"]
+    cmd = ["sessions", "list", "--workspace", str(state.project_root(request)), "--json"]
     role = request.query_params.get("role")
     if role:
         cmd.extend(["--role", role])
@@ -4176,7 +4614,7 @@ async def api_list_sessions(request: Request) -> JSONResponse:
 
 async def api_get_session(request: Request) -> JSONResponse:
     session_id = request.path_params["session_id"]
-    cmd = ["sessions", "show", session_id, "--workspace", str(state.workspace), "--json"]
+    cmd = ["sessions", "show", session_id, "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
         err_str = ""
@@ -4193,7 +4631,7 @@ async def api_get_session(request: Request) -> JSONResponse:
 
 async def api_get_role_holder(request: Request) -> JSONResponse:
     role_name = request.path_params.get("role") or request.query_params.get("role") or "orchestrator"
-    cmd = ["sessions", "show", "--role", role_name, "--workspace", str(state.workspace), "--json"]
+    cmd = ["sessions", "show", "--role", role_name, "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
         err_str = ""
@@ -4213,7 +4651,7 @@ async def api_get_role_holder(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def api_list_triggers(request: Request) -> JSONResponse:
-    cmd = ["triggers", "list", "--workspace", str(state.workspace), "--json"]
+    cmd = ["triggers", "list", "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -4221,14 +4659,14 @@ async def api_list_triggers(request: Request) -> JSONResponse:
 
 async def api_get_triggers_status(request: Request) -> JSONResponse:
     role = request.query_params.get("role", "orchestrator")
-    cmd = ["triggers", "status", "--role", role, "--workspace", str(state.workspace), "--json"]
+    cmd = ["triggers", "status", "--role", role, "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_get_triggers_history(request: Request) -> JSONResponse:
-    cmd = ["triggers", "history", "--workspace", str(state.workspace), "--json"]
+    cmd = ["triggers", "history", "--workspace", str(state.project_root(request)), "--json"]
     rule = request.query_params.get("rule")
     if rule:
         cmd.extend(["--rule", rule])
@@ -4245,7 +4683,7 @@ async def api_run_triggers_once(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         body = {}
-    cmd = ["triggers", "run-once", "--workspace", str(state.workspace), "--json"]
+    cmd = ["triggers", "run-once", "--workspace", str(state.project_root(request)), "--json"]
     if body.get("dry_run"):
         cmd.append("--dry-run")
     if body.get("role"):
@@ -4263,14 +4701,14 @@ PROPOSAL_ACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 async def api_list_proposed_actions(request: Request) -> JSONResponse:
     status_filter = request.query_params.get("status", "all").lower().strip() or "all"
-    cmd = ["triggers", "proposals", "--status", status_filter, "--workspace", str(state.workspace), "--json"]
+    cmd = ["triggers", "proposals", "--status", status_filter, "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code == 0 and isinstance(data, dict):
         records = data.get("proposed_actions") or data.get("proposals") or []
         return JSONResponse({"ok": True, "proposed_actions": records, "count": len(records)}, status_code=200)
 
     # Fallback to direct directory read
-    prop_dir = state.workspace / ".ai-orchestration" / "proposed_actions"
+    prop_dir = state.project_root(request) / ".ai-orchestration" / "proposed_actions"
     records = []
     if prop_dir.is_dir():
         norm_status = status_filter
@@ -4422,11 +4860,12 @@ async def api_reject_proposed_action(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
-def _get_active_trigger_config_path() -> pathlib.Path:
-    local_cfg = state.workspace / ".ai-orchestration.local.toml"
+def _get_active_trigger_config_path(request: Request | None = None) -> pathlib.Path:
+    p_root = state.project_root(request)
+    local_cfg = p_root / ".ai-orchestration.local.toml"
     if local_cfg.is_file():
         return local_cfg
-    ws_cfg = state.workspace / "orchestration.toml"
+    ws_cfg = p_root / "orchestration.toml"
     if ws_cfg.is_file():
         return ws_cfg
     global_cfg = os.environ.get("AI_ORCH_GLOBAL_CONFIG", "").strip()
@@ -4512,7 +4951,7 @@ async def api_preview_toggle_trigger(request: Request) -> JSONResponse:
     kill_switch = body.get("kill_switch")
     enabled = bool(body.get("enabled", False))
 
-    target_cfg = _get_active_trigger_config_path()
+    target_cfg = _get_active_trigger_config_path(request)
     old_text, new_text, diff_str, old_hash = _compute_trigger_toggle(target_cfg, rule_name, kill_switch, enabled)
 
     return JSONResponse({
@@ -4537,7 +4976,7 @@ async def api_toggle_trigger(request: Request) -> JSONResponse:
     kill_switch = body.get("kill_switch")
     enabled = bool(body.get("enabled", False))
 
-    target_cfg = _get_active_trigger_config_path()
+    target_cfg = _get_active_trigger_config_path(request)
     old_text, new_text, diff_str, old_hash = _compute_trigger_toggle(target_cfg, rule_name, kill_switch, enabled)
 
     if expect_hash.lower() != old_hash.lower():
@@ -4621,7 +5060,7 @@ def _get_rotate_after_tokens(workspace: pathlib.Path) -> int:
 
 
 async def api_get_orchestrator_status(request: Request) -> JSONResponse:
-    cmd = ["orchestrator", "status", "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "status", "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code != 0:
         status_code = map_cli_status(code, data)
@@ -4630,6 +5069,8 @@ async def api_get_orchestrator_status(request: Request) -> JSONResponse:
     if isinstance(data, dict):
         data.setdefault("rotate_after_tokens", _get_rotate_after_tokens(state.workspace))
         data.setdefault("ok", True)
+        if data.get("generation") is None:
+            data["generation"] = 1
     return JSONResponse(data if isinstance(data, dict) else {"status": data}, status_code=200)
 
 
@@ -4650,7 +5091,7 @@ async def api_post_orchestrator_chat(request: Request) -> JSONResponse:
         "--message", str(message).strip(),
         "--type", turn_type,
         "--priority", priority,
-        "--workspace", str(state.workspace),
+        "--workspace", str(state.project_root(request)),
         "--json",
     ]
     if body.get("policy"):
@@ -4679,8 +5120,8 @@ async def api_get_orchestrator_conversation(request: Request) -> JSONResponse:
         offset = 0
     order = request.query_params.get("order", "asc").lower()
 
-    t_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "turns"
-    q_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "queue"
+    t_dir = state.project_root(request) / ".ai-orchestration" / "orchestrator" / "turns"
+    q_dir = state.project_root(request) / ".ai-orchestration" / "orchestrator" / "queue"
 
     turns_by_id: dict[str, dict[str, Any]] = {}
 
@@ -4810,8 +5251,8 @@ async def api_get_orchestrator_turn(request: Request) -> JSONResponse:
     if not turn_id:
         return JSONResponse({"error": "turn_id is required"}, status_code=400)
 
-    t_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "turns" / turn_id
-    q_file = state.workspace / ".ai-orchestration" / "orchestrator" / "queue" / f"{turn_id}.json"
+    t_dir = state.project_root(request) / ".ai-orchestration" / "orchestrator" / "turns" / turn_id
+    q_file = state.project_root(request) / ".ai-orchestration" / "orchestrator" / "queue" / f"{turn_id}.json"
 
     turn_doc: dict[str, Any] | None = None
     if (t_dir / "turn.json").is_file():
@@ -4842,7 +5283,7 @@ async def api_get_orchestrator_turn(request: Request) -> JSONResponse:
 
 
 async def api_pause_orchestrator(request: Request) -> JSONResponse:
-    cmd = ["orchestrator", "pause", "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "pause", "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.check_and_push_events()
@@ -4853,7 +5294,7 @@ async def api_pause_orchestrator(request: Request) -> JSONResponse:
 
 
 async def api_resume_orchestrator(request: Request) -> JSONResponse:
-    cmd = ["orchestrator", "resume", "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "resume", "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.check_and_push_events()
@@ -4868,7 +5309,7 @@ async def api_rotate_orchestrator(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         body = {}
-    cmd = ["orchestrator", "rotate", "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "rotate", "--workspace", str(state.project_root(request)), "--json"]
     if body.get("tool"):
         cmd.extend(["--tool", str(body["tool"])])
     if body.get("model"):
@@ -4896,7 +5337,7 @@ async def api_cancel_orchestrator_turn(request: Request) -> JSONResponse:
     if not turn_id:
         return JSONResponse({"error": "turn_id is required"}, status_code=400)
 
-    cmd = ["orchestrator", "cancel", str(turn_id), "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "cancel", str(turn_id), "--workspace", str(state.project_root(request)), "--json"]
     code, data = await run_ai_orch(cmd)
     if code == 0:
         await state.check_and_push_events()
@@ -4911,7 +5352,7 @@ async def api_run_next_orchestrator_turn(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         body = {}
-    cmd = ["orchestrator", "run-next", "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "run-next", "--workspace", str(state.project_root(request)), "--json"]
     if body.get("timeout"):
         cmd.extend(["--timeout", str(body["timeout"])])
     code, data = await run_ai_orch(cmd)
@@ -4923,7 +5364,7 @@ async def api_run_next_orchestrator_turn(request: Request) -> JSONResponse:
 
 
 async def api_list_orchestrator_queue(request: Request) -> JSONResponse:
-    q_dir = state.workspace / ".ai-orchestration" / "orchestrator" / "queue"
+    q_dir = state.project_root(request) / ".ai-orchestration" / "orchestrator" / "queue"
     items = []
     if q_dir.is_dir():
         for p in sorted(q_dir.glob("*.json")):
@@ -4949,7 +5390,7 @@ async def api_preview_orchestrator_reassign(request: Request) -> JSONResponse:
     if not tool:
         return JSONResponse({"error": "tool is required"}, status_code=400)
 
-    cmd = ["orchestrator", "reassign", "--tool", str(tool), "--dry-run", "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "reassign", "--tool", str(tool), "--dry-run", "--workspace", str(state.project_root(request)), "--json"]
     model = body.get("model") or request.query_params.get("model")
     if model:
         cmd.extend(["--model", str(model)])
@@ -4977,7 +5418,7 @@ async def api_orchestrator_reassign(request: Request) -> JSONResponse:
     if not expect_hash:
         return JSONResponse({"error": "expect_hash is required"}, status_code=400)
 
-    cmd = ["orchestrator", "reassign", "--tool", str(tool), "--expect-hash", str(expect_hash), "--workspace", str(state.workspace), "--json"]
+    cmd = ["orchestrator", "reassign", "--tool", str(tool), "--expect-hash", str(expect_hash), "--workspace", str(state.project_root(request)), "--json"]
     if body.get("model"):
         cmd.extend(["--model", str(body["model"])])
     scope = body.get("scope", "project")
@@ -5005,7 +5446,7 @@ async def api_preview_setup(request: Request) -> JSONResponse:
     else:
         body = {}
     scope = body.get("scope") or request.query_params.get("scope", "project-local")
-    cmd = ["setup", "--plan", "--scope", str(scope), "--workspace", str(state.workspace), "--json"]
+    cmd = ["setup", "--plan", "--scope", str(scope), "--workspace", str(state.project_root(request)), "--json"]
     orch = body.get("orchestrator") or request.query_params.get("orchestrator")
     if orch:
         cmd.extend(["--orchestrator", str(orch)])
@@ -5037,7 +5478,7 @@ async def api_apply_setup(request: Request) -> JSONResponse:
         return JSONResponse({"error": "expect_hash is required"}, status_code=400)
 
     scope = body.get("scope", "project-local")
-    cmd = ["setup", "--apply", "--expect-hash", str(expect_hash), "--scope", str(scope), "--workspace", str(state.workspace), "--json"]
+    cmd = ["setup", "--apply", "--expect-hash", str(expect_hash), "--scope", str(scope), "--workspace", str(state.project_root(request)), "--json"]
     if body.get("orchestrator"):
         cmd.extend(["--orchestrator", str(body["orchestrator"])])
     if body.get("executor"):
@@ -5062,7 +5503,7 @@ async def api_apply_setup(request: Request) -> JSONResponse:
 
 
 async def api_list_notifications(request: Request) -> JSONResponse:
-    notif_dir = state.workspace / ".ai-orchestration" / "notifications"
+    notif_dir = state.project_root(request) / ".ai-orchestration" / "notifications"
     notifications = []
     if notif_dir.is_dir():
         for entry in sorted(notif_dir.glob("*.json")):
@@ -5075,7 +5516,7 @@ async def api_list_notifications(request: Request) -> JSONResponse:
     notifications.sort(key=lambda n: n.get("created_at") or "", reverse=True)
 
     recent_events_code, recent_events_data = await run_ai_orch([
-        "events", "tail", "--limit", "25", "--workspace", str(state.workspace), "--json"
+        "events", "tail", "--limit", "25", "--workspace", str(state.project_root(request)), "--json"
     ])
     recent_events = []
     if recent_events_code == 0 and isinstance(recent_events_data, dict):
@@ -5092,7 +5533,7 @@ async def api_list_notifications(request: Request) -> JSONResponse:
 
 async def api_mark_notification_read(request: Request) -> JSONResponse:
     notif_id = request.path_params.get("id", "")
-    notif_dir = state.workspace / ".ai-orchestration" / "notifications"
+    notif_dir = state.project_root(request) / ".ai-orchestration" / "notifications"
     if notif_id == "all":
         if notif_dir.is_dir():
             for entry in notif_dir.glob("*.json"):
@@ -5126,6 +5567,14 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     try:
         qs = parse_qs(websocket.scope.get("query_string", b"").decode("latin1"))
         since_param = qs.get("since", [None])[0]
+        project_param = qs.get("project", [None])[0]
+        try:
+            ws_target = state.project_root(project_param)
+            proj_id = state.resolve_project(project_param).id
+        except Exception:
+            ws_target = state.workspace
+            proj_id = "_workspace"
+
         await websocket.send_json({
             "type": "connected",
             "workspace": str(state.workspace),
@@ -5137,13 +5586,14 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 code, data = await run_ai_orch([
                     "events", "tail",
                     "--since", str(since_seq),
-                    "--workspace", str(state.workspace),
+                    "--workspace", str(ws_target),
                     "--json",
                 ])
                 if code == 0 and isinstance(data, dict) and data.get("ok"):
                     for ev in data.get("events", []):
                         await websocket.send_json({
                             "type": "event",
+                            "project": proj_id,
                             "seq": ev.get("seq", 0),
                             "event": ev,
                         })
@@ -5162,7 +5612,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                         code, rep_data = await run_ai_orch([
                             "events", "tail",
                             "--since", str(since_seq),
-                            "--workspace", str(state.workspace),
+                            "--workspace", str(ws_target),
                             "--json",
                         ])
                         if code == 0 and isinstance(rep_data, dict) and rep_data.get("ok"):
@@ -5186,6 +5636,10 @@ routes = [
     Route("/", serve_index, methods=["GET"]),
     Route("/index.html", serve_index, methods=["GET"]),
     Route("/api/workspace", api_get_workspace, methods=["GET"]),
+    Route("/api/workspace/tasks", api_get_workspace_tasks, methods=["GET"]),
+    Route("/api/workspace/questions", api_get_workspace_questions, methods=["GET"]),
+    Route("/api/workspace/inbox", api_get_workspace_inbox, methods=["GET"]),
+    Route("/api/workspace/runs", api_get_workspace_runs, methods=["GET"]),
     Route("/api/tasks", api_list_tasks, methods=["GET"]),
     Route("/api/tasks/labels", api_list_labels, methods=["GET"]),
     Route("/api/tasks/micro", api_create_microtask, methods=["POST"]),
@@ -5339,7 +5793,13 @@ app = Starlette(
     lifespan=lifespan,
     middleware=[
         Middleware(AuthAndHostMiddleware),
+        Middleware(ProjectScopeMiddleware),
     ],
+    exception_handlers={
+        UnknownProjectError: lambda req, exc: JSONResponse({"error": "unknown-project"}, status_code=404),
+        ProjectRequiredError: lambda req, exc: JSONResponse({"error": "project-required"}, status_code=400),
+        OutsideWorkspaceError: lambda req, exc: JSONResponse({"error": "outside-workspace-root"}, status_code=400),
+    },
 )
 
 
