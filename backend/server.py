@@ -997,9 +997,12 @@ async def api_get_workspace(request: Request) -> JSONResponse:
     mode, projects, sub_workspaces = resolver.get_workspace_info()
 
     project_counts = await asyncio.gather(*[resolver.get_project_counts(p, run_ai_orch) for p in projects])
+    # Same cached task lists as the counts; conditional tasks are closed, so the
+    # common view (active tasks only by default) cannot count them itself
+    project_tasks = await asyncio.gather(*[resolver.load_project_tasks(p, run_ai_orch) for p in projects])
 
     projects_summary = []
-    for p, counts in zip(projects, project_counts):
+    for p, counts, tasks in zip(projects, project_counts, project_tasks):
         open_q = fast_count_questions(p.tasks_dir)
         inbox_n = fast_count_inbox(p.tasks_dir)
         projects_summary.append({
@@ -1008,6 +1011,7 @@ async def api_get_workspace(request: Request) -> JSONResponse:
             "kind": p.kind,
             "uuid": p.uuid,
             "counts": counts,
+            "conditional": sum(1 for t in tasks if t.get("conditional")),
             "open_questions": open_q,
             "inbox_notes": inbox_n,
         })
@@ -1145,6 +1149,9 @@ async def api_get_workspace_tasks(request: Request) -> JSONResponse:
                 "labels": list(t.get("labels") or []),
                 "coordinates": resolved_coords,
             }
+            if t.get("conditional"):
+                item["conditional"] = True
+                item["conditions"] = list(t.get("conditions") or [])
             flattened_tasks.append(item)
 
     filter_projects = [x.strip() for k in request.query_params.getlist("project") for x in k.split(",") if x.strip()]

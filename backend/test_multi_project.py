@@ -773,3 +773,62 @@ def test_web_ui_multi_project_contract():
     # 4. App.tsx WS & workspace mount effect is decoupled from selectedProject
     assert "[loadWorkspace, triggerDebouncedReload]" in app_tsx
 
+
+
+def test_common_view_carries_conditional_tasks(auth_headers):
+    """The aggregate keeps T030/T031 condition data, so the common view can show the conditional badge."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ws_path = pathlib.Path(tmp_dir).resolve()
+        subprocess.run(["git", "init", "-q"], cwd=str(ws_path), check=True)
+        _create_minimal_task_tree(
+            ws_path / "proj-a" / "tasks", "01", "alpha", "01.1", "Alpha Task", state="open"
+        )
+        tasks_dir = ws_path / "proj-b" / "tasks"
+        _create_minimal_task_tree(tasks_dir, "02", "beta", "02.1", "Beta Task", state="open")
+        asked = time.strftime("%Y-%m-%d", time.localtime(time.time() - 9 * 86400))
+        (tasks_dir / "questions").mkdir(parents=True, exist_ok=True)
+        (tasks_dir / "questions" / "Q001-pending-choice.md").write_text(
+            "# Q001 Pending choice\n\n"
+            "- id: Q001\n- question: Which option?\n- status: open\n- blocks: -\n- decider: owner\n"
+            f"- asked-by: owner\n- asked: {asked}\n- origin-run: -\n- open-answer: yes\n- recommended: -\n"
+            "- short: Pending choice\n\n"
+            "## Context\nC.\n\n## Options\n- **A** — a: x\n- **B** — b: y\n\n"
+            "## Answer\n- choice: -\n- text: -\n- answered-by: -\n- answered: -\n",
+            encoding="utf-8",
+        )
+        cat_dir = tasks_dir / "general"
+        cat_dir.mkdir(parents=True, exist_ok=True)
+        (cat_dir / "T001-finished-work.md").write_text(
+            "# T001 Finished work\n\n"
+            "- id: T001\n- title: Finished work\n- category: general\n- priority: P2\n"
+            "- priority-reason: test\n- next-up: no\n- state: done\n- executor: self\n- depends-on: -\n"
+            "- decider: -\n- sources: -\n- paths: -\n- handoff: -\n- conditions: Q001\n- short: Finished\n\n"
+            "## Goal\nG.\n\n## Steps\n1. S.\n\n## Verification\nV.\n",
+            encoding="utf-8",
+        )
+        with (tasks_dir / "00-INDEX.md").open("a", encoding="utf-8") as fh:
+            fh.write("\n## Emergent Tasks\n\n- [T001: Finished work](general/T001-finished-work.md)\n")
+
+        old_ws = state.workspace
+        state.workspace = ws_path
+        try:
+            client = TestClient(app)
+            res = client.get("/api/workspace/tasks?per_page=500", headers=auth_headers)
+            assert res.status_code == 200, res.text
+            body = res.json()
+            items = body.get("items") or body.get("tasks") or []
+            t1 = next(t for t in items if t["qualified_id"] == "proj-b/T001")
+            assert t1["conditional"] is True
+            assert t1["conditions"][0]["id"] == "Q001"
+            assert t1["conditions"][0]["decider"] == "owner"
+            assert t1["conditions"][0]["age_days"] == 9
+            other = next(t for t in items if t["qualified_id"] == "proj-a/01.1")
+            assert "conditional" not in other
+
+            # The per-project count does not depend on which tasks the view loaded
+            ws = client.get("/api/workspace", headers=auth_headers).json()
+            by_id = {p["id"]: p for p in ws["projects"]}
+            assert by_id["proj-b"]["conditional"] == 1
+            assert by_id["proj-a"]["conditional"] == 0
+        finally:
+            state.workspace = old_ws
