@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Terminal, Bot, User, AlertTriangle, Layers, Radio } from 'lucide-react';
 import { OrchestrationSession } from '../types';
-import { api } from '../api';
+import { api, useProject } from '../api';
 
 interface SessionChipsProps {
   selectedSessionId?: string | null;
@@ -14,12 +14,14 @@ export const SessionChips: React.FC<SessionChipsProps> = ({
   onSelectSession,
   compact = false,
 }) => {
+  const targetProject = useProject();
   const [sessions, setSessions] = useState<OrchestrationSession[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
 
   const fetchSessions = useCallback(async () => {
+    if (!targetProject) return;
     try {
-      const res = await api.getSessions();
+      const res = await api.getSessions(undefined, targetProject);
       if (res && res.sessions) {
         setSessions(res.sessions);
       }
@@ -28,7 +30,7 @@ export const SessionChips: React.FC<SessionChipsProps> = ({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [targetProject]);
 
   useEffect(() => {
     fetchSessions();

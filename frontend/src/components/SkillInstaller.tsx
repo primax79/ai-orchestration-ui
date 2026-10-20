@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { DownloadCloud, Server, Check, AlertCircle, Loader2 } from 'lucide-react';
-import { api } from '../api';
+import { api, useProjectContext } from '../api';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface SkillInstallerProps {
@@ -8,6 +8,21 @@ interface SkillInstallerProps {
 }
 
 export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => {
+  const { selectedProject, fallbackProject, isCommonView, projects } = useProjectContext();
+  const writableProjects = projects.filter((p) => p.kind !== 'sub_workspace');
+  const [targetProject, setTargetProject] = useState<string>(
+    selectedProject || fallbackProject || writableProjects[0]?.id || ''
+  );
+
+  useEffect(() => {
+    if (selectedProject) {
+      setTargetProject(selectedProject);
+    } else if (!targetProject && (fallbackProject || writableProjects[0]?.id)) {
+      setTargetProject(fallbackProject || writableProjects[0]?.id || '');
+    }
+  }, [selectedProject, fallbackProject, projects]);
+
+  const effectiveProject = selectedProject || targetProject || fallbackProject;
   // No assistant preselected; scope radio has no default (must choose)
   const [selectedAssistants, setSelectedAssistants] = useState<string[]>([]);
   const [scope, setScope] = useState<'global' | 'project' | null>(null);
@@ -36,7 +51,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
     setStatusMessage(null);
 
     try {
-      const res = await api.previewInstallSkills(selectedAssistants, scope, repo, useSymlink);
+      const res = await api.previewInstallSkills(selectedAssistants, scope, repo, useSymlink, undefined, undefined, effectiveProject);
       setConfirmData({
         title: `Install Skills (${repo})`,
         summary: `Install skills from **${repo}** into **${selectedAssistants.join(', ')}** (${scope} scope). Mode: ${useSymlink ? 'Symlink (dev)' : 'Copy (standalone)'}.`,
@@ -45,7 +60,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
         hash: res.plan_hash,
         onApplyAction: async (hash?: string) => {
           if (!hash) throw new Error('Plan hash is required for installation');
-          const applyRes = await api.installSkills(selectedAssistants, scope, repo, useSymlink, hash);
+          const applyRes = await api.installSkills(selectedAssistants, scope, repo, useSymlink, hash, undefined, undefined, effectiveProject);
           setConfirmData(null);
           setStatusMessage({
             type: 'success',
@@ -54,7 +69,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
           onRefresh();
         },
         onRefetchAction: async () => {
-          const r = await api.previewInstallSkills(selectedAssistants, scope, repo, useSymlink);
+          const r = await api.previewInstallSkills(selectedAssistants, scope, repo, useSymlink, undefined, undefined, effectiveProject);
           return {
             summary: `Install skills from **${repo}** into **${selectedAssistants.join(', ')}** (${scope} scope). Mode: ${useSymlink ? 'Symlink (dev)' : 'Copy (standalone)'}.`,
             plan: r.plan,
@@ -76,7 +91,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
     setStatusMessage(null);
 
     try {
-      const res = await api.previewRegisterMcp(server, selectedAssistants, scope, true);
+      const res = await api.previewRegisterMcp(server, selectedAssistants, scope, true, effectiveProject);
       setConfirmData({
         title: `Register MCP Server (${server})`,
         summary: `Register MCP server **${server}** in configuration for **${selectedAssistants.join(', ')}** (${scope} scope). Python venv provisioning is enabled.`,
@@ -85,7 +100,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
         hash: res.plan_hash,
         onApplyAction: async (hash?: string) => {
           if (!hash) throw new Error('Plan hash is required for MCP registration');
-          const applyRes = await api.registerMcp(server, selectedAssistants, scope, true, hash);
+          const applyRes = await api.registerMcp(server, selectedAssistants, scope, true, hash, effectiveProject);
           setConfirmData(null);
           setStatusMessage({
             type: 'success',
@@ -94,7 +109,7 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
           onRefresh();
         },
         onRefetchAction: async () => {
-          const r = await api.previewRegisterMcp(server, selectedAssistants, scope, true);
+          const r = await api.previewRegisterMcp(server, selectedAssistants, scope, true, effectiveProject);
           return {
             summary: `Register MCP server **${server}** in configuration for **${selectedAssistants.join(', ')}** (${scope} scope). Python venv provisioning is enabled.`,
             plan: r.plan,
@@ -131,6 +146,31 @@ export const SkillInstaller: React.FC<SkillInstallerProps> = ({ onRefresh }) => 
         gap: '2rem',
         alignItems: 'center',
       }}>
+        {isCommonView && writableProjects.length > 1 && (
+          <div>
+            <label style={{ fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', display: 'block', marginBottom: '0.4rem' }}>
+              Target Project
+            </label>
+            <select
+              value={targetProject}
+              onChange={(e) => setTargetProject(e.target.value)}
+              style={{
+                backgroundColor: '#0f172a',
+                color: '#f8fafc',
+                border: '1px solid #475569',
+                padding: '0.35rem 0.65rem',
+                borderRadius: '0.375rem',
+                fontSize: '0.82rem',
+              }}
+            >
+              {writableProjects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.id} ({p.kind})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div>
           <label style={{ fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', textTransform: 'uppercase', display: 'block', marginBottom: '0.4rem' }}>
             Target Assistants <span style={{ color: selectedAssistants.length === 0 ? '#ef4444' : '#10b981' }}>*</span>

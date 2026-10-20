@@ -1,7 +1,9 @@
+import { createContext, useContext } from 'react';
 import {
   TaskListResponse,
   WorkspaceTasksResponse,
   WorkspaceInfo,
+  WorkspaceProjectInfo,
   EnvStatusResponse,
   OrchestrationConfigResponse,
   ConfigPreviewResponse,
@@ -54,6 +56,46 @@ import {
   SetShortTitleResponse,
 } from './types';
 
+export interface ProjectScopeOpts {
+  project?: string | null;
+}
+
+export interface ProjectContextValue {
+  selectedProject: string | null;
+  fallbackProject: string | null;
+  isCommonView: boolean;
+  projects: WorkspaceProjectInfo[];
+}
+
+export const ProjectContext = createContext<ProjectContextValue>({
+  selectedProject: null,
+  fallbackProject: null,
+  isCommonView: false,
+  projects: [],
+});
+
+export function useProjectContext(): ProjectContextValue {
+  return useContext(ProjectContext);
+}
+
+/** Returns the selected project, or fallback project when in common view / single project. */
+export function useProject(): string | null {
+  const ctx = useContext(ProjectContext);
+  return ctx.selectedProject ?? ctx.fallbackProject;
+}
+
+export function resolveExplicitProject(
+  arg?: string | ProjectScopeOpts | null
+): string | null | undefined {
+  if (arg === undefined) return undefined;
+  if (arg === null) return null;
+  if (typeof arg === 'string') return arg.trim() || null;
+  if (typeof arg === 'object' && 'project' in arg) {
+    return arg.project ? arg.project.trim() || null : null;
+  }
+  return undefined;
+}
+
 // Custom ApiError to carry HTTP status and response payload
 export class ApiError extends Error {
   status: number;
@@ -82,48 +124,17 @@ export const isVsCode = typeof window !== 'undefined' && typeof window.acquireVs
 export const vscode = isVsCode && window.acquireVsCodeApi ? window.acquireVsCodeApi() : null;
 
 let messageSeq = 0;
-let currentProjectId: string | null = null;
-let fallbackProjectId: string | null = null;
-
-export function setCurrentProject(projectId: string | null): void {
-  currentProjectId = projectId ? projectId.trim() || null : null;
-}
-
-export function getCurrentProject(): string | null {
-  return currentProjectId;
-}
-
-export function setFallbackProject(projectId: string | null): void {
-  fallbackProjectId = projectId ? projectId.trim() || null : null;
-}
-
-export function getFallbackProject(): string | null {
-  return fallbackProjectId;
-}
 
 function isAggregateEndpoint(endpoint: string): boolean {
   const path = endpoint.split('?')[0];
   return path === '/api/workspace' || path.startsWith('/api/workspace/');
 }
 
-function isSetupConfigDoctorEndpoint(endpoint: string): boolean {
-  const path = endpoint.split('?')[0];
-  return (
-    path.startsWith('/api/setup') ||
-    path.startsWith('/api/config') ||
-    path.startsWith('/api/env') ||
-    path.startsWith('/api/token')
-  );
-}
-
 export function withProjectQuery(endpoint: string, explicitProject?: string | null): string {
   if (isAggregateEndpoint(endpoint)) {
     return endpoint;
   }
-  const proj =
-    explicitProject !== undefined
-      ? explicitProject
-      : currentProjectId ?? (isSetupConfigDoctorEndpoint(endpoint) ? fallbackProjectId : null);
+  const proj = explicitProject ? explicitProject.trim() : null;
   if (!proj) {
     return endpoint;
   }
@@ -174,14 +185,14 @@ const AGGREGATE_VSCODE_TYPES = new Set([
   'getWorkspaceRuns',
 ]);
 
-function sendVsCodeMessage<T>(type: string, payload?: any): Promise<T> {
+function sendVsCodeMessage<T>(type: string, payload?: any, explicitProject?: string | null): Promise<T> {
   return new Promise((resolve, reject) => {
     if (!vscode) return reject(new ApiError('VS Code API not available', 500));
     const id = `req_${++messageSeq}_${Date.now()}`;
     pendingRequests.set(id, { resolve, reject });
     let finalPayload = payload;
     if (!AGGREGATE_VSCODE_TYPES.has(type)) {
-      const proj = currentProjectId ?? fallbackProjectId;
+      const proj = explicitProject ? explicitProject.trim() : null;
       if (proj) {
         if (finalPayload && typeof finalPayload === 'object' && !Array.isArray(finalPayload)) {
           if (finalPayload.project === undefined) {
@@ -203,8 +214,8 @@ function getApiToken(): string | null {
 }
 
 // Helper for HTTP fetch in standalone browser mode
-async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T> {
-  const url = endpoint.startsWith('http') ? endpoint : withProjectQuery(endpoint);
+async function apiFetch<T>(endpoint: string, options?: RequestInit, explicitProject?: string | null): Promise<T> {
+  const url = endpoint.startsWith('http') ? endpoint : withProjectQuery(endpoint, explicitProject);
   const token = getApiToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -350,9 +361,10 @@ export const api = {
     throw new ApiError('Workspace switching is not supported in standalone browser mode. Start another server with the desired workspace.', 400);
   },
 
-  async getTasks(filters?: { kind?: string[]; label?: string[] }, projectOverride?: string): Promise<TaskListResponse> {
+  async getTasks(filters?: { kind?: string[]; label?: string[]; project?: string | null }, projectOverride?: string | ProjectScopeOpts | null): Promise<TaskListResponse> {
+    const proj = resolveExplicitProject(projectOverride) ?? (filters?.project ? filters.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskListResponse>('getTasks', projectOverride ? { ...(filters || {}), project: projectOverride } : filters);
+      return sendVsCodeMessage<TaskListResponse>('getTasks', filters, proj);
     }
     const params = new URLSearchParams();
     if (filters?.kind) {
@@ -361,18 +373,16 @@ export const api = {
     if (filters?.label) {
       filters.label.forEach((l) => params.append('label', l));
     }
-    if (projectOverride) {
-      params.set('project', projectOverride);
-    }
     const qs = params.toString();
-    return apiFetch<TaskListResponse>(qs ? `/api/tasks?${qs}` : '/api/tasks');
+    return apiFetch<TaskListResponse>(qs ? `/api/tasks?${qs}` : '/api/tasks', undefined, proj);
   },
 
-  async validateTasks(): Promise<any> {
+  async validateTasks(opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('validateTasks');
+      return sendVsCodeMessage('validateTasks', undefined, proj);
     }
-    return apiFetch('/api/tasks/validate');
+    return apiFetch('/api/tasks/validate', undefined, proj);
   },
 
   async transitionTask(
@@ -381,10 +391,12 @@ export const api = {
     actor = 'operator',
     verifier?: string,
     reason?: string,
-    expectTaskHash?: string
+    expectTaskHash?: string,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('transitionTask', { taskId, newState, actor, verifier, reason, expectTaskHash });
+      return sendVsCodeMessage('transitionTask', { taskId, newState, actor, verifier, reason, expectTaskHash }, proj);
     }
     return apiFetch('/api/tasks/transition', {
       method: 'POST',
@@ -396,59 +408,66 @@ export const api = {
         reason,
         expect_task_hash: expectTaskHash,
       }),
-    });
+    }, proj);
   },
 
-  async previewSyncIndex(): Promise<any> {
+  async previewSyncIndex(opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewSyncIndex');
+      return sendVsCodeMessage('previewSyncIndex', undefined, proj);
     }
-    return apiFetch('/api/tasks/sync-index/preview');
+    return apiFetch('/api/tasks/sync-index/preview', undefined, proj);
   },
 
-  async syncIndex(expectHash: string): Promise<any> {
+  async syncIndex(expectHash: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('syncIndex', { expectHash });
+      return sendVsCodeMessage('syncIndex', { expectHash }, proj);
     }
     return apiFetch('/api/tasks/sync-index', {
       method: 'POST',
       body: JSON.stringify({ expect_hash: expectHash }),
-    });
+    }, proj);
   },
 
-  async previewSetShortTitle(taskId: string, payload: SetShortTitlePayload): Promise<SetShortTitleResponse> {
+  async previewSetShortTitle(taskId: string, payload: SetShortTitlePayload, opts?: string | ProjectScopeOpts | null): Promise<SetShortTitleResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetShortTitleResponse>('previewSetShortTitle', { taskId, ...payload });
+      return sendVsCodeMessage<SetShortTitleResponse>('previewSetShortTitle', { taskId, ...payload }, proj);
     }
     return apiFetch<SetShortTitleResponse>(`/api/tasks/${encodeURIComponent(taskId)}/short/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async setShortTitle(taskId: string, payload: SetShortTitlePayload): Promise<SetShortTitleResponse> {
+  async setShortTitle(taskId: string, payload: SetShortTitlePayload, opts?: string | ProjectScopeOpts | null): Promise<SetShortTitleResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetShortTitleResponse>('setShortTitle', { taskId, ...payload });
+      return sendVsCodeMessage<SetShortTitleResponse>('setShortTitle', { taskId, ...payload }, proj);
     }
     return apiFetch<SetShortTitleResponse>(`/api/tasks/${encodeURIComponent(taskId)}/short`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async getTaskDetail(taskId: string): Promise<any> {
+  async getTaskDetail(taskId: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('getTaskDetail', { taskId });
+      return sendVsCodeMessage('getTaskDetail', { taskId }, proj);
     }
-    return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+    return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`, undefined, proj);
   },
 
   async uploadTaskAttachment(
     taskId: string,
     file: File | Blob,
     filename?: string,
-    expectTaskHash?: string
+    expectTaskHash?: string,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<UploadAttachmentResponse> {
+    const proj = resolveExplicitProject(opts);
     const fname = filename || (file instanceof File ? file.name : 'attachment.txt');
     if (isVsCode && vscode) {
       const base64 = await blobToBase64(file);
@@ -457,7 +476,7 @@ export const api = {
         filename: fname,
         data: base64,
         expect_task_hash: expectTaskHash,
-      });
+      }, proj);
     }
 
     const formData = new FormData();
@@ -473,7 +492,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(withProjectQuery(`/api/tasks/${encodeURIComponent(taskId)}/attachments`), {
+      res = await fetch(withProjectQuery(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, proj), {
         method: 'POST',
         headers,
         body: formData,
@@ -497,9 +516,10 @@ export const api = {
     return res.json();
   },
 
-  async getTaskAttachment(taskId: string, name: string, projectOverride?: string): Promise<Blob> {
+  async getTaskAttachment(taskId: string, name: string, projectOverride?: string | ProjectScopeOpts | null): Promise<Blob> {
+    const proj = resolveExplicitProject(projectOverride);
     if (isVsCode && vscode) {
-      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getTaskAttachment', { id: taskId, name, ...(projectOverride ? { project: projectOverride } : {}) });
+      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getTaskAttachment', { id: taskId, name }, proj);
       const byteCharacters = atob(res.data);
       const byteNumbers = new Array(byteCharacters.length);
       for (let i = 0; i < byteCharacters.length; i++) {
@@ -517,7 +537,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(withProjectQuery(`/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(name)}`, projectOverride), {
+      res = await fetch(withProjectQuery(`/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(name)}`, proj), {
         headers,
       });
     } catch {
@@ -539,69 +559,76 @@ export const api = {
     return res.blob();
   },
 
-  async deleteTaskAttachment(taskId: string, name: string, expectTaskHash?: string): Promise<DeleteAttachmentResponse> {
+  async deleteTaskAttachment(taskId: string, name: string, expectTaskHash?: string, opts?: string | ProjectScopeOpts | null): Promise<DeleteAttachmentResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<DeleteAttachmentResponse>('deleteTaskAttachment', { id: taskId, name, expect_task_hash: expectTaskHash });
+      return sendVsCodeMessage<DeleteAttachmentResponse>('deleteTaskAttachment', { id: taskId, name, expect_task_hash: expectTaskHash }, proj);
     }
     const q = expectTaskHash ? `?expect_task_hash=${encodeURIComponent(expectTaskHash)}` : '';
     return apiFetch<DeleteAttachmentResponse>(`/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(name)}${q}`, {
       method: 'DELETE',
-    });
+    }, proj);
   },
 
-  async getQuestions(params?: { status?: string; blocks?: string }): Promise<QuestionListResponse> {
+  async getQuestions(params?: { status?: string; blocks?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<QuestionListResponse> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<QuestionListResponse>('getQuestions', params);
+      return sendVsCodeMessage<QuestionListResponse>('getQuestions', params, proj);
     }
     const searchParams = new URLSearchParams();
     if (params?.status) searchParams.set('status', params.status);
     if (params?.blocks) searchParams.set('blocks', params.blocks);
     const qs = searchParams.toString();
-    return apiFetch<QuestionListResponse>(qs ? `/api/questions?${qs}` : '/api/questions');
+    return apiFetch<QuestionListResponse>(qs ? `/api/questions?${qs}` : '/api/questions', undefined, proj);
   },
 
-  async getQuestion(id: string): Promise<{ ok: boolean; question: QuestionItem }> {
+  async getQuestion(id: string, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; question: QuestionItem }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean; question: QuestionItem }>('getQuestion', { id });
+      return sendVsCodeMessage<{ ok: boolean; question: QuestionItem }>('getQuestion', { id }, proj);
     }
-    return apiFetch<{ ok: boolean; question: QuestionItem }>(`/api/questions/${encodeURIComponent(id)}`);
+    return apiFetch<{ ok: boolean; question: QuestionItem }>(`/api/questions/${encodeURIComponent(id)}`, undefined, proj);
   },
 
-  async askQuestion(payload: AskQuestionPayload): Promise<{ ok: boolean; id: string; rel_path?: string }> {
+  async askQuestion(payload: AskQuestionPayload, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; id: string; rel_path?: string }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean; id: string; rel_path?: string }>('askQuestion', payload);
+      return sendVsCodeMessage<{ ok: boolean; id: string; rel_path?: string }>('askQuestion', payload, proj);
     }
     return apiFetch<{ ok: boolean; id: string; rel_path?: string }>('/api/questions', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async answerQuestion(id: string, payload: AnswerQuestionPayload): Promise<{ ok: boolean; choice: string; unblocked_tasks?: string[] }> {
+  async answerQuestion(id: string, payload: AnswerQuestionPayload, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; choice: string; unblocked_tasks?: string[] }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean; choice: string; unblocked_tasks?: string[] }>('answerQuestion', { id, ...payload });
+      return sendVsCodeMessage<{ ok: boolean; choice: string; unblocked_tasks?: string[] }>('answerQuestion', { id, ...payload }, proj);
     }
     return apiFetch<{ ok: boolean; choice: string; unblocked_tasks?: string[] }>(`/api/questions/${encodeURIComponent(id)}/answer`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async withdrawQuestion(id: string, payload: WithdrawQuestionPayload): Promise<{ ok: boolean }> {
+  async withdrawQuestion(id: string, payload: WithdrawQuestionPayload, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean }>('withdrawQuestion', { id, ...payload });
+      return sendVsCodeMessage<{ ok: boolean }>('withdrawQuestion', { id, ...payload }, proj);
     }
     return apiFetch<{ ok: boolean }>(`/api/questions/${encodeURIComponent(id)}/withdraw`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async getEnvStatus(): Promise<EnvStatusResponse> {
+  async getEnvStatus(opts?: string | ProjectScopeOpts | null): Promise<EnvStatusResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<EnvStatusResponse>('getEnvStatus');
+      return sendVsCodeMessage<EnvStatusResponse>('getEnvStatus', undefined, proj);
     }
-    return apiFetch<EnvStatusResponse>('/api/env/status');
+    return apiFetch<EnvStatusResponse>('/api/env/status', undefined, proj);
   },
 
   async previewInstallSkills(
@@ -610,15 +637,17 @@ export const api = {
     repo = 'ai-orchestration',
     link = false,
     plugins?: string[],
-    overwrite?: string[]
+    overwrite?: string[],
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewInstallSkills', { assistants, scope, repo, link, plugins, overwrite });
+      return sendVsCodeMessage('previewInstallSkills', { assistants, scope, repo, link, plugins, overwrite }, proj);
     }
     return apiFetch('/api/env/install-skills/preview', {
       method: 'POST',
       body: JSON.stringify({ assistants, scope, repo, link, plugins, overwrite }),
-    });
+    }, proj);
   },
 
   async installSkills(
@@ -628,10 +657,12 @@ export const api = {
     link = false,
     expectPlanHash?: string,
     plugins?: string[],
-    overwrite?: string[]
+    overwrite?: string[],
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('installSkills', { assistants, scope, repo, link, expectPlanHash, plugins, overwrite });
+      return sendVsCodeMessage('installSkills', { assistants, scope, repo, link, expectPlanHash, plugins, overwrite }, proj);
     }
     return apiFetch('/api/env/install-skills', {
       method: 'POST',
@@ -644,17 +675,19 @@ export const api = {
         plugins,
         overwrite,
       }),
-    });
+    }, proj);
   },
 
   async previewRegisterMcp(
     server: string,
     assistants: string[],
     scope: 'global' | 'project',
-    provisionVenv = false
+    provisionVenv = false,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewRegisterMcp', { server, assistants, scope, provisionVenv });
+      return sendVsCodeMessage('previewRegisterMcp', { server, assistants, scope, provisionVenv }, proj);
     }
     return apiFetch('/api/env/register-mcp/preview', {
       method: 'POST',
@@ -664,7 +697,7 @@ export const api = {
         scope,
         provision_venv: provisionVenv,
       }),
-    });
+    }, proj);
   },
 
   async registerMcp(
@@ -672,10 +705,12 @@ export const api = {
     assistants: string[],
     scope: 'global' | 'project',
     provisionVenv = false,
-    expectPlanHash?: string
+    expectPlanHash?: string,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('registerMcp', { server, assistants, scope, provisionVenv, expectPlanHash });
+      return sendVsCodeMessage('registerMcp', { server, assistants, scope, provisionVenv, expectPlanHash }, proj);
     }
     return apiFetch('/api/env/register-mcp', {
       method: 'POST',
@@ -686,80 +721,89 @@ export const api = {
         provision_venv: provisionVenv,
         expect_plan_hash: expectPlanHash,
       }),
-    });
+    }, proj);
   },
 
   async previewRemoveSkill(
     skill: string,
     assistant: string,
-    scope: 'global' | 'project' = 'global'
+    scope: 'global' | 'project' = 'global',
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewRemoveSkill', { skill, assistant, scope });
+      return sendVsCodeMessage('previewRemoveSkill', { skill, assistant, scope }, proj);
     }
     return apiFetch('/api/env/remove-skill/preview', {
       method: 'POST',
       body: JSON.stringify({ skill, assistant, scope }),
-    });
+    }, proj);
   },
 
   async removeSkill(
     skill: string,
     assistant: string,
     scope: 'global' | 'project' = 'global',
-    expectPlanHash?: string
+    expectPlanHash?: string,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('removeSkill', { skill, assistant, scope, expectPlanHash });
+      return sendVsCodeMessage('removeSkill', { skill, assistant, scope, expectPlanHash }, proj);
     }
     return apiFetch('/api/env/remove-skill', {
       method: 'POST',
       body: JSON.stringify({ skill, assistant, scope, expect_plan_hash: expectPlanHash }),
-    });
+    }, proj);
   },
 
-  async previewResolveConflicts(): Promise<any> {
+  async previewResolveConflicts(opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewResolveConflicts');
+      return sendVsCodeMessage('previewResolveConflicts', undefined, proj);
     }
-    return apiFetch('/api/env/resolve-conflicts/preview', { method: 'POST' });
+    return apiFetch('/api/env/resolve-conflicts/preview', { method: 'POST' }, proj);
   },
 
-  async resolveConflicts(expectPlanHash?: string): Promise<any> {
+  async resolveConflicts(expectPlanHash?: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('resolveConflicts', { expectPlanHash });
+      return sendVsCodeMessage('resolveConflicts', { expectPlanHash }, proj);
     }
     return apiFetch('/api/env/resolve-conflicts', {
       method: 'POST',
       body: JSON.stringify({ expect_plan_hash: expectPlanHash }),
-    });
+    }, proj);
   },
 
-  async previewFetchRepos(repos?: string[]): Promise<any> {
+  async previewFetchRepos(repos?: string[], opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('previewFetchRepos', { repos });
+      return sendVsCodeMessage('previewFetchRepos', { repos }, proj);
     }
     return apiFetch('/api/env/fetch-repos/preview', {
       method: 'POST',
       body: JSON.stringify({ repos }),
-    });
+    }, proj);
   },
 
-  async fetchRepos(expectPlanHash: string, repos?: string[]): Promise<any> {
+  async fetchRepos(expectPlanHash: string, repos?: string[], opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('fetchRepos', { expectPlanHash, repos });
+      return sendVsCodeMessage('fetchRepos', { expectPlanHash, repos }, proj);
     }
     return apiFetch('/api/env/fetch-repos', {
       method: 'POST',
       body: JSON.stringify({ expect_plan_hash: expectPlanHash, repos }),
-    });
+    }, proj);
   },
 
-  async getConfig(): Promise<OrchestrationConfigResponse> {
+  async getConfig(opts?: string | ProjectScopeOpts | null): Promise<OrchestrationConfigResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<OrchestrationConfigResponse>('getConfig');
+      return sendVsCodeMessage<OrchestrationConfigResponse>('getConfig', undefined, proj);
     }
-    return apiFetch<OrchestrationConfigResponse>('/api/config/show');
+    return apiFetch<OrchestrationConfigResponse>('/api/config/show', undefined, proj);
   },
 
   async previewSetProfile(
@@ -769,15 +813,17 @@ export const api = {
     variant?: string,
     effort?: string,
     basis?: string,
-    scope: 'global' | 'project' = 'global'
+    scope: 'global' | 'project' = 'global',
+    opts?: string | ProjectScopeOpts | null
   ): Promise<ConfigPreviewResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigPreviewResponse>('previewSetProfile', { tool, profile, model, variant, effort, basis, scope });
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewSetProfile', { tool, profile, model, variant, effort, basis, scope }, proj);
     }
     return apiFetch<ConfigPreviewResponse>('/api/config/set-profile/preview', {
       method: 'POST',
       body: JSON.stringify({ tool, profile, model, variant, effort, basis, scope }),
-    });
+    }, proj);
   },
 
   async setProfile(
@@ -788,15 +834,17 @@ export const api = {
     variant?: string,
     effort?: string,
     basis?: string,
-    scope: 'global' | 'project' = 'global'
+    scope: 'global' | 'project' = 'global',
+    opts?: string | ProjectScopeOpts | null
   ): Promise<ConfigApplyResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigApplyResponse>('setProfile', { tool, profile, model, expectHash, variant, effort, basis, scope });
+      return sendVsCodeMessage<ConfigApplyResponse>('setProfile', { tool, profile, model, expectHash, variant, effort, basis, scope }, proj);
     }
     return apiFetch<ConfigApplyResponse>('/api/config/set-profile', {
       method: 'POST',
       body: JSON.stringify({ tool, profile, model, expect_hash: expectHash, variant, effort, basis, scope }),
-    });
+    }, proj);
   },
 
   async previewSetRouting(
@@ -804,10 +852,12 @@ export const api = {
     orchestrator?: string,
     executor?: string,
     defaultProfile?: string,
-    verificationMode?: string
+    verificationMode?: string,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<ConfigPreviewResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigPreviewResponse>('previewSetRouting', { scope, orchestrator, executor, defaultProfile, verificationMode });
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewSetRouting', { scope, orchestrator, executor, defaultProfile, verificationMode }, proj);
     }
     return apiFetch<ConfigPreviewResponse>('/api/config/set-routing/preview', {
       method: 'POST',
@@ -818,7 +868,7 @@ export const api = {
         default_profile: defaultProfile,
         verification_mode: verificationMode,
       }),
-    });
+    }, proj);
   },
 
   async setRouting(
@@ -827,10 +877,12 @@ export const api = {
     orchestrator?: string,
     executor?: string,
     defaultProfile?: string,
-    verificationMode?: string
+    verificationMode?: string,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<ConfigApplyResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigApplyResponse>('setRouting', { expectHash, scope, orchestrator, executor, defaultProfile, verificationMode });
+      return sendVsCodeMessage<ConfigApplyResponse>('setRouting', { expectHash, scope, orchestrator, executor, defaultProfile, verificationMode }, proj);
     }
     return apiFetch<ConfigApplyResponse>('/api/config/set-routing', {
       method: 'POST',
@@ -842,213 +894,234 @@ export const api = {
         default_profile: defaultProfile,
         verification_mode: verificationMode,
       }),
-    });
+    }, proj);
   },
 
-  async renderAgentsMd(): Promise<any> {
+  async renderAgentsMd(opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('renderAgentsMd');
+      return sendVsCodeMessage('renderAgentsMd', undefined, proj);
     }
-    return apiFetch('/api/config/render-agents-md');
+    return apiFetch('/api/config/render-agents-md', undefined, proj);
   },
 
-  async previewAgentsMd(): Promise<ConfigPreviewResponse> {
+  async previewAgentsMd(opts?: string | ProjectScopeOpts | null): Promise<ConfigPreviewResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigPreviewResponse>('previewAgentsMd');
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewAgentsMd', undefined, proj);
     }
-    return apiFetch<ConfigPreviewResponse>('/api/config/render-agents-md/preview');
+    return apiFetch<ConfigPreviewResponse>('/api/config/render-agents-md/preview', undefined, proj);
   },
 
-  async applyAgentsMd(expectHash: string, allowGlobalRouting = false): Promise<ConfigApplyResponse> {
+  async applyAgentsMd(expectHash: string, allowGlobalRouting = false, opts?: string | ProjectScopeOpts | null): Promise<ConfigApplyResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigApplyResponse>('applyAgentsMd', { expectHash, allowGlobalRouting });
+      return sendVsCodeMessage<ConfigApplyResponse>('applyAgentsMd', { expectHash, allowGlobalRouting }, proj);
     }
     return apiFetch<ConfigApplyResponse>('/api/config/render-agents-md/apply', {
       method: 'POST',
       body: JSON.stringify({ expect_hash: expectHash, allow_global_routing: allowGlobalRouting }),
-    });
+    }, proj);
   },
 
   // -------------------------------------------------------------------------
   // Agent Runs Endpoints (Task 07.7)
   // -------------------------------------------------------------------------
 
-  async getRunOptions(target: string | { task?: string; note?: string }): Promise<RunOptionsResponse> {
+  async getRunOptions(target: string | { task?: string; note?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<RunOptionsResponse> {
     const payload = typeof target === 'string'
       ? (target.startsWith('N') ? { note: target } : { task: target })
       : target;
+    const proj = resolveExplicitProject(opts) ?? (typeof target === 'object' && target.project ? target.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<RunOptionsResponse>('getRunOptions', payload);
+      return sendVsCodeMessage<RunOptionsResponse>('getRunOptions', payload, proj);
     }
     const query = new URLSearchParams();
     if (payload.task) query.set('task', payload.task);
     if (payload.note) query.set('note', payload.note);
-    return apiFetch<RunOptionsResponse>(`/api/runs/options?${query.toString()}`);
+    return apiFetch<RunOptionsResponse>(`/api/runs/options?${query.toString()}`, undefined, proj);
   },
 
-  async previewRun(payload: RunPreviewPayload): Promise<RunPreviewResponse> {
+  async previewRun(payload: RunPreviewPayload, opts?: string | ProjectScopeOpts | null): Promise<RunPreviewResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<RunPreviewResponse>('previewRun', payload);
+      return sendVsCodeMessage<RunPreviewResponse>('previewRun', payload, proj);
     }
     return apiFetch<RunPreviewResponse>('/api/runs/preview', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async startRun(payload: RunStartPayload): Promise<{ ok: boolean; run_id: string; status: string; [key: string]: any }> {
+  async startRun(payload: RunStartPayload, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; run_id: string; status: string; [key: string]: any }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('startRun', payload);
+      return sendVsCodeMessage('startRun', payload, proj);
     }
     return apiFetch('/api/runs', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async continueRun(runId: string, payload?: RunContinuePayload): Promise<{ ok: boolean; run_id: string; status: string; [key: string]: any }> {
+  async continueRun(runId: string, payload?: RunContinuePayload, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; run_id: string; status: string; [key: string]: any }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('continueRun', { runId, ...(payload || {}) });
+      return sendVsCodeMessage('continueRun', { runId, ...(payload || {}) }, proj);
     }
     return apiFetch(`/api/runs/${encodeURIComponent(runId)}/continue`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async listRuns(params?: { task?: string; note?: string; active?: boolean }): Promise<RunListResponse> {
+  async listRuns(params?: { task?: string; note?: string; active?: boolean; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<RunListResponse> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<RunListResponse>('listRuns', params);
+      return sendVsCodeMessage<RunListResponse>('listRuns', params, proj);
     }
     const query = new URLSearchParams();
     if (params?.task) query.set('task', params.task);
     if (params?.note) query.set('note', params.note);
     if (params?.active) query.set('active', '1');
     const qs = query.toString();
-    return apiFetch<RunListResponse>(`/api/runs${qs ? `?${qs}` : ''}`);
+    return apiFetch<RunListResponse>(`/api/runs${qs ? `?${qs}` : ''}`, undefined, proj);
   },
 
-  async getRun(runId: string, projectOverride?: string): Promise<{ ok: boolean; run: RunRecord }> {
+  async getRun(runId: string, projectOverride?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; run: RunRecord }> {
+    const proj = resolveExplicitProject(projectOverride);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean; run: RunRecord }>('getRun', { runId, ...(projectOverride ? { project: projectOverride } : {}) });
+      return sendVsCodeMessage<{ ok: boolean; run: RunRecord }>('getRun', { runId }, proj);
     }
-    const qs = projectOverride ? `?project=${encodeURIComponent(projectOverride)}` : '';
-    return apiFetch<{ ok: boolean; run: RunRecord }>(`/api/runs/${encodeURIComponent(runId)}${qs}`);
+    return apiFetch<{ ok: boolean; run: RunRecord }>(`/api/runs/${encodeURIComponent(runId)}`, undefined, proj);
   },
 
-  async getRunLogs(runId: string, params?: { since_offset?: number; tail?: number }): Promise<RunLogsResponse> {
+  async getRunLogs(runId: string, params?: { since_offset?: number; tail?: number; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<RunLogsResponse> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<RunLogsResponse>('getRunLogs', { runId, ...(params || {}) });
+      return sendVsCodeMessage<RunLogsResponse>('getRunLogs', { runId, ...(params || {}) }, proj);
     }
     const query = new URLSearchParams();
     if (params?.since_offset !== undefined) query.set('since_offset', String(params.since_offset));
     if (params?.tail !== undefined) query.set('tail', String(params.tail));
     const qs = query.toString();
-    return apiFetch<RunLogsResponse>(`/api/runs/${encodeURIComponent(runId)}/logs${qs ? `?${qs}` : ''}`);
+    return apiFetch<RunLogsResponse>(`/api/runs/${encodeURIComponent(runId)}/logs${qs ? `?${qs}` : ''}`, undefined, proj);
   },
 
-  async cancelRun(runId: string): Promise<{ ok: boolean; run_id: string; status: string }> {
+  async cancelRun(runId: string, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; run_id: string; status: string }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('cancelRun', { runId });
+      return sendVsCodeMessage('cancelRun', { runId }, proj);
     }
     return apiFetch(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
       method: 'POST',
-    });
+    }, proj);
   },
 
-  async markDeliveredRun(runId: string, payload?: RunMarkDeliveredPayload): Promise<any> {
+  async markDeliveredRun(runId: string, payload?: RunMarkDeliveredPayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('markDeliveredRun', { runId, ...(payload || {}) });
+      return sendVsCodeMessage('markDeliveredRun', { runId, ...(payload || {}) }, proj);
     }
     return apiFetch(`/api/runs/${encodeURIComponent(runId)}/mark-delivered`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async applyVerdictRun(runId: string, payload?: RunApplyVerdictPayload): Promise<any> {
+  async applyVerdictRun(runId: string, payload?: RunApplyVerdictPayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('applyVerdictRun', { runId, ...(payload || {}) });
+      return sendVsCodeMessage('applyVerdictRun', { runId, ...(payload || {}) }, proj);
     }
     return apiFetch(`/api/runs/${encodeURIComponent(runId)}/apply-verdict`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async cleanupRun(runId: string, payload?: RunCleanupPayload): Promise<any> {
+  async cleanupRun(runId: string, payload?: RunCleanupPayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('cleanupRun', { runId, ...(payload || {}) });
+      return sendVsCodeMessage('cleanupRun', { runId, ...(payload || {}) }, proj);
     }
     return apiFetch(`/api/runs/${encodeURIComponent(runId)}/cleanup`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async getTriageProposal(runId: string): Promise<TriageProposalResponse> {
+  async getTriageProposal(runId: string, opts?: string | ProjectScopeOpts | null): Promise<TriageProposalResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TriageProposalResponse>('getTriageProposal', { runId });
+      return sendVsCodeMessage<TriageProposalResponse>('getTriageProposal', { runId }, proj);
     }
-    return apiFetch<TriageProposalResponse>(`/api/runs/${encodeURIComponent(runId)}/triage-proposal`);
+    return apiFetch<TriageProposalResponse>(`/api/runs/${encodeURIComponent(runId)}/triage-proposal`, undefined, proj);
   },
 
-  async acceptTriage(runId: string, payload?: AcceptTriagePayload): Promise<AcceptTriageResponse> {
+  async acceptTriage(runId: string, payload?: AcceptTriagePayload, opts?: string | ProjectScopeOpts | null): Promise<AcceptTriageResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<AcceptTriageResponse>('acceptTriage', { runId, ...(payload || {}) });
+      return sendVsCodeMessage<AcceptTriageResponse>('acceptTriage', { runId, ...(payload || {}) }, proj);
     }
     return apiFetch<AcceptTriageResponse>(`/api/runs/${encodeURIComponent(runId)}/accept-triage`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
   // -------------------------------------------------------------------------
   // Inbox API methods (Task 09.3)
   // -------------------------------------------------------------------------
 
-  async listInboxNotes(params?: { status?: string }): Promise<InboxListResponse> {
+  async listInboxNotes(params?: { status?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<InboxListResponse> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<InboxListResponse>('listInbox', params || {});
+      return sendVsCodeMessage<InboxListResponse>('listInbox', params || {}, proj);
     }
     const query = new URLSearchParams();
     if (params?.status) query.set('status', params.status);
     const qs = query.toString();
-    return apiFetch<InboxListResponse>(`/api/inbox${qs ? `?${qs}` : ''}`);
+    return apiFetch<InboxListResponse>(`/api/inbox${qs ? `?${qs}` : ''}`, undefined, proj);
   },
 
-  async getInboxNote(id: string): Promise<InboxNoteResponse> {
+  async getInboxNote(id: string, opts?: string | ProjectScopeOpts | null): Promise<InboxNoteResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<InboxNoteResponse>('getInboxNote', { id });
+      return sendVsCodeMessage<InboxNoteResponse>('getInboxNote', { id }, proj);
     }
-    return apiFetch<InboxNoteResponse>(`/api/inbox/${encodeURIComponent(id)}`);
+    return apiFetch<InboxNoteResponse>(`/api/inbox/${encodeURIComponent(id)}`, undefined, proj);
   },
 
-  async addInboxNote(payload: AddInboxNotePayload): Promise<AddInboxNoteResponse> {
+  async addInboxNote(payload: AddInboxNotePayload, opts?: string | ProjectScopeOpts | null): Promise<AddInboxNoteResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<AddInboxNoteResponse>('addInboxNote', payload);
+      return sendVsCodeMessage<AddInboxNoteResponse>('addInboxNote', payload, proj);
     }
     return apiFetch<AddInboxNoteResponse>('/api/inbox', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async editInboxNote(id: string, payload: EditInboxNotePayload): Promise<EditInboxNoteResponse> {
+  async editInboxNote(id: string, payload: EditInboxNotePayload, opts?: string | ProjectScopeOpts | null): Promise<EditInboxNoteResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<EditInboxNoteResponse>('editInboxNote', { id, ...payload });
+      return sendVsCodeMessage<EditInboxNoteResponse>('editInboxNote', { id, ...payload }, proj);
     }
     return apiFetch<EditInboxNoteResponse>(`/api/inbox/${encodeURIComponent(id)}`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
   async uploadInboxAttachment(
     id: string,
     file: File | Blob,
-    filename?: string
+    filename?: string,
+    opts?: string | ProjectScopeOpts | null
   ): Promise<UploadAttachmentResponse> {
+    const proj = resolveExplicitProject(opts);
     const fname = filename || (file instanceof File ? file.name : 'attachment.png');
     if (isVsCode && vscode) {
       const base64 = await blobToBase64(file);
@@ -1056,7 +1129,7 @@ export const api = {
         id,
         filename: fname,
         data: base64,
-      });
+      }, proj);
     }
 
     const formData = new FormData();
@@ -1069,7 +1142,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(withProjectQuery(`/api/inbox/${encodeURIComponent(id)}/attachments`), {
+      res = await fetch(withProjectQuery(`/api/inbox/${encodeURIComponent(id)}/attachments`, proj), {
         method: 'POST',
         headers,
         body: formData,
@@ -1093,9 +1166,10 @@ export const api = {
     return res.json();
   },
 
-  async getInboxAttachment(id: string, name: string, projectOverride?: string): Promise<Blob> {
+  async getInboxAttachment(id: string, name: string, projectOverride?: string | ProjectScopeOpts | null): Promise<Blob> {
+    const proj = resolveExplicitProject(projectOverride);
     if (isVsCode && vscode) {
-      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getInboxAttachment', { id, name, ...(projectOverride ? { project: projectOverride } : {}) });
+      const res = await sendVsCodeMessage<{ data: string; contentType?: string }>('getInboxAttachment', { id, name }, proj);
       const byteCharacters = atob(res.data);
       const byteNumbers = new Array(byteCharacters.length);
       for (let i = 0; i < byteCharacters.length; i++) {
@@ -1113,7 +1187,7 @@ export const api = {
 
     let res: Response;
     try {
-      res = await fetch(withProjectQuery(`/api/inbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(name)}`, projectOverride), {
+      res = await fetch(withProjectQuery(`/api/inbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(name)}`, proj), {
         headers,
       });
     } catch {
@@ -1135,101 +1209,111 @@ export const api = {
     return res.blob();
   },
 
-  async deleteInboxAttachment(id: string, name: string): Promise<DeleteAttachmentResponse> {
+  async deleteInboxAttachment(id: string, name: string, opts?: string | ProjectScopeOpts | null): Promise<DeleteAttachmentResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<DeleteAttachmentResponse>('deleteInboxAttachment', { id, name });
+      return sendVsCodeMessage<DeleteAttachmentResponse>('deleteInboxAttachment', { id, name }, proj);
     }
     return apiFetch<DeleteAttachmentResponse>(`/api/inbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(name)}`, {
       method: 'DELETE',
-    });
+    }, proj);
   },
 
-  async resolveInboxNote(id: string, payload: ResolveInboxNotePayload): Promise<any> {
+  async resolveInboxNote(id: string, payload: ResolveInboxNotePayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('resolveInboxNote', { id, ...payload });
+      return sendVsCodeMessage('resolveInboxNote', { id, ...payload }, proj);
     }
     return apiFetch(`/api/inbox/${encodeURIComponent(id)}/resolve`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async discardInboxNote(id: string, payload: DiscardInboxNotePayload): Promise<any> {
+  async discardInboxNote(id: string, payload: DiscardInboxNotePayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('discardInboxNote', { id, ...payload });
+      return sendVsCodeMessage('discardInboxNote', { id, ...payload }, proj);
     }
     return apiFetch(`/api/inbox/${encodeURIComponent(id)}/discard`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async reopenInboxNote(id: string): Promise<any> {
+  async reopenInboxNote(id: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('reopenInboxNote', { id });
+      return sendVsCodeMessage('reopenInboxNote', { id }, proj);
     }
     return apiFetch(`/api/inbox/${encodeURIComponent(id)}/reopen`, {
       method: 'POST',
-    });
+    }, proj);
   },
 
-  async inboxToTask(id: string, payload: InboxToTaskPayload): Promise<InboxToTaskResponse> {
+  async inboxToTask(id: string, payload: InboxToTaskPayload, opts?: string | ProjectScopeOpts | null): Promise<InboxToTaskResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<InboxToTaskResponse>('inboxToTask', { id, ...payload });
+      return sendVsCodeMessage<InboxToTaskResponse>('inboxToTask', { id, ...payload }, proj);
     }
     return apiFetch<InboxToTaskResponse>(`/api/inbox/${encodeURIComponent(id)}/to-task`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
   // -------------------------------------------------------------------------
   // Use Cases (Spec 15)
   // -------------------------------------------------------------------------
 
-  async getUseCases(status?: string): Promise<any> {
+  async getUseCases(status?: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('getUseCases', { status });
+      return sendVsCodeMessage('getUseCases', { status }, proj);
     }
     const q = status && status !== 'all' ? `?status=${encodeURIComponent(status)}` : '';
-    return apiFetch(`/api/use-cases${q}`);
+    return apiFetch(`/api/use-cases${q}`, undefined, proj);
   },
 
-  async getUseCase(id: string): Promise<{ ok: boolean; use_case: any }> {
+  async getUseCase(id: string, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; use_case: any }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('getUseCase', { id });
+      return sendVsCodeMessage('getUseCase', { id }, proj);
     }
-    return apiFetch(`/api/use-cases/${encodeURIComponent(id)}`);
+    return apiFetch(`/api/use-cases/${encodeURIComponent(id)}`, undefined, proj);
   },
 
-  async createUseCase(data: any): Promise<any> {
+  async createUseCase(data: any, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('createUseCase', data);
+      return sendVsCodeMessage('createUseCase', data, proj);
     }
     return apiFetch('/api/use-cases', {
       method: 'POST',
       body: JSON.stringify(data),
-    });
+    }, proj);
   },
 
-  async validateUseCase(id: string, options?: { timeout?: number; actor?: string }): Promise<any> {
+  async validateUseCase(id: string, options?: { timeout?: number; actor?: string }, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('validateUseCase', { id, ...options });
+      return sendVsCodeMessage('validateUseCase', { id, ...options }, proj);
     }
     return apiFetch(`/api/use-cases/${encodeURIComponent(id)}/validate`, {
       method: 'POST',
       body: JSON.stringify(options || {}),
-    });
+    }, proj);
   },
 
-  async runValidationCampaign(options?: { filter_actor?: string; timeout?: number }): Promise<any> {
+  async runValidationCampaign(options?: { filter_actor?: string; timeout?: number }, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('runValidationCampaign', options);
+      return sendVsCodeMessage('runValidationCampaign', options, proj);
     }
     return apiFetch('/api/use-cases/campaign', {
       method: 'POST',
       body: JSON.stringify(options || {}),
-    });
+    }, proj);
   },
 
   connectWebSocket(
@@ -1270,7 +1354,8 @@ export const api = {
     return this.connectWebSocket(onMessage);
   },
 
-  async getEvents(params?: { since?: number; limit?: number; type?: string; session?: string }): Promise<EventsTailResponse> {
+  async getEvents(params?: { since?: number; limit?: number; type?: string; session?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<EventsTailResponse> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     const query = new URLSearchParams();
     if (params?.since !== undefined) query.set('since', String(params.since));
     if (params?.limit !== undefined) query.set('limit', String(params.limit));
@@ -1279,19 +1364,21 @@ export const api = {
     const qs = query.toString();
     const endpoint = `/api/events${qs ? `?${qs}` : ''}`;
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<EventsTailResponse>('getEvents', params || {});
+      return sendVsCodeMessage<EventsTailResponse>('getEvents', params || {}, proj);
     }
-    return apiFetch<EventsTailResponse>(endpoint);
+    return apiFetch<EventsTailResponse>(endpoint, undefined, proj);
   },
 
-  async getEventsStats(): Promise<EventsStatsResponse> {
+  async getEventsStats(opts?: string | ProjectScopeOpts | null): Promise<EventsStatsResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<EventsStatsResponse>('getEventsStats', {});
+      return sendVsCodeMessage<EventsStatsResponse>('getEventsStats', {}, proj);
     }
-    return apiFetch<EventsStatsResponse>('/api/events/stats');
+    return apiFetch<EventsStatsResponse>('/api/events/stats', undefined, proj);
   },
 
-  async getSessions(params?: { role?: string; status?: string; tool?: string }): Promise<{ ok: boolean; sessions: OrchestrationSession[] }> {
+  async getSessions(params?: { role?: string; status?: string; tool?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; sessions: OrchestrationSession[] }> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     const query = new URLSearchParams();
     if (params?.role) query.set('role', params.role);
     if (params?.status) query.set('status', params.status);
@@ -1299,153 +1386,170 @@ export const api = {
     const qs = query.toString();
     const endpoint = `/api/sessions${qs ? `?${qs}` : ''}`;
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean; sessions: OrchestrationSession[] }>('getSessions', params || {});
+      return sendVsCodeMessage<{ ok: boolean; sessions: OrchestrationSession[] }>('getSessions', params || {}, proj);
     }
-    return apiFetch<{ ok: boolean; sessions: OrchestrationSession[] }>(endpoint);
+    return apiFetch<{ ok: boolean; sessions: OrchestrationSession[] }>(endpoint, undefined, proj);
   },
 
-  async getSession(sessionId: string): Promise<OrchestrationSession> {
+  async getSession(sessionId: string, opts?: string | ProjectScopeOpts | null): Promise<OrchestrationSession> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<OrchestrationSession>('getSession', { sessionId });
+      return sendVsCodeMessage<OrchestrationSession>('getSession', { sessionId }, proj);
     }
-    return apiFetch<OrchestrationSession>(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    return apiFetch<OrchestrationSession>(`/api/sessions/${encodeURIComponent(sessionId)}`, undefined, proj);
   },
 
-  async getRoleHolder(role: string): Promise<any> {
+  async getRoleHolder(role: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('getRoleHolder', { role });
+      return sendVsCodeMessage<any>('getRoleHolder', { role }, proj);
     }
-    return apiFetch<any>(`/api/sessions/role/${encodeURIComponent(role)}`);
+    return apiFetch<any>(`/api/sessions/role/${encodeURIComponent(role)}`, undefined, proj);
   },
 
-  async getTriggers(): Promise<TriggersListResponse> {
+  async getTriggers(opts?: string | ProjectScopeOpts | null): Promise<TriggersListResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TriggersListResponse>('getTriggers', {});
+      return sendVsCodeMessage<TriggersListResponse>('getTriggers', {}, proj);
     }
-    return apiFetch<TriggersListResponse>('/api/triggers');
+    return apiFetch<TriggersListResponse>('/api/triggers', undefined, proj);
   },
 
-  async getTriggersStatus(role?: string): Promise<TriggersStatusResponse> {
+  async getTriggersStatus(role?: string, opts?: string | ProjectScopeOpts | null): Promise<TriggersStatusResponse> {
+    const proj = resolveExplicitProject(opts);
     const qs = role ? `?role=${encodeURIComponent(role)}` : '';
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TriggersStatusResponse>('getTriggersStatus', { role });
+      return sendVsCodeMessage<TriggersStatusResponse>('getTriggersStatus', { role }, proj);
     }
-    return apiFetch<TriggersStatusResponse>(`/api/triggers/status${qs}`);
+    return apiFetch<TriggersStatusResponse>(`/api/triggers/status${qs}`, undefined, proj);
   },
 
-  async getTriggersHistory(params?: { rule?: string; limit?: number }): Promise<TriggersHistoryResponse> {
+  async getTriggersHistory(params?: { rule?: string; limit?: number; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<TriggersHistoryResponse> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     const query = new URLSearchParams();
     if (params?.rule) query.set('rule', params.rule);
     if (params?.limit) query.set('limit', String(params.limit));
     const qs = query.toString();
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TriggersHistoryResponse>('getTriggersHistory', params || {});
+      return sendVsCodeMessage<TriggersHistoryResponse>('getTriggersHistory', params || {}, proj);
     }
-    return apiFetch<TriggersHistoryResponse>(`/api/triggers/history${qs ? `?${qs}` : ''}`);
+    return apiFetch<TriggersHistoryResponse>(`/api/triggers/history${qs ? `?${qs}` : ''}`, undefined, proj);
   },
 
-  async runTriggersOnce(payload?: { dry_run?: boolean; role?: string }): Promise<any> {
+  async runTriggersOnce(payload?: { dry_run?: boolean; role?: string }, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('runTriggersOnce', payload || {});
+      return sendVsCodeMessage<any>('runTriggersOnce', payload || {}, proj);
     }
     return apiFetch<any>('/api/triggers/run-once', {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async previewToggleTrigger(payload: { rule_name?: string; kill_switch?: boolean; enabled?: boolean }): Promise<ConfigPreviewResponse> {
+  async previewToggleTrigger(payload: { rule_name?: string; kill_switch?: boolean; enabled?: boolean }, opts?: string | ProjectScopeOpts | null): Promise<ConfigPreviewResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigPreviewResponse>('previewToggleTrigger', payload);
+      return sendVsCodeMessage<ConfigPreviewResponse>('previewToggleTrigger', payload, proj);
     }
     return apiFetch<ConfigPreviewResponse>('/api/triggers/toggle/preview', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async toggleTrigger(payload: { rule_name?: string; kill_switch?: boolean; enabled?: boolean; expect_hash: string }): Promise<ConfigApplyResponse> {
+  async toggleTrigger(payload: { rule_name?: string; kill_switch?: boolean; enabled?: boolean; expect_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<ConfigApplyResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ConfigApplyResponse>('toggleTrigger', payload);
+      return sendVsCodeMessage<ConfigApplyResponse>('toggleTrigger', payload, proj);
     }
     return apiFetch<ConfigApplyResponse>('/api/triggers/toggle', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async getProposedActions(): Promise<ProposedActionsResponse> {
+  async getProposedActions(opts?: string | ProjectScopeOpts | null): Promise<ProposedActionsResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ProposedActionsResponse>('getProposedActions', {});
+      return sendVsCodeMessage<ProposedActionsResponse>('getProposedActions', {}, proj);
     }
-    return apiFetch<ProposedActionsResponse>('/api/triggers/proposed-actions');
+    return apiFetch<ProposedActionsResponse>('/api/triggers/proposed-actions', undefined, proj);
   },
 
-  async confirmProposedAction(actionId: string): Promise<any> {
+  async confirmProposedAction(actionId: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('confirmProposedAction', { actionId });
+      return sendVsCodeMessage<any>('confirmProposedAction', { actionId }, proj);
     }
     return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/confirm`, {
       method: 'POST',
-    });
+    }, proj);
   },
 
-  async rejectProposedAction(actionId: string): Promise<any> {
+  async rejectProposedAction(actionId: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('rejectProposedAction', { actionId });
+      return sendVsCodeMessage<any>('rejectProposedAction', { actionId }, proj);
     }
     return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/reject`, {
       method: 'POST',
-    });
+    }, proj);
   },
 
-  async getQuestionsAwaitingApplication(): Promise<AwaitingApplicationResponse> {
+  async getQuestionsAwaitingApplication(opts?: string | ProjectScopeOpts | null): Promise<AwaitingApplicationResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<AwaitingApplicationResponse>('getQuestionsAwaitingApplication', {});
+      return sendVsCodeMessage<AwaitingApplicationResponse>('getQuestionsAwaitingApplication', {}, proj);
     }
-    return apiFetch<AwaitingApplicationResponse>('/api/questions/awaiting-application');
+    return apiFetch<AwaitingApplicationResponse>('/api/questions/awaiting-application', undefined, proj);
   },
 
-  async applyQuestion(questionId: string, payload: ApplyQuestionPayload): Promise<ApplyQuestionResponse> {
+  async applyQuestion(questionId: string, payload: ApplyQuestionPayload, opts?: string | ProjectScopeOpts | null): Promise<ApplyQuestionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<ApplyQuestionResponse>('applyQuestion', { questionId, ...payload });
+      return sendVsCodeMessage<ApplyQuestionResponse>('applyQuestion', { questionId, ...payload }, proj);
     }
     return apiFetch<ApplyQuestionResponse>(`/api/questions/${encodeURIComponent(questionId)}/apply`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async getOrchestratorQueue(): Promise<OrchestratorQueueResponse> {
+  async getOrchestratorQueue(opts?: string | ProjectScopeOpts | null): Promise<OrchestratorQueueResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<OrchestratorQueueResponse>('getOrchestratorQueue', {});
+      return sendVsCodeMessage<OrchestratorQueueResponse>('getOrchestratorQueue', {}, proj);
     }
-    return apiFetch<OrchestratorQueueResponse>('/api/orchestrator/queue');
+    return apiFetch<OrchestratorQueueResponse>('/api/orchestrator/queue', undefined, proj);
   },
 
-  async getNotifications(): Promise<NotificationsResponse> {
+  async getNotifications(opts?: string | ProjectScopeOpts | null): Promise<NotificationsResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<NotificationsResponse>('getNotifications', {});
+      return sendVsCodeMessage<NotificationsResponse>('getNotifications', {}, proj);
     }
-    return apiFetch<NotificationsResponse>('/api/notifications');
+    return apiFetch<NotificationsResponse>('/api/notifications', undefined, proj);
   },
 
-  async markNotificationRead(id: string): Promise<{ ok: boolean }> {
+  async markNotificationRead(id: string, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean }>('markNotificationRead', { id });
+      return sendVsCodeMessage<{ ok: boolean }>('markNotificationRead', { id }, proj);
     }
     return apiFetch<{ ok: boolean }>(`/api/notifications/${encodeURIComponent(id)}/read`, {
       method: 'POST',
-    });
+    }, proj);
   },
 
-  async markAllNotificationsRead(): Promise<{ ok: boolean }> {
+  async markAllNotificationsRead(opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean }>('markAllNotificationsRead', {});
+      return sendVsCodeMessage<{ ok: boolean }>('markAllNotificationsRead', {}, proj);
     }
     return apiFetch<{ ok: boolean }>('/api/notifications/read', {
       method: 'POST',
-    });
+    }, proj);
   },
 };
 
@@ -1559,19 +1663,20 @@ import type {
 } from './types';
 
 export interface TimelineApiExtensions {
-  getTasksGraph(filters?: { kind?: string[]; label?: string[] }, projectOverride?: string | null): Promise<TaskGraphResponse>;
-  previewSetPriority(taskId: string, payload: SetPriorityPayload): Promise<TaskMutationPreviewResult>;
-  setPriority(taskId: string, payload: SetPriorityPayload): Promise<any>;
-  previewSetSize(taskId: string, payload: SetSizePayload): Promise<TaskMutationPreviewResult>;
-  setSize(taskId: string, payload: SetSizePayload): Promise<any>;
-  previewSetDeps(taskId: string, payload: SetDepsPayload): Promise<TaskMutationPreviewResult>;
-  setDeps(taskId: string, payload: SetDepsPayload): Promise<any>;
+  getTasksGraph(filters?: { kind?: string[]; label?: string[]; project?: string | null }, projectOverride?: string | ProjectScopeOpts | null): Promise<TaskGraphResponse>;
+  previewSetPriority(taskId: string, payload: SetPriorityPayload, opts?: string | ProjectScopeOpts | null): Promise<TaskMutationPreviewResult>;
+  setPriority(taskId: string, payload: SetPriorityPayload, opts?: string | ProjectScopeOpts | null): Promise<any>;
+  previewSetSize(taskId: string, payload: SetSizePayload, opts?: string | ProjectScopeOpts | null): Promise<TaskMutationPreviewResult>;
+  setSize(taskId: string, payload: SetSizePayload, opts?: string | ProjectScopeOpts | null): Promise<any>;
+  previewSetDeps(taskId: string, payload: SetDepsPayload, opts?: string | ProjectScopeOpts | null): Promise<TaskMutationPreviewResult>;
+  setDeps(taskId: string, payload: SetDepsPayload, opts?: string | ProjectScopeOpts | null): Promise<any>;
 }
 
 export const timelineApi: TimelineApiExtensions = {
-  async getTasksGraph(filters?: { kind?: string[]; label?: string[] }, projectOverride?: string | null): Promise<TaskGraphResponse> {
+  async getTasksGraph(filters?: { kind?: string[]; label?: string[]; project?: string | null }, projectOverride?: string | ProjectScopeOpts | null): Promise<TaskGraphResponse> {
+    const proj = resolveExplicitProject(projectOverride) ?? (filters?.project ? filters.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskGraphResponse>('getGraph', projectOverride ? { ...(filters || {}), project: projectOverride } : filters);
+      return sendVsCodeMessage<TaskGraphResponse>('getGraph', filters, proj);
     }
     const params = new URLSearchParams();
     if (filters?.kind) {
@@ -1580,71 +1685,74 @@ export const timelineApi: TimelineApiExtensions = {
     if (filters?.label) {
       filters.label.forEach((l) => params.append('label', l));
     }
-    if (projectOverride) {
-      params.set('project', projectOverride);
-    }
     const qs = params.toString();
-    return apiFetch<TaskGraphResponse>(qs ? `/api/tasks/graph?${qs}` : '/api/tasks/graph');
+    return apiFetch<TaskGraphResponse>(qs ? `/api/tasks/graph?${qs}` : '/api/tasks/graph', undefined, proj);
   },
 
-  async previewSetPriority(taskId: string, payload: SetPriorityPayload): Promise<TaskMutationPreviewResult> {
+  async previewSetPriority(taskId: string, payload: SetPriorityPayload, opts?: string | ProjectScopeOpts | null): Promise<TaskMutationPreviewResult> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetPriority', { taskId, ...payload });
+      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetPriority', { taskId, ...payload }, proj);
     }
     return apiFetch<TaskMutationPreviewResult>(`/api/tasks/${encodeURIComponent(taskId)}/priority/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async setPriority(taskId: string, payload: SetPriorityPayload): Promise<any> {
+  async setPriority(taskId: string, payload: SetPriorityPayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('setPriority', { taskId, ...payload });
+      return sendVsCodeMessage('setPriority', { taskId, ...payload }, proj);
     }
     return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/priority`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewSetSize(taskId: string, payload: SetSizePayload): Promise<TaskMutationPreviewResult> {
+  async previewSetSize(taskId: string, payload: SetSizePayload, opts?: string | ProjectScopeOpts | null): Promise<TaskMutationPreviewResult> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetSize', { taskId, ...payload });
+      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetSize', { taskId, ...payload }, proj);
     }
     return apiFetch<TaskMutationPreviewResult>(`/api/tasks/${encodeURIComponent(taskId)}/size/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async setSize(taskId: string, payload: SetSizePayload): Promise<any> {
+  async setSize(taskId: string, payload: SetSizePayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('setSize', { taskId, ...payload });
+      return sendVsCodeMessage('setSize', { taskId, ...payload }, proj);
     }
     return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/size`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewSetDeps(taskId: string, payload: SetDepsPayload): Promise<TaskMutationPreviewResult> {
+  async previewSetDeps(taskId: string, payload: SetDepsPayload, opts?: string | ProjectScopeOpts | null): Promise<TaskMutationPreviewResult> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetDeps', { taskId, ...payload });
+      return sendVsCodeMessage<TaskMutationPreviewResult>('previewSetDeps', { taskId, ...payload }, proj);
     }
     return apiFetch<TaskMutationPreviewResult>(`/api/tasks/${encodeURIComponent(taskId)}/deps/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async setDeps(taskId: string, payload: SetDepsPayload): Promise<any> {
+  async setDeps(taskId: string, payload: SetDepsPayload, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('setDeps', { taskId, ...payload });
+      return sendVsCodeMessage('setDeps', { taskId, ...payload }, proj);
     }
     return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/deps`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 };
 
@@ -1661,29 +1769,31 @@ import type {
 } from './types';
 
 export interface AnswerAndResumeApiExtensions {
-  previewAnswerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumePreviewResponse>;
-  answerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumeResponse>;
+  previewAnswerAndResume(id: string, payload: AnswerAndResumePayload, opts?: string | ProjectScopeOpts | null): Promise<AnswerAndResumePreviewResponse>;
+  answerAndResume(id: string, payload: AnswerAndResumePayload, opts?: string | ProjectScopeOpts | null): Promise<AnswerAndResumeResponse>;
 }
 
 export const answerAndResumeApi: AnswerAndResumeApiExtensions = {
-  async previewAnswerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumePreviewResponse> {
+  async previewAnswerAndResume(id: string, payload: AnswerAndResumePayload, opts?: string | ProjectScopeOpts | null): Promise<AnswerAndResumePreviewResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<AnswerAndResumePreviewResponse>('previewAnswerAndResume', { id, ...payload });
+      return sendVsCodeMessage<AnswerAndResumePreviewResponse>('previewAnswerAndResume', { id, ...payload }, proj);
     }
     return apiFetch<AnswerAndResumePreviewResponse>(`/api/questions/${encodeURIComponent(id)}/answer-and-resume/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async answerAndResume(id: string, payload: AnswerAndResumePayload): Promise<AnswerAndResumeResponse> {
+  async answerAndResume(id: string, payload: AnswerAndResumePayload, opts?: string | ProjectScopeOpts | null): Promise<AnswerAndResumeResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<AnswerAndResumeResponse>('answerAndResume', { id, ...payload });
+      return sendVsCodeMessage<AnswerAndResumeResponse>('answerAndResume', { id, ...payload }, proj);
     }
     return apiFetch<AnswerAndResumeResponse>(`/api/questions/${encodeURIComponent(id)}/answer-and-resume`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 };
 
@@ -1694,93 +1804,101 @@ Object.assign(api, answerAndResumeApi);
 // ---------------------------------------------------------------------------
 
 export interface TaskStructureApiExtensions {
-  previewAddChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string }): Promise<StructureActionResponse>;
-  addChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string; expect_plan_hash: string }): Promise<StructureActionResponse>;
-  previewExpandTask(taskId: string): Promise<StructureActionResponse>;
-  expandTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse>;
-  previewCollapseTask(taskId: string): Promise<StructureActionResponse>;
-  collapseTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse>;
-  previewReopenTask(taskId: string, payload: { reason: string }): Promise<StructureActionResponse>;
-  reopenTask(taskId: string, payload: { reason: string; expect_plan_hash: string }): Promise<StructureActionResponse>;
+  previewAddChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
+  addChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string; expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
+  previewExpandTask(taskId: string, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
+  expandTask(taskId: string, payload: { expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
+  previewCollapseTask(taskId: string, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
+  collapseTask(taskId: string, payload: { expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
+  previewReopenTask(taskId: string, payload: { reason: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
+  reopenTask(taskId: string, payload: { reason: string; expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse>;
 }
 
 export const taskStructureApi: TaskStructureApiExtensions = {
-  async previewAddChild(parentId: string, payload: { title: string; kind?: string }): Promise<StructureActionResponse> {
+  async previewAddChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('previewAddChild', { id: parentId, ...payload });
+      return sendVsCodeMessage<StructureActionResponse>('previewAddChild', { id: parentId, ...payload }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(parentId)}/child/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async addChild(parentId: string, payload: { title: string; kind?: string; expect_plan_hash: string }): Promise<StructureActionResponse> {
+  async addChild(parentId: string, payload: { title: string; kind?: string; short_title?: string; short?: string; expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('addChild', { id: parentId, ...payload });
+      return sendVsCodeMessage<StructureActionResponse>('addChild', { id: parentId, ...payload }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(parentId)}/child`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewExpandTask(taskId: string): Promise<StructureActionResponse> {
+  async previewExpandTask(taskId: string, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('previewExpandTask', { id: taskId });
+      return sendVsCodeMessage<StructureActionResponse>('previewExpandTask', { id: taskId }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/expand/preview`, {
       method: 'POST',
-    });
+    }, proj);
   },
 
-  async expandTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse> {
+  async expandTask(taskId: string, payload: { expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('expandTask', { id: taskId, ...payload });
+      return sendVsCodeMessage<StructureActionResponse>('expandTask', { id: taskId, ...payload }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/expand`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewCollapseTask(taskId: string): Promise<StructureActionResponse> {
+  async previewCollapseTask(taskId: string, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('previewCollapseTask', { id: taskId });
+      return sendVsCodeMessage<StructureActionResponse>('previewCollapseTask', { id: taskId }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/collapse/preview`, {
       method: 'POST',
-    });
+    }, proj);
   },
 
-  async collapseTask(taskId: string, payload: { expect_plan_hash: string }): Promise<StructureActionResponse> {
+  async collapseTask(taskId: string, payload: { expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('collapseTask', { id: taskId, ...payload });
+      return sendVsCodeMessage<StructureActionResponse>('collapseTask', { id: taskId, ...payload }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/collapse`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewReopenTask(taskId: string, payload: { reason: string }): Promise<StructureActionResponse> {
+  async previewReopenTask(taskId: string, payload: { reason: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('previewReopenTask', { id: taskId, ...payload });
+      return sendVsCodeMessage<StructureActionResponse>('previewReopenTask', { id: taskId, ...payload }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/reopen/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async reopenTask(taskId: string, payload: { reason: string; expect_plan_hash: string }): Promise<StructureActionResponse> {
+  async reopenTask(taskId: string, payload: { reason: string; expect_plan_hash: string }, opts?: string | ProjectScopeOpts | null): Promise<StructureActionResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<StructureActionResponse>('reopenTask', { id: taskId, ...payload });
+      return sendVsCodeMessage<StructureActionResponse>('reopenTask', { id: taskId, ...payload }, proj);
     }
     return apiFetch<StructureActionResponse>(`/api/tasks/${encodeURIComponent(taskId)}/reopen`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 };
 
@@ -1804,103 +1922,112 @@ import type {
 } from './types';
 
 export interface MicrotaskAndLabelsApiExtensions {
-  getLabels(): Promise<LabelsResponse>;
-  createMicrotask(payload: CreateMicrotaskPayload): Promise<CreateMicrotaskResponse>;
-  previewPromoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse>;
-  promoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse>;
-  previewSetKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse>;
-  setKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse>;
-  previewSetLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse>;
-  setLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse>;
-  inboxToMicrotask(noteId: string, payload?: InboxToMicrotaskPayload): Promise<CreateMicrotaskResponse>;
+  getLabels(opts?: string | ProjectScopeOpts | null): Promise<LabelsResponse>;
+  createMicrotask(payload: CreateMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<CreateMicrotaskResponse>;
+  previewPromoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<PromoteMicrotaskResponse>;
+  promoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<PromoteMicrotaskResponse>;
+  previewSetKind(taskId: string, payload: SetKindPayload, opts?: string | ProjectScopeOpts | null): Promise<SetKindResponse>;
+  setKind(taskId: string, payload: SetKindPayload, opts?: string | ProjectScopeOpts | null): Promise<SetKindResponse>;
+  previewSetLabels(taskId: string, payload: SetLabelsPayload, opts?: string | ProjectScopeOpts | null): Promise<SetLabelsResponse>;
+  setLabels(taskId: string, payload: SetLabelsPayload, opts?: string | ProjectScopeOpts | null): Promise<SetLabelsResponse>;
+  inboxToMicrotask(noteId: string, payload?: InboxToMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<CreateMicrotaskResponse>;
 }
 
 export const microtaskAndLabelsApi: MicrotaskAndLabelsApiExtensions = {
-  async getLabels(): Promise<LabelsResponse> {
+  async getLabels(opts?: string | ProjectScopeOpts | null): Promise<LabelsResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<LabelsResponse>('getLabels');
+      return sendVsCodeMessage<LabelsResponse>('getLabels', undefined, proj);
     }
-    return apiFetch<LabelsResponse>('/api/tasks/labels');
+    return apiFetch<LabelsResponse>('/api/tasks/labels', undefined, proj);
   },
 
-  async createMicrotask(payload: CreateMicrotaskPayload): Promise<CreateMicrotaskResponse> {
+  async createMicrotask(payload: CreateMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<CreateMicrotaskResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<CreateMicrotaskResponse>('createMicrotask', payload);
+      return sendVsCodeMessage<CreateMicrotaskResponse>('createMicrotask', payload, proj);
     }
     return apiFetch<CreateMicrotaskResponse>('/api/tasks/micro', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewPromoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse> {
+  async previewPromoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<PromoteMicrotaskResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<PromoteMicrotaskResponse>('previewPromoteMicrotask', { taskId, ...payload });
+      return sendVsCodeMessage<PromoteMicrotaskResponse>('previewPromoteMicrotask', { taskId, ...payload }, proj);
     }
     return apiFetch<PromoteMicrotaskResponse>(`/api/tasks/${encodeURIComponent(taskId)}/promote/preview`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async promoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload): Promise<PromoteMicrotaskResponse> {
+  async promoteMicrotask(taskId: string, payload?: PromoteMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<PromoteMicrotaskResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<PromoteMicrotaskResponse>('promoteMicrotask', { taskId, ...payload });
+      return sendVsCodeMessage<PromoteMicrotaskResponse>('promoteMicrotask', { taskId, ...payload }, proj);
     }
     return apiFetch<PromoteMicrotaskResponse>(`/api/tasks/${encodeURIComponent(taskId)}/promote`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async previewSetKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse> {
+  async previewSetKind(taskId: string, payload: SetKindPayload, opts?: string | ProjectScopeOpts | null): Promise<SetKindResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetKindResponse>('previewSetKind', { taskId, ...payload });
+      return sendVsCodeMessage<SetKindResponse>('previewSetKind', { taskId, ...payload }, proj);
     }
     return apiFetch<SetKindResponse>(`/api/tasks/${encodeURIComponent(taskId)}/kind/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async setKind(taskId: string, payload: SetKindPayload): Promise<SetKindResponse> {
+  async setKind(taskId: string, payload: SetKindPayload, opts?: string | ProjectScopeOpts | null): Promise<SetKindResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetKindResponse>('setKind', { taskId, ...payload });
+      return sendVsCodeMessage<SetKindResponse>('setKind', { taskId, ...payload }, proj);
     }
     return apiFetch<SetKindResponse>(`/api/tasks/${encodeURIComponent(taskId)}/kind`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewSetLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse> {
+  async previewSetLabels(taskId: string, payload: SetLabelsPayload, opts?: string | ProjectScopeOpts | null): Promise<SetLabelsResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetLabelsResponse>('previewSetLabels', { taskId, ...payload });
+      return sendVsCodeMessage<SetLabelsResponse>('previewSetLabels', { taskId, ...payload }, proj);
     }
     return apiFetch<SetLabelsResponse>(`/api/tasks/${encodeURIComponent(taskId)}/labels/preview`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async setLabels(taskId: string, payload: SetLabelsPayload): Promise<SetLabelsResponse> {
+  async setLabels(taskId: string, payload: SetLabelsPayload, opts?: string | ProjectScopeOpts | null): Promise<SetLabelsResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetLabelsResponse>('setLabels', { taskId, ...payload });
+      return sendVsCodeMessage<SetLabelsResponse>('setLabels', { taskId, ...payload }, proj);
     }
     return apiFetch<SetLabelsResponse>(`/api/tasks/${encodeURIComponent(taskId)}/labels`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async inboxToMicrotask(noteId: string, payload?: InboxToMicrotaskPayload): Promise<CreateMicrotaskResponse> {
+  async inboxToMicrotask(noteId: string, payload?: InboxToMicrotaskPayload, opts?: string | ProjectScopeOpts | null): Promise<CreateMicrotaskResponse> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<CreateMicrotaskResponse>('inboxToMicrotask', { noteId, ...payload });
+      return sendVsCodeMessage<CreateMicrotaskResponse>('inboxToMicrotask', { noteId, ...payload }, proj);
     }
     return apiFetch<CreateMicrotaskResponse>(`/api/inbox/${encodeURIComponent(noteId)}/to-microtask`, {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 };
 
@@ -1918,93 +2045,102 @@ import type {
 } from './types';
 
 export interface OrchestratorChatApiExtensions {
-  getOrchestratorStatus(): Promise<OrchestratorStatus>;
-  postOrchestratorChat(message: string, options?: { type?: string; priority?: string; policy?: string }): Promise<PostChatResponse>;
-  getOrchestratorConversation(params?: { limit?: number; offset?: number; order?: string }): Promise<OrchestratorConversationResponse>;
-  getOrchestratorTurn(turnId: string): Promise<{ ok: boolean; turn: OrchestratorTurn }>;
-  pauseOrchestrator(): Promise<any>;
-  resumeOrchestrator(): Promise<any>;
-  rotateOrchestrator(payload?: { tool?: string; model?: string; reason?: string; no_handoff?: boolean }): Promise<any>;
-  cancelOrchestratorTurn(turnId: string): Promise<any>;
-  runNextOrchestratorTurn(timeout?: number): Promise<any>;
+  getOrchestratorStatus(opts?: string | ProjectScopeOpts | null): Promise<OrchestratorStatus>;
+  postOrchestratorChat(message: string, options?: { type?: string; priority?: string; policy?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<PostChatResponse>;
+  getOrchestratorConversation(params?: { limit?: number; offset?: number; order?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<OrchestratorConversationResponse>;
+  getOrchestratorTurn(turnId: string, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; turn: OrchestratorTurn }>;
+  pauseOrchestrator(opts?: string | ProjectScopeOpts | null): Promise<any>;
+  resumeOrchestrator(opts?: string | ProjectScopeOpts | null): Promise<any>;
+  rotateOrchestrator(payload?: { tool?: string; model?: string; reason?: string; no_handoff?: boolean }, opts?: string | ProjectScopeOpts | null): Promise<any>;
+  cancelOrchestratorTurn(turnId: string, opts?: string | ProjectScopeOpts | null): Promise<any>;
+  runNextOrchestratorTurn(timeout?: number, opts?: string | ProjectScopeOpts | null): Promise<any>;
 }
 
 export const orchestratorChatApi: OrchestratorChatApiExtensions = {
-  async getOrchestratorStatus(): Promise<OrchestratorStatus> {
+  async getOrchestratorStatus(opts?: string | ProjectScopeOpts | null): Promise<OrchestratorStatus> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<OrchestratorStatus>('getOrchestratorStatus', {});
+      return sendVsCodeMessage<OrchestratorStatus>('getOrchestratorStatus', {}, proj);
     }
-    return apiFetch<OrchestratorStatus>('/api/orchestrator/status');
+    return apiFetch<OrchestratorStatus>('/api/orchestrator/status', undefined, proj);
   },
 
-  async postOrchestratorChat(message: string, options?: { type?: string; priority?: string; policy?: string }): Promise<PostChatResponse> {
+  async postOrchestratorChat(message: string, options?: { type?: string; priority?: string; policy?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<PostChatResponse> {
+    const proj = resolveExplicitProject(opts) ?? (options?.project ? options.project.trim() || null : null);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<PostChatResponse>('postOrchestratorChat', { message, ...options });
+      return sendVsCodeMessage<PostChatResponse>('postOrchestratorChat', { message, ...options }, proj);
     }
     return apiFetch<PostChatResponse>('/api/orchestrator/chat', {
       method: 'POST',
       body: JSON.stringify({ message, ...(options || {}) }),
-    });
+    }, proj);
   },
 
-  async getOrchestratorConversation(params?: { limit?: number; offset?: number; order?: string }): Promise<OrchestratorConversationResponse> {
+  async getOrchestratorConversation(params?: { limit?: number; offset?: number; order?: string; project?: string | null }, opts?: string | ProjectScopeOpts | null): Promise<OrchestratorConversationResponse> {
+    const proj = resolveExplicitProject(opts) ?? (params?.project ? params.project.trim() || null : null);
     const query = new URLSearchParams();
     if (params?.limit !== undefined) query.set('limit', String(params.limit));
     if (params?.offset !== undefined) query.set('offset', String(params.offset));
     if (params?.order) query.set('order', params.order);
     const qs = query.toString();
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<OrchestratorConversationResponse>('getOrchestratorConversation', params || {});
+      return sendVsCodeMessage<OrchestratorConversationResponse>('getOrchestratorConversation', params || {}, proj);
     }
-    return apiFetch<OrchestratorConversationResponse>(`/api/orchestrator/conversation${qs ? `?${qs}` : ''}`);
+    return apiFetch<OrchestratorConversationResponse>(`/api/orchestrator/conversation${qs ? `?${qs}` : ''}`, undefined, proj);
   },
 
-  async getOrchestratorTurn(turnId: string): Promise<{ ok: boolean; turn: OrchestratorTurn }> {
+  async getOrchestratorTurn(turnId: string, opts?: string | ProjectScopeOpts | null): Promise<{ ok: boolean; turn: OrchestratorTurn }> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<{ ok: boolean; turn: OrchestratorTurn }>('getOrchestratorTurn', { turnId });
+      return sendVsCodeMessage<{ ok: boolean; turn: OrchestratorTurn }>('getOrchestratorTurn', { turnId }, proj);
     }
-    return apiFetch<{ ok: boolean; turn: OrchestratorTurn }>(`/api/orchestrator/turns/${encodeURIComponent(turnId)}`);
+    return apiFetch<{ ok: boolean; turn: OrchestratorTurn }>(`/api/orchestrator/turns/${encodeURIComponent(turnId)}`, undefined, proj);
   },
 
-  async pauseOrchestrator(): Promise<any> {
+  async pauseOrchestrator(opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('pauseOrchestrator', {});
+      return sendVsCodeMessage<any>('pauseOrchestrator', {}, proj);
     }
-    return apiFetch<any>('/api/orchestrator/pause', { method: 'POST' });
+    return apiFetch<any>('/api/orchestrator/pause', { method: 'POST' }, proj);
   },
 
-  async resumeOrchestrator(): Promise<any> {
+  async resumeOrchestrator(opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('resumeOrchestrator', {});
+      return sendVsCodeMessage<any>('resumeOrchestrator', {}, proj);
     }
-    return apiFetch<any>('/api/orchestrator/resume', { method: 'POST' });
+    return apiFetch<any>('/api/orchestrator/resume', { method: 'POST' }, proj);
   },
 
-  async rotateOrchestrator(payload?: { tool?: string; model?: string; reason?: string; no_handoff?: boolean }): Promise<any> {
+  async rotateOrchestrator(payload?: { tool?: string; model?: string; reason?: string; no_handoff?: boolean }, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('rotateOrchestrator', payload || {});
+      return sendVsCodeMessage<any>('rotateOrchestrator', payload || {}, proj);
     }
     return apiFetch<any>('/api/orchestrator/rotate', {
       method: 'POST',
       body: JSON.stringify(payload || {}),
-    });
+    }, proj);
   },
 
-  async cancelOrchestratorTurn(turnId: string): Promise<any> {
+  async cancelOrchestratorTurn(turnId: string, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('cancelOrchestratorTurn', { turnId });
+      return sendVsCodeMessage<any>('cancelOrchestratorTurn', { turnId }, proj);
     }
-    return apiFetch<any>(`/api/orchestrator/cancel/${encodeURIComponent(turnId)}`, { method: 'POST' });
+    return apiFetch<any>(`/api/orchestrator/cancel/${encodeURIComponent(turnId)}`, { method: 'POST' }, proj);
   },
 
-  async runNextOrchestratorTurn(timeout?: number): Promise<any> {
+  async runNextOrchestratorTurn(timeout?: number, opts?: string | ProjectScopeOpts | null): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('runNextOrchestratorTurn', { timeout });
+      return sendVsCodeMessage<any>('runNextOrchestratorTurn', { timeout }, proj);
     }
     return apiFetch<any>('/api/orchestrator/run-next', {
       method: 'POST',
       body: JSON.stringify(timeout ? { timeout } : {}),
-    });
+    }, proj);
   },
 };
 
@@ -2023,28 +2159,32 @@ import type {
 export const proposedActionsApi = {
   async confirmProposedAction(
     actionId: string,
-    payload: { expect_hash: string }
+    payload: { expect_hash: string },
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('confirmProposedAction', { actionId, ...payload });
+      return sendVsCodeMessage<any>('confirmProposedAction', { actionId, ...payload }, proj);
     }
     return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/confirm`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
   async rejectProposedAction(
     actionId: string,
-    payload: { reason: string }
+    payload: { reason: string },
+    opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<any>('rejectProposedAction', { actionId, ...payload });
+      return sendVsCodeMessage<any>('rejectProposedAction', { actionId, ...payload }, proj);
     }
     return apiFetch<any>(`/api/triggers/proposed-actions/${encodeURIComponent(actionId)}/reject`, {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 };
 
@@ -2059,7 +2199,7 @@ export interface OrchestratorCardAndSetupApiExtensions {
     scope?: string;
     no_handoff?: boolean;
     timeout?: number;
-  }): Promise<OrchestratorReassignPreviewResponse>;
+  }, opts?: string | ProjectScopeOpts | null): Promise<OrchestratorReassignPreviewResponse>;
   reassignOrchestrator(payload: {
     tool: string;
     expect_hash: string;
@@ -2067,7 +2207,7 @@ export interface OrchestratorCardAndSetupApiExtensions {
     scope?: string;
     no_handoff?: boolean;
     timeout?: number;
-  }): Promise<OrchestratorReassignApplyResponse>;
+  }, opts?: string | ProjectScopeOpts | null): Promise<OrchestratorReassignApplyResponse>;
   previewSetup(params?: {
     scope?: string;
     orchestrator?: string;
@@ -2075,7 +2215,7 @@ export interface OrchestratorCardAndSetupApiExtensions {
     orchestrator_model?: string;
     executor_model?: string;
     verification_mode?: string;
-  }): Promise<SetupPlanResponse>;
+  }, opts?: string | ProjectScopeOpts | null): Promise<SetupPlanResponse>;
   applySetup(payload: {
     expect_hash: string;
     scope?: string;
@@ -2085,48 +2225,52 @@ export interface OrchestratorCardAndSetupApiExtensions {
     executor_model?: string;
     verification_mode?: string;
     start_orchestrator?: boolean;
-  }): Promise<SetupApplyResponse>;
+  }, opts?: string | ProjectScopeOpts | null): Promise<SetupApplyResponse>;
 }
 
 export const orchestratorCardAndSetupApi: OrchestratorCardAndSetupApiExtensions = {
-  async previewOrchestratorReassign(payload) {
+  async previewOrchestratorReassign(payload, opts) {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<OrchestratorReassignPreviewResponse>('previewOrchestratorReassign', payload);
+      return sendVsCodeMessage<OrchestratorReassignPreviewResponse>('previewOrchestratorReassign', payload, proj);
     }
     return apiFetch<OrchestratorReassignPreviewResponse>('/api/orchestrator/reassign/preview', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async reassignOrchestrator(payload) {
+  async reassignOrchestrator(payload, opts) {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<OrchestratorReassignApplyResponse>('reassignOrchestrator', payload);
+      return sendVsCodeMessage<OrchestratorReassignApplyResponse>('reassignOrchestrator', payload, proj);
     }
     return apiFetch<OrchestratorReassignApplyResponse>('/api/orchestrator/reassign', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 
-  async previewSetup(params) {
+  async previewSetup(params, opts) {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetupPlanResponse>('previewSetup', params || {});
+      return sendVsCodeMessage<SetupPlanResponse>('previewSetup', params || {}, proj);
     }
     return apiFetch<SetupPlanResponse>('/api/setup/preview', {
       method: 'POST',
       body: JSON.stringify(params || {}),
-    });
+    }, proj);
   },
 
-  async applySetup(payload) {
+  async applySetup(payload, opts) {
+    const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage<SetupApplyResponse>('applySetup', payload);
+      return sendVsCodeMessage<SetupApplyResponse>('applySetup', payload, proj);
     }
     return apiFetch<SetupApplyResponse>('/api/setup/apply', {
       method: 'POST',
       body: JSON.stringify(payload),
-    });
+    }, proj);
   },
 };
 
@@ -2144,6 +2288,7 @@ export const orchestratorConfigApi = {
 export async function acceptTriageWithEdits(
   runId: string,
   payload: AcceptTriagePayload,
+  opts?: string | ProjectScopeOpts | null
 ): Promise<AcceptTriageResponse> {
-  return api.acceptTriage(runId, payload);
+  return api.acceptTriage(runId, payload, opts);
 }

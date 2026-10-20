@@ -25,7 +25,7 @@ import {
   StructurePlanItem,
   SharedFilterState,
 } from '../types';
-import { taskStructureApi, setCurrentProject } from '../api';
+import { taskStructureApi, useProject } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
 import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
@@ -142,9 +142,10 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
   isCommonView = false,
   onSelectCoordTarget,
 }) => {
+  const defaultProject = useProject();
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>(getStoredExpanded);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [promoteTargetTask, setPromoteTargetTask] = useState<{ id: string; title: string } | null>(null);
+  const [promoteTargetTask, setPromoteTargetTask] = useState<{ id: string; title: string; project?: string } | null>(null);
   const [localGroupByLabel, setLocalGroupByLabel] = useState(false);
   const [expandedLabelGroups, setExpandedLabelGroups] = useState<Record<string, boolean>>({});
 
@@ -166,6 +167,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
     planHash?: string;
     actionType: 'add-child' | 'expand' | 'collapse' | 'reopen';
     nodeId: string;
+    nodeProject?: string;
     extraPayload?: any;
   } | null>(null);
 
@@ -379,6 +381,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
     e.preventDefault();
     if (!addChildParent || !addChildTitle.trim()) return;
 
+    const targetProj = addChildParent.project || defaultProject;
     setAddChildLoading(true);
     setAddChildError(null);
     try {
@@ -386,7 +389,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         title: addChildTitle.trim(),
         short_title: addChildShortTitle.trim() || undefined,
         kind: addChildKind,
-      });
+      }, targetProj);
 
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
@@ -400,6 +403,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         planHash: res.plan_hash || res.hash,
         actionType: 'add-child',
         nodeId: addChildParent.id,
+        nodeProject: targetProj || undefined,
         extraPayload: {
           title: addChildTitle.trim(),
           short_title: addChildShortTitle.trim() || undefined,
@@ -417,8 +421,9 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
 
   const handlePreviewExpand = async (node: TreeNode, e: React.MouseEvent) => {
     e.stopPropagation();
+    const targetProj = node.project || defaultProject;
     try {
-      const res = await taskStructureApi.previewExpandTask(node.id);
+      const res = await taskStructureApi.previewExpandTask(node.id, targetProj);
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
       }
@@ -430,6 +435,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         planHash: res.plan_hash || res.hash,
         actionType: 'expand',
         nodeId: node.id,
+        nodeProject: targetProj || undefined,
       });
     } catch (err: any) {
       alert(`Expand failed: ${err.message || String(err)}`);
@@ -438,8 +444,9 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
 
   const handlePreviewCollapse = async (node: TreeNode, e: React.MouseEvent) => {
     e.stopPropagation();
+    const targetProj = node.project || defaultProject;
     try {
-      const res = await taskStructureApi.previewCollapseTask(node.id);
+      const res = await taskStructureApi.previewCollapseTask(node.id, targetProj);
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
       }
@@ -451,6 +458,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         planHash: res.plan_hash || res.hash,
         actionType: 'collapse',
         nodeId: node.id,
+        nodeProject: targetProj || undefined,
       });
     } catch (err: any) {
       alert(`Collapse failed: ${err.message || String(err)}`);
@@ -467,11 +475,12 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
   const handlePreviewReopen = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!reopenNode || !reopenReason.trim()) return;
+    const targetProj = reopenNode.project || defaultProject;
 
     try {
       const res = await taskStructureApi.previewReopenTask(reopenNode.id, {
         reason: reopenReason.trim(),
-      });
+      }, targetProj);
       if (!res.ok) {
         throw new Error(res.error || 'Preview failed');
       }
@@ -483,6 +492,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         planHash: res.plan_hash || res.hash,
         actionType: 'reopen',
         nodeId: reopenNode.id,
+        nodeProject: targetProj || undefined,
         extraPayload: { reason: reopenReason.trim() },
       });
       setReopenNode(null);
@@ -493,8 +503,9 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
 
   const handleApplyConfirmDialog = async (planHash?: string) => {
     if (!confirmDialogData) return;
-    const { actionType, nodeId, extraPayload } = confirmDialogData;
+    const { actionType, nodeId, nodeProject, extraPayload } = confirmDialogData;
     const hash = planHash || confirmDialogData.planHash || '';
+    const targetProj = nodeProject || defaultProject;
 
     if (actionType === 'add-child') {
       await taskStructureApi.addChild(nodeId, {
@@ -502,7 +513,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         short_title: extraPayload.short_title,
         kind: extraPayload.kind,
         expect_plan_hash: hash,
-      });
+      }, targetProj);
       // Automatically expand parent so the new child is visible
       setExpandedNodes((prev) => {
         const next = { ...prev, [nodeId]: true };
@@ -510,19 +521,19 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         return next;
       });
     } else if (actionType === 'expand') {
-      await taskStructureApi.expandTask(nodeId, { expect_plan_hash: hash });
+      await taskStructureApi.expandTask(nodeId, { expect_plan_hash: hash }, targetProj);
       setExpandedNodes((prev) => {
         const next = { ...prev, [nodeId]: true };
         storeExpanded(next);
         return next;
       });
     } else if (actionType === 'collapse') {
-      await taskStructureApi.collapseTask(nodeId, { expect_plan_hash: hash });
+      await taskStructureApi.collapseTask(nodeId, { expect_plan_hash: hash }, targetProj);
     } else if (actionType === 'reopen') {
       await taskStructureApi.reopenTask(nodeId, {
         reason: extraPayload.reason,
         expect_plan_hash: hash,
-      });
+      }, targetProj);
     }
 
     setConfirmDialogData(null);
@@ -531,9 +542,6 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
 
   // Convert a TreeNode to a TaskItem for modal display
   const handleSelectNode = (node: TreeNode) => {
-    if (node.project) {
-      setCurrentProject(node.project);
-    }
     const taskItem: TaskItem = {
       id: node.id,
       project: node.project,
@@ -895,7 +903,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  setPromoteTargetTask({ id: node.id, title: node.title });
+                  setPromoteTargetTask({ id: node.id, title: node.title, project: node.project });
                 }}
                 style={{
                   display: 'flex',
@@ -1344,10 +1352,10 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
                                 {isMicro && (
                                   <button
                                     type="button"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setPromoteTargetTask({ id: t.id, title: t.title });
-                                    }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setPromoteTargetTask({ id: t.id, title: t.title, project: t.project });
+                      }}
                                     title="Promote microtask to full task"
                                     style={{
                                       display: 'inline-flex',
@@ -1777,6 +1785,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
       {promoteTargetTask && (
         <PromoteDialog
           taskId={promoteTargetTask.id}
+          project={promoteTargetTask.project || defaultProject}
           taskTitle={promoteTargetTask.title}
           isOpen={true}
           onClose={() => setPromoteTargetTask(null)}

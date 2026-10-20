@@ -14,7 +14,7 @@ import {
   Eye,
 } from 'lucide-react';
 import { OrchestrationConfigResponse, VerificationMode, ConfigPreviewResponse } from '../types';
-import { api } from '../api';
+import { api, useProjectContext } from '../api';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { OrchestratorConfigCard } from './OrchestratorConfigCard';
 import { SetupWizard } from './SetupWizard';
@@ -52,14 +52,48 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
   configData,
   onRefresh,
 }) => {
+  const { selectedProject, fallbackProject, isCommonView, projects } = useProjectContext();
+  const writableProjects = projects.filter((p) => p.kind !== 'sub_workspace');
+  const [targetProject, setTargetProject] = useState<string>(
+    selectedProject || fallbackProject || writableProjects[0]?.id || ''
+  );
+  const [overrideConfig, setOverrideConfig] = useState<OrchestrationConfigResponse | null>(null);
+
+  useEffect(() => {
+    if (selectedProject) {
+      setTargetProject(selectedProject);
+      setOverrideConfig(null);
+    } else if (!targetProject && (fallbackProject || writableProjects[0]?.id)) {
+      setTargetProject(fallbackProject || writableProjects[0]?.id || '');
+    }
+  }, [selectedProject, fallbackProject, projects]);
+
+  const effectiveProject = selectedProject || targetProject || fallbackProject;
+
+  useEffect(() => {
+    if (!isCommonView || !targetProject || targetProject === fallbackProject) {
+      setOverrideConfig(null);
+      return;
+    }
+    let active = true;
+    api.getConfig(targetProject).then((res) => {
+      if (active) setOverrideConfig(res);
+    }).catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [isCommonView, targetProject, fallbackProject, configData]);
+
+  const activeConfigData = overrideConfig || configData;
+
   // Scope: 'global' vs 'project'
   const [selectedScope, setSelectedScope] = useState<'global' | 'project'>(() => {
-    return configData?.meta?.project_config_exists ? 'project' : 'global';
+    return activeConfigData?.meta?.project_config_exists ? 'project' : 'global';
   });
 
   // First-run wizard state: auto-open if workspace has no project config
   const [showWizard, setShowWizard] = useState<boolean>(() => {
-    return !configData?.meta?.project_config_exists;
+    return !activeConfigData?.meta?.project_config_exists;
   });
 
   // Routing state
@@ -86,11 +120,11 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
     onRefetchAction: () => Promise<ConfirmDialogPreviewData>;
   }) | null>(null);
 
-  // Sync state when configData arrives or refreshes
+  // Sync state when activeConfigData arrives or refreshes
   useEffect(() => {
-    if (!configData) return;
-    const r = configData.config.routing || {};
-    const v = configData.config.verification || {};
+    if (!activeConfigData) return;
+    const r = activeConfigData.config.routing || {};
+    const v = activeConfigData.config.verification || {};
 
     setOrchestrator(r.default_orchestrator || 'kilo');
     setExecutor(r.default_executor || 'kilo');
@@ -99,7 +133,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
 
     // Populate matrix edits from config
     const initialEdits: Record<string, CellEditState> = {};
-    const tools = configData.config.tools || {};
+    const tools = activeConfigData.config.tools || {};
     Object.keys(tools).forEach((toolKey) => {
       const toolProfiles = tools[toolKey]?.profiles || {};
       PROFILES.forEach((prof) => {
@@ -113,12 +147,13 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
       });
     });
     setMatrixEdits(initialEdits);
-  }, [configData]);
+  }, [activeConfigData]);
 
   // Prefetch AGENTS.md preview warnings on mount to display T011 warnings immediately
   useEffect(() => {
+    if (!effectiveProject) return;
     let active = true;
-    api.previewAgentsMd()
+    api.previewAgentsMd(effectiveProject)
       .then((res) => {
         if (active && res.warnings && res.warnings.length > 0) {
           setAgentsMdWarnings(res.warnings);
@@ -128,13 +163,13 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
     return () => {
       active = false;
     };
-  }, []);
+  }, [effectiveProject]);
 
-  if (!configData) {
+  if (!activeConfigData) {
     return <div style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>Loading configuration...</div>;
   }
 
-  const { config, meta } = configData;
+  const { config, meta } = activeConfigData;
   const initialRouting = config.routing || {};
   const initialVerification = config.verification || {};
   const tools = config.tools || {};
@@ -247,7 +282,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         orchestrator,
         executor,
         defaultProfile,
-        verificationMode
+        verificationMode,
+        effectiveProject
       );
 
       if (!res.changed && !res.diff) {
@@ -273,7 +309,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
             orchestrator,
             executor,
             defaultProfile,
-            verificationMode
+            verificationMode,
+            effectiveProject
           );
           setConfirmData(null);
           setStatusMsg({
@@ -288,7 +325,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
             orchestrator,
             executor,
             defaultProfile,
-            verificationMode
+            verificationMode,
+            effectiveProject
           );
           return {
             summary: `Update routing in ${r.path}`,
@@ -329,7 +367,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         cell.variant || undefined,
         cell.effort || undefined,
         'operator-stated',
-        selectedScope
+        selectedScope,
+        effectiveProject
       );
 
       if (!res.changed && !res.diff) {
@@ -357,7 +396,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
             cell.variant || undefined,
             cell.effort || undefined,
             'operator-stated',
-            selectedScope
+            selectedScope,
+            effectiveProject
           );
           setConfirmData(null);
           setStatusMsg({
@@ -374,7 +414,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
             cell.variant || undefined,
             cell.effort || undefined,
             'operator-stated',
-            selectedScope
+            selectedScope,
+            effectiveProject
           );
           return {
             summary: `Set model to "${cell.model}" in ${r.path}`,
@@ -421,7 +462,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
           item.cell.variant || undefined,
           item.cell.effort || undefined,
           'operator-stated',
-          selectedScope
+          selectedScope,
+          effectiveProject
         );
         previews.push({ tool: item.tool, profile: item.profile, cell: item.cell, res });
       }
@@ -459,7 +501,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
               item.cell.variant || undefined,
               item.cell.effort || undefined,
               'operator-stated',
-              selectedScope
+              selectedScope,
+              effectiveProject
             );
             if (!freshPrev.hash) {
               throw new Error(`Failed to obtain hash for ${item.tool} [${item.profile}]`);
@@ -472,7 +515,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
               item.cell.variant || undefined,
               item.cell.effort || undefined,
               'operator-stated',
-              selectedScope
+              selectedScope,
+              effectiveProject
             );
           }
           setConfirmData(null);
@@ -492,7 +536,8 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
               item.cell.variant || undefined,
               item.cell.effort || undefined,
               'operator-stated',
-              selectedScope
+              selectedScope,
+              effectiveProject
             );
             freshPreviews.push({ tool: item.tool, profile: item.profile, res: r });
           }
@@ -520,7 +565,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
     setLoadingAction('agents_md');
     setStatusMsg(null);
     try {
-      const res = await api.previewAgentsMd();
+      const res = await api.previewAgentsMd(effectiveProject);
       if (res.warnings && res.warnings.length > 0) {
         setAgentsMdWarnings(res.warnings);
       }
@@ -534,7 +579,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         onApplyAction: async (hash?: string) => {
           if (!hash) throw new Error('Hash is required to apply changes to AGENTS.md');
           const hasNoProjectConfig = !meta.project_config_exists;
-          await api.applyAgentsMd(hash, hasNoProjectConfig);
+          await api.applyAgentsMd(hash, hasNoProjectConfig, effectiveProject);
           setConfirmData(null);
           setStatusMsg({
             type: 'success',
@@ -543,7 +588,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
           onRefresh();
         },
         onRefetchAction: async () => {
-          const r = await api.previewAgentsMd();
+          const r = await api.previewAgentsMd(effectiveProject);
           if (r.warnings) setAgentsMdWarnings(r.warnings);
           return {
             summary: 'Synchronize active model matrix, cognitive profiles, and routing rules with workspace `AGENTS.md`.',
@@ -565,6 +610,42 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
 
   return (
     <div style={{ padding: '1.5rem', maxWidth: '1150px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+      {isCommonView && writableProjects.length > 1 && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '1rem',
+            padding: '0.75rem 1rem',
+            backgroundColor: '#1e293b',
+            border: '1px solid #334155',
+            borderRadius: '0.5rem',
+          }}
+        >
+          <span style={{ fontSize: '0.82rem', color: '#cbd5e1', fontWeight: 600 }}>
+            Configuring Project Scope:
+          </span>
+          <select
+            value={targetProject}
+            onChange={(e) => setTargetProject(e.target.value)}
+            style={{
+              backgroundColor: '#0f172a',
+              color: '#f8fafc',
+              border: '1px solid #475569',
+              padding: '0.35rem 0.65rem',
+              borderRadius: '0.375rem',
+              fontSize: '0.82rem',
+            }}
+          >
+            {writableProjects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.id} ({p.kind})
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       {/* Top Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '1rem' }}>
         <div>
@@ -632,7 +713,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
       )}
 
       {/* Validation Errors from config show */}
-      {configData.errors && configData.errors.length > 0 && (
+      {activeConfigData.errors && activeConfigData.errors.length > 0 && (
         <div style={{
           backgroundColor: '#451a1a',
           border: '1px solid #ef4444',
@@ -641,10 +722,10 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#fca5a5', fontWeight: 600, fontSize: '0.9rem' }}>
             <AlertCircle size={17} color="#ef4444" />
-            <span>Configuration Validation Errors ({configData.errors.length})</span>
+            <span>Configuration Validation Errors ({activeConfigData.errors.length})</span>
           </div>
           <ul style={{ margin: '0.5rem 0 0 1.3rem', padding: 0, color: '#fecaca', fontSize: '0.85rem' }}>
-            {configData.errors.map((err, i) => (
+            {activeConfigData.errors.map((err, i) => (
               <li key={i}>{err}</li>
             ))}
           </ul>
@@ -652,7 +733,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
       )}
 
       {/* Validation Warnings from config show */}
-      {configData.warnings && configData.warnings.length > 0 && (
+      {activeConfigData.warnings && activeConfigData.warnings.length > 0 && (
         <div style={{
           backgroundColor: '#451a03',
           border: '1px solid #f59e0b',
@@ -661,10 +742,10 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#fde68a', fontWeight: 600, fontSize: '0.9rem' }}>
             <AlertTriangle size={17} color="#f59e0b" />
-            <span>Configuration Warnings ({configData.warnings.length})</span>
+            <span>Configuration Warnings ({activeConfigData.warnings.length})</span>
           </div>
           <ul style={{ margin: '0.5rem 0 0 1.3rem', padding: 0, color: '#fef3c7', fontSize: '0.85rem' }}>
-            {configData.warnings.map((w, i) => (
+            {activeConfigData.warnings.map((w, i) => (
               <li key={i}>{w}</li>
             ))}
           </ul>
@@ -674,6 +755,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
       {/* First-Run Setup Wizard */}
       {showWizard && (
         <SetupWizard
+          project={effectiveProject}
           onComplete={() => {
             setShowWizard(false);
             setStatusMsg({
@@ -688,7 +770,7 @@ export const OrchestrationConfigurator: React.FC<OrchestrationConfiguratorProps>
 
       {/* Orchestrator Role & Reassignment Card */}
       <OrchestratorConfigCard
-        configData={configData}
+        configData={activeConfigData}
         onRefresh={onRefresh}
         onOpenSetupWizard={() => setShowWizard(true)}
       />

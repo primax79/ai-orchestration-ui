@@ -21,12 +21,13 @@ import {
   RunRecord,
   RunLogEvent,
 } from '../types';
-import { api } from '../api';
+import { api, useProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { ConfirmDialog } from './ConfirmDialog';
 
 interface TaskRunsPanelProps {
   task: TaskItem;
+  project?: string | null;
   initialRunId?: string;
   refreshTrigger?: number;
   onRunsLoaded?: (runs: RunRecord[]) => void;
@@ -37,6 +38,7 @@ interface TaskRunsPanelProps {
 
 export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
   task,
+  project,
   initialRunId,
   refreshTrigger,
   onRunsLoaded,
@@ -44,6 +46,8 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
   onNavigateToDecisions,
   onOpenRunDialog,
 }) => {
+  const defaultProject = useProject();
+  const targetProject = project || task.project || defaultProject;
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -83,33 +87,37 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
   const isFetchingLogsRef = useRef<boolean>(false);
   const prevRunIdRef = useRef<string | null>(null);
 
+  const onRunsLoadedRef = useRef(onRunsLoaded);
+  useEffect(() => {
+    onRunsLoadedRef.current = onRunsLoaded;
+  });
+
   const loadRuns = useCallback(async (selectId?: string) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await api.listRuns({ task: task.id });
+      const res = await api.listRuns({ task: task.id }, targetProject);
       const runList = res.runs || [];
       setRuns(runList);
-      onRunsLoaded?.(runList);
+      onRunsLoadedRef.current?.(runList);
 
       if (selectId) {
         setSelectedRunId(selectId);
-      } else if (!selectedRunId && runList.length > 0) {
-        // Prefer initialRunId, else first active run, else latest run
-        const matched = initialRunId ? runList.find((r) => r.run_id === initialRunId) : null;
-        if (matched) {
-          setSelectedRunId(matched.run_id);
-        } else {
+      } else {
+        setSelectedRunId((prev) => {
+          if (prev || runList.length === 0) return prev;
+          const matched = initialRunId ? runList.find((r) => r.run_id === initialRunId) : null;
+          if (matched) return matched.run_id;
           const active = runList.find((r) => r.status === 'running' || r.status === 'starting');
-          setSelectedRunId(active ? active.run_id : runList[0].run_id);
-        }
+          return active ? active.run_id : runList[0].run_id;
+        });
       }
     } catch (e: any) {
       setError(e?.data?.error || e?.message || String(e));
     } finally {
       setLoading(false);
     }
-  }, [task.id, initialRunId, selectedRunId, onRunsLoaded]);
+  }, [task.id, targetProject, initialRunId]);
 
   useEffect(() => {
     loadRuns(initialRunId);
@@ -153,7 +161,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
 
     const storedOffset = nextOffsetsRef.current[runId] || 0;
     try {
-      const res = await api.getRunLogs(runId, { since_offset: storedOffset });
+      const res = await api.getRunLogs(runId, { since_offset: storedOffset }, targetProject);
       if (!res || !res.ok) return;
 
       // Reset when first_available_offset > stored offset (log buffer wrapped)
@@ -206,7 +214,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
       isFetchingLogsRef.current = false;
       setLogsLoading(false);
     }
-  }, []);
+  }, [targetProject]);
 
   // Reset and fetch logs when selected run changes
   useEffect(() => {
@@ -249,7 +257,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
 
       for (const ar of activeRuns) {
         try {
-          const updated = await api.getRun(ar.run_id);
+          const updated = await api.getRun(ar.run_id, ar.project || targetProject);
           if (updated && updated.run) {
             setRuns((prev) => {
               const next = prev.map((item) => (item.run_id === updated.run.run_id ? updated.run : item));
@@ -301,7 +309,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
       const prev = await api.cleanupRun(run.run_id, {
         dry_run: true,
         expect_plan_hash: run.plan_hash,
-      });
+      }, run.project || targetProject);
       setCleanupConfirm({
         isOpen: true,
         runId: run.run_id,
@@ -325,7 +333,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
       await api.cleanupRun(cleanupConfirm.runId, {
         discard: true,
         expect_plan_hash: hash || cleanupConfirm.planHash,
-      });
+      }, targetProject);
       setCleanupConfirm(null);
       await loadRuns(cleanupConfirm.runId);
       onRefreshTask?.();
@@ -1026,7 +1034,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
             setActionLoading(`cancel_${cancelConfirm.run_id}`);
             setActionError(null);
             try {
-              await api.cancelRun(cancelConfirm.run_id);
+              await api.cancelRun(cancelConfirm.run_id, cancelConfirm.project || targetProject);
               setCancelConfirm(null);
               await loadRuns(cancelConfirm.run_id);
               onRefreshTask?.();
@@ -1067,7 +1075,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
               const bundleHash = task.bundle_sha256 || task.task_bundle_sha256;
               await api.markDeliveredRun(deliverConfirm.run_id, {
                 expect_task_hash: bundleHash,
-              });
+              }, deliverConfirm.project || targetProject);
               setDeliverConfirm(null);
               await loadRuns(deliverConfirm.run_id);
               onRefreshTask?.();
@@ -1121,7 +1129,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
               await api.applyVerdictRun(verdictConfirm.run_id, {
                 expect_task_hash: bundleHash,
                 panel_id: verdictConfirm.panel_id || undefined,
-              });
+              }, verdictConfirm.project || targetProject);
               setVerdictConfirm(null);
               await loadRuns(verdictConfirm.run_id);
               onRefreshTask?.();
@@ -1159,7 +1167,7 @@ export const TaskRunsPanel: React.FC<TaskRunsPanelProps> = ({
               const res = await api.continueRun(continueConfirm.run_id, {
                 instructions: continueInstructions.trim() || undefined,
                 expect_plan_hash: hash || continueConfirm.plan_hash,
-              });
+              }, continueConfirm.project || targetProject);
               setContinueConfirm(null);
               setContinueInstructions('');
               if (res && res.run_id) {

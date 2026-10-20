@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, Zap, Loader2, AlertCircle, X, Check } from 'lucide-react';
 import { TaskKind, Priority, CreateMicrotaskResponse, WorkspaceProjectInfo } from '../types';
-import { microtaskAndLabelsApi, setCurrentProject } from '../api';
+import { microtaskAndLabelsApi, useProject } from '../api';
 import { KIND_CONFIGS } from './KindBadge';
 
 interface MicrotaskQuickAddProps {
@@ -28,10 +28,11 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
   defaultProject = null,
   disabled = false,
 }) => {
+  const ctxProject = useProject();
   const writableProjects = projects.filter((p) => p.kind !== 'sub_workspace');
   const [isOpen, setIsOpen] = useState(false);
   const [targetProject, setTargetProject] = useState<string>(
-    defaultProject || (writableProjects.length === 1 ? writableProjects[0].id : writableProjects[0]?.id || '')
+    defaultProject || ctxProject || (writableProjects.length === 1 ? writableProjects[0].id : writableProjects[0]?.id || '')
   );
 
   useEffect(() => {
@@ -71,10 +72,9 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
       .map((s) => s.trim().toLowerCase())
       .filter((s) => s.length > 0);
 
+    const explicitProj = (isCommonView ? targetProject : defaultProject) || ctxProject;
+
     try {
-      if (isCommonView && targetProject) {
-        setCurrentProject(targetProject);
-      }
       const res = await microtaskAndLabelsApi.createMicrotask({
         title: title.trim(),
         short_title: shortTitle.trim() || undefined,
@@ -82,7 +82,7 @@ export const MicrotaskQuickAdd: React.FC<MicrotaskQuickAddProps> = ({
         priority,
         labels: labels.length > 0 ? labels : undefined,
         what: what.trim() || undefined,
-      });
+      }, explicitProj);
 
       // Clear form
       setTitle('');

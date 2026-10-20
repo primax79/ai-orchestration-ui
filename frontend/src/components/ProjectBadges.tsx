@@ -16,23 +16,60 @@ import {
   shortTitle,
 } from '../types';
 
+export const PROJECT_PALETTE: Array<{
+  bg: string;
+  text: string;
+  border: string;
+  dot: string;
+}> = [
+  // 0: Sky Blue
+  { bg: 'rgba(14, 165, 233, 0.16)', text: '#38bdf8', border: 'rgba(14, 165, 233, 0.45)', dot: '#0ea5e9' },
+  // 1: Emerald Green
+  { bg: 'rgba(16, 185, 129, 0.16)', text: '#34d399', border: 'rgba(16, 185, 129, 0.45)', dot: '#10b981' },
+  // 2: Amber Gold
+  { bg: 'rgba(245, 158, 11, 0.16)', text: '#fbbf24', border: 'rgba(245, 158, 11, 0.45)', dot: '#f59e0b' },
+  // 3: Violet Purple
+  { bg: 'rgba(168, 85, 247, 0.16)', text: '#c084fc', border: 'rgba(168, 85, 247, 0.45)', dot: '#a855f7' },
+  // 4: Rose Pink
+  { bg: 'rgba(244, 63, 94, 0.16)', text: '#fb7185', border: 'rgba(244, 63, 94, 0.45)', dot: '#f43f5e' },
+  // 5: Cyan Teal
+  { bg: 'rgba(6, 182, 212, 0.16)', text: '#22d3ee', border: 'rgba(6, 182, 212, 0.45)', dot: '#06b6d4' },
+  // 6: Orange Coral
+  { bg: 'rgba(249, 115, 22, 0.16)', text: '#fb923c', border: 'rgba(249, 115, 22, 0.45)', dot: '#f97316' },
+  // 7: Lime Green
+  { bg: 'rgba(132, 204, 22, 0.16)', text: '#a3e635', border: 'rgba(132, 204, 22, 0.45)', dot: '#84cc16' },
+  // 8: Indigo
+  { bg: 'rgba(99, 102, 241, 0.16)', text: '#818cf8', border: 'rgba(99, 102, 241, 0.45)', dot: '#6366f1' },
+  // 9: Fuchsia Magenta
+  { bg: 'rgba(217, 70, 239, 0.16)', text: '#e879f9', border: 'rgba(217, 70, 239, 0.45)', dot: '#d946ef' },
+];
+
+const assignedProjectColors = new Map<string, number>();
+
+export function registerProjectColorOrder(projectIds: string[]): void {
+  projectIds.forEach((id, idx) => {
+    if (id && !assignedProjectColors.has(id)) {
+      assignedProjectColors.set(id, idx % PROJECT_PALETTE.length);
+    }
+  });
+}
+
 export function getProjectColor(projectId: string): {
   bg: string;
   text: string;
   border: string;
   dot: string;
 } {
-  let hash = 0;
-  for (let i = 0; i < projectId.length; i++) {
-    hash = projectId.charCodeAt(i) + ((hash << 5) - hash);
+  if (!projectId) {
+    return PROJECT_PALETTE[0];
   }
-  const hue = Math.abs(hash * 37) % 360;
-  return {
-    bg: `hsla(${hue}, 70%, 50%, 0.14)`,
-    text: `hsl(${hue}, 82%, 76%)`,
-    border: `hsla(${hue}, 70%, 50%, 0.42)`,
-    dot: `hsl(${hue}, 75%, 60%)`,
-  };
+  const existing = assignedProjectColors.get(projectId);
+  if (existing !== undefined) {
+    return PROJECT_PALETTE[existing % PROJECT_PALETTE.length];
+  }
+  const nextIndex = assignedProjectColors.size % PROJECT_PALETTE.length;
+  assignedProjectColors.set(projectId, nextIndex);
+  return PROJECT_PALETTE[nextIndex];
 }
 
 export const ProjectChip: React.FC<{
@@ -221,12 +258,43 @@ export const PlacementWarningChip: React.FC<{
   );
 };
 
+export function normalizeCoordinates(task?: {
+  coordinates?: TaskCoordinateItem[];
+  coordinates_refs?: string[];
+  coordinates_raw?: string;
+  [key: string]: any;
+} | null): TaskCoordinateItem[] {
+  if (!task) return [];
+  if (Array.isArray(task.coordinates) && task.coordinates.length > 0) {
+    return task.coordinates;
+  }
+  const refs: string[] = Array.isArray(task.coordinates_refs) && task.coordinates_refs.length > 0
+    ? task.coordinates_refs
+    : typeof task.coordinates_raw === 'string' && task.coordinates_raw !== '-'
+    ? task.coordinates_raw.split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
+  return refs
+    .map((ref) => {
+      const idx = ref.indexOf('/');
+      if (idx > 0) {
+        return {
+          project: ref.slice(0, idx).trim(),
+          id: ref.slice(idx + 1).trim(),
+        };
+      }
+      return { project: '', id: ref.trim() };
+    })
+    .filter((c) => Boolean(c.id));
+}
+
 export const CoordinatesExpansionList: React.FC<{
   coordinates?: TaskCoordinateItem[];
+  task?: { coordinates?: TaskCoordinateItem[]; coordinates_refs?: string[]; coordinates_raw?: string; [key: string]: any } | null;
   onSelectTarget?: (project: string, taskId: string) => void;
   compact?: boolean;
-}> = ({ coordinates, onSelectTarget, compact = false }) => {
-  if (!coordinates || coordinates.length === 0) return null;
+}> = ({ coordinates, task, onSelectTarget, compact = false }) => {
+  const list = coordinates && coordinates.length > 0 ? coordinates : normalizeCoordinates(task);
+  if (!list || list.length === 0) return null;
 
   const getStateBadgeColors = (st?: string) => {
     const s = (st || 'open').toLowerCase();
@@ -271,12 +339,12 @@ export const CoordinatesExpansionList: React.FC<{
         }}
       >
         <GitBranch size={10} color="#818cf8" />
-        <span>Coordinates ({coordinates.length})</span>
+        <span>Coordinates ({list.length})</span>
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem' }}>
-        {coordinates.map((c, idx) => {
+        {list.map((c, idx) => {
           const stColors = getStateBadgeColors(c.state);
-          const qid = `${c.project}/${c.id}`;
+          const qid = c.project ? `${c.project}/${c.id}` : c.id;
           return (
             <div
               key={`${qid}-${idx}`}
@@ -293,7 +361,7 @@ export const CoordinatesExpansionList: React.FC<{
                 cursor: onSelectTarget ? 'pointer' : 'default',
               }}
             >
-              <ProjectChip project={c.project} size="xs" />
+              {c.project && <ProjectChip project={c.project} size="xs" />}
               <span style={{ fontFamily: 'monospace', fontWeight: 700, color: '#e2e8f0' }}>
                 {qid}
               </span>
@@ -311,19 +379,21 @@ export const CoordinatesExpansionList: React.FC<{
                   ({c.short_title})
                 </span>
               )}
-              <span
-                style={{
-                  fontSize: '0.62rem',
-                  fontWeight: 600,
-                  padding: '0.05rem 0.3rem',
-                  borderRadius: '999px',
-                  backgroundColor: stColors.bg,
-                  color: stColors.text,
-                  border: `1px solid ${stColors.border}`,
-                }}
-              >
-                {c.state || 'open'}
-              </span>
+              {c.state && (
+                <span
+                  style={{
+                    fontSize: '0.62rem',
+                    fontWeight: 600,
+                    padding: '0.05rem 0.3rem',
+                    borderRadius: '999px',
+                    backgroundColor: stColors.bg,
+                    color: stColors.text,
+                    border: `1px solid ${stColors.border}`,
+                  }}
+                >
+                  {c.state}
+                </span>
+              )}
             </div>
           );
         })}
@@ -419,6 +489,7 @@ export const WorkspaceDashboardStrip: React.FC<{
   onSelectProject: (projectId: string | null) => void;
 }> = ({ projects, tasks = [], selectedProject, onSelectProject }) => {
   if (!projects || projects.length <= 1) return null;
+  registerProjectColorOrder(projects.map((p) => p.id));
 
   // Compute conditional task counts per project from tasks if present
   const conditionalByProject: Record<string, number> = {};

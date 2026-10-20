@@ -19,7 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import { QuestionItem, TaskItem, AnswerAndResumePreviewResponse, shortTitle } from '../types';
-import { api, setCurrentProject } from '../api';
+import { api, answerAndResumeApi, useProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ProjectChip } from './ProjectBadges';
@@ -28,6 +28,7 @@ interface DecisionsTabProps {
   tasks?: TaskItem[];
   onRefresh?: () => void;
   isCommonView?: boolean;
+  selectedProject?: string | null;
 }
 
 const getQuestionKey = (q: QuestionItem) => (q.project ? `${q.project}/${q.id}` : q.id);
@@ -221,7 +222,10 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
   tasks = [],
   onRefresh,
   isCommonView = false,
+  selectedProject = null,
 }) => {
+  const defaultProject = useProject();
+  const effectiveProject = selectedProject || defaultProject;
   const [subTab, setSubTab] = useState<'open' | 'awaiting' | 'history'>('open');
   const [questions, setQuestions] = useState<QuestionItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -279,7 +283,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
     try {
       const res = isCommonView
         ? await api.getWorkspaceQuestions({ status: 'all' })
-        : await api.getQuestions({ status: 'all' });
+        : await api.getQuestions({ status: 'all' }, effectiveProject);
       if (res && res.questions) {
         setQuestions(res.questions);
       } else {
@@ -290,7 +294,7 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
     } finally {
       setLoading(false);
     }
-  }, [isCommonView]);
+  }, [isCommonView, effectiveProject]);
 
   useEffect(() => {
     loadQuestions();
@@ -491,39 +495,29 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
   const executeAnswer = async () => {
     if (!confirmingAnswer) return;
     const { question, choice, text } = confirmingAnswer;
-    if (question.project) {
-      setCurrentProject(question.project);
-    }
+    const qProj = question.project || effectiveProject;
 
-    try {
-      await api.answerQuestion(question.id, {
-        choice,
-        text,
-        by: 'owner',
-      });
+    await api.answerQuestion(question.id, {
+      choice,
+      text,
+      by: 'owner',
+    }, qProj);
 
-      setConfirmingAnswer(null);
-      if (isCommonView) setCurrentProject(null);
-      await loadQuestions();
-      onRefresh?.();
-    } finally {
-      if (isCommonView) setCurrentProject(null);
-    }
+    setConfirmingAnswer(null);
+    await loadQuestions();
+    onRefresh?.();
   };
 
   const executeApply = async () => {
     if (!applyingQuestion) return;
     setApplyingQuestion((prev) => (prev ? { ...prev, loading: true, error: undefined } : null));
+    const qProj = applyingQuestion.question.project || effectiveProject;
     try {
-      if (applyingQuestion.question.project) {
-        setCurrentProject(applyingQuestion.question.project);
-      }
       const res = await api.applyQuestion(applyingQuestion.question.id, {
         ref: applyingQuestion.ref,
         by: applyingQuestion.by || 'owner',
         note: applyingQuestion.note,
-      });
-      if (isCommonView) setCurrentProject(null);
+      }, qProj);
       if (res && res.ok) {
         setApplyingQuestion(null);
         await loadQuestions();
@@ -534,7 +528,6 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
         );
       }
     } catch (e: any) {
-      if (isCommonView) setCurrentProject(null);
       setApplyingQuestion((prev) =>
         prev ? { ...prev, loading: false, error: e.message || String(e) } : null
       );
@@ -561,16 +554,14 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
       }
     }
 
+    const qProj = q.project || effectiveProject;
     setResumeLoading(qKey);
     setResumeError(null);
     try {
-      if (q.project) {
-        setCurrentProject(q.project);
-      }
-      const preview = await (api as any).previewAnswerAndResume(q.id, {
+      const preview = await answerAndResumeApi.previewAnswerAndResume(q.id, {
         choice,
         text: text.trim() ? text : undefined,
-      });
+      }, qProj);
       if (!preview.ok) {
         setResumeError(preview.error || 'Failed to preview run continuation');
         return;
@@ -585,7 +576,6 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
     } catch (err: any) {
       setResumeError(err.message || 'Error previewing run continuation');
     } finally {
-      if (isCommonView) setCurrentProject(null);
       setResumeLoading(null);
     }
   };
@@ -593,44 +583,33 @@ export const DecisionsTab: React.FC<DecisionsTabProps> = ({
   const executeAnswerAndResume = async () => {
     if (!confirmingAnswerAndResume) return;
     const { question, choice, text, preview } = confirmingAnswerAndResume;
+    const qProj = question.project || effectiveProject;
     try {
-      if (question.project) {
-        setCurrentProject(question.project);
-      }
-      await (api as any).answerAndResume(question.id, {
+      await answerAndResumeApi.answerAndResume(question.id, {
         choice,
         text,
         expect_plan_hash: preview.plan_hash,
         by: 'owner',
-      });
+      }, qProj);
       setConfirmingAnswerAndResume(null);
-      if (isCommonView) setCurrentProject(null);
       await loadQuestions();
       onRefresh?.();
     } catch (err: any) {
-      if (isCommonView) setCurrentProject(null);
       setResumeError(err.message || 'Failed to answer and resume run');
     }
   };
 
   const executeWithdraw = async () => {
     if (!withdrawingQuestion || !withdrawingQuestion.reason.trim()) return;
+    const qProj = withdrawingQuestion.question.project || effectiveProject;
 
-    try {
-      if (withdrawingQuestion.question.project) {
-        setCurrentProject(withdrawingQuestion.question.project);
-      }
-      await api.withdrawQuestion(withdrawingQuestion.question.id, {
-        reason: withdrawingQuestion.reason.trim(),
-        by: 'owner',
-      });
-      setWithdrawingQuestion(null);
-      if (isCommonView) setCurrentProject(null);
-      await loadQuestions();
-      onRefresh?.();
-    } finally {
-      if (isCommonView) setCurrentProject(null);
-    }
+    await api.withdrawQuestion(withdrawingQuestion.question.id, {
+      reason: withdrawingQuestion.reason.trim(),
+      by: 'owner',
+    }, qProj);
+    setWithdrawingQuestion(null);
+    await loadQuestions();
+    onRefresh?.();
   };
 
   return (

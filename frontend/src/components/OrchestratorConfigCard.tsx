@@ -18,7 +18,7 @@ import {
   OrchestratorStatus,
   OrchestratorReassignPreviewResponse,
 } from '../types';
-import { orchestratorConfigApi } from '../api';
+import { orchestratorConfigApi, useProject } from '../api';
 
 interface OrchestratorConfigCardProps {
   configData: OrchestrationConfigResponse | null;
@@ -31,6 +31,7 @@ export const OrchestratorConfigCard: React.FC<OrchestratorConfigCardProps> = ({
   onRefresh,
   onOpenSetupWizard,
 }) => {
+  const targetProject = useProject();
   const [status, setStatus] = useState<OrchestratorStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState<boolean>(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -50,10 +51,11 @@ export const OrchestratorConfigCard: React.FC<OrchestratorConfigCardProps> = ({
 
   // Fetch orchestrator status
   const fetchStatus = useCallback(async () => {
+    if (!targetProject) return;
     setLoadingStatus(true);
     setErrorMsg(null);
     try {
-      const data = await orchestratorConfigApi.getOrchestratorStatus();
+      const data = await orchestratorConfigApi.getOrchestratorStatus(targetProject);
       setStatus(data);
     } catch (err: any) {
       console.error('Failed to fetch orchestrator status:', err);
@@ -61,7 +63,7 @@ export const OrchestratorConfigCard: React.FC<OrchestratorConfigCardProps> = ({
     } finally {
       setLoadingStatus(false);
     }
-  }, []);
+  }, [targetProject]);
 
   useEffect(() => {
     fetchStatus();
@@ -76,10 +78,10 @@ export const OrchestratorConfigCard: React.FC<OrchestratorConfigCardProps> = ({
     setSuccessMsg(null);
     try {
       if (isPaused) {
-        await orchestratorConfigApi.resumeOrchestrator();
+        await orchestratorConfigApi.resumeOrchestrator(targetProject);
         setSuccessMsg('Orchestrator role resumed');
       } else {
-        await orchestratorConfigApi.pauseOrchestrator();
+        await orchestratorConfigApi.pauseOrchestrator(targetProject);
         setSuccessMsg('Orchestrator role paused');
       }
       await fetchStatus();
@@ -98,7 +100,7 @@ export const OrchestratorConfigCard: React.FC<OrchestratorConfigCardProps> = ({
     setSuccessMsg(null);
     setShowRotateConfirm(false);
     try {
-      const res = await orchestratorConfigApi.rotateOrchestrator({ reason: 'owner_request' });
+      const res = await orchestratorConfigApi.rotateOrchestrator({ reason: 'owner_request' }, targetProject);
       setSuccessMsg(`Orchestrator rotated to Generation ${res.generation || (status?.generation ? status.generation + 1 : '')}`);
       await fetchStatus();
       onRefresh();
@@ -129,7 +131,7 @@ export const OrchestratorConfigCard: React.FC<OrchestratorConfigCardProps> = ({
         tool: reassignTool,
         model: reassignModel.trim() || undefined,
         scope: reassignScope,
-      });
+      }, targetProject);
       setReassignPreview(preview);
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to preview reassignment');
@@ -149,7 +151,7 @@ export const OrchestratorConfigCard: React.FC<OrchestratorConfigCardProps> = ({
         model: reassignModel.trim() || undefined,
         scope: reassignScope,
         expect_hash: reassignPreview.plan_hash,
-      });
+      }, targetProject);
       setShowReassignModal(false);
       setSuccessMsg(`Orchestrator successfully reassigned to ${res.tool || reassignTool} (Generation ${res.generation || ''})`);
       await fetchStatus();

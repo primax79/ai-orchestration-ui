@@ -11,13 +11,16 @@ import {
   Radio,
 } from 'lucide-react';
 import { NotificationItem, OrchestrationEvent, shortTitle } from '../types';
-import { api } from '../api';
+import { api, useProjectContext } from '../api';
 
 interface NotificationAreaProps {
   onNavigate?: (tab: 'backlog' | 'decisions' | 'inbox' | 'runs' | 'use-cases' | 'installer' | 'doctor' | 'config' | 'triggers' | 'events') => void;
 }
 
 export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }) => {
+  const { selectedProject, fallbackProject } = useProjectContext();
+  const targetProject = selectedProject || fallbackProject;
+
   const [isOpen, setIsOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [recentEvents, setRecentEvents] = useState<OrchestrationEvent[]>([]);
@@ -25,8 +28,9 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   const fetchNotifications = useCallback(async () => {
+    if (!targetProject) return;
     try {
-      const res = await api.getNotifications();
+      const res = await api.getNotifications(targetProject);
       if (res && res.ok) {
         setNotifications(res.notifications || []);
         setRecentEvents(res.recent_events || []);
@@ -35,13 +39,14 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
     } catch {
       // Ignore network errors
     }
-  }, []);
+  }, [targetProject]);
 
   useEffect(() => {
+    if (!targetProject) return;
     fetchNotifications();
     const interval = setInterval(fetchNotifications, 5000);
     return () => clearInterval(interval);
-  }, [fetchNotifications]);
+  }, [targetProject, fetchNotifications]);
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -59,8 +64,9 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
   }, [isOpen]);
 
   const handleMarkAllRead = async () => {
+    if (!targetProject) return;
     try {
-      await api.markAllNotificationsRead();
+      await api.markAllNotificationsRead(targetProject);
       setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
       setUnreadCount(0);
     } catch {
@@ -69,8 +75,8 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
   };
 
   const handleItemClick = (type: string, id?: string) => {
-    if (id) {
-      api.markNotificationRead(id).catch(() => {});
+    if (id && targetProject) {
+      api.markNotificationRead(id, targetProject).catch(() => {});
       setNotifications((prev) =>
         prev.map((n) => (n.id === id ? { ...n, read: true } : n))
       );

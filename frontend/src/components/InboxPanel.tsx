@@ -39,7 +39,7 @@ import {
   WorkspaceProjectInfo,
   shortTitle,
 } from '../types';
-import { api, ApiError, microtaskAndLabelsApi, setCurrentProject } from '../api';
+import { api, ApiError, microtaskAndLabelsApi, useProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
 import {
@@ -300,6 +300,7 @@ const AttachmentThumbnail: React.FC<AttachmentThumbnailProps> = ({
 
 interface ConvertToTaskDialogProps {
   note: InboxNoteItem;
+  project?: string | null;
   isOpen: boolean;
   onClose: () => void;
   onSuccess: (taskId: string) => void;
@@ -307,10 +308,13 @@ interface ConvertToTaskDialogProps {
 
 const ConvertToTaskDialog: React.FC<ConvertToTaskDialogProps> = ({
   note,
+  project,
   isOpen,
   onClose,
   onSuccess,
 }) => {
+  const defaultProject = useProject();
+  const targetProject = project || note.project || defaultProject;
   const getDefaultCategory = (kind: string) => {
     const k = kind.toLowerCase();
     if (k === 'bug') return 'bugfix';
@@ -368,7 +372,7 @@ const ConvertToTaskDialog: React.FC<ConvertToTaskDialogProps> = ({
     };
 
     try {
-      const res = await api.inboxToTask(note.id, payload);
+      const res = await api.inboxToTask(note.id, payload, targetProject);
       if (res && res.id) {
         onSuccess(res.id);
         onClose();
@@ -388,8 +392,8 @@ const ConvertToTaskDialog: React.FC<ConvertToTaskDialogProps> = ({
     try {
       const res = await microtaskAndLabelsApi.inboxToMicrotask(note.id, {
         title: title.trim(),
-        priority,
-      });
+        priority: priority as any,
+      }, targetProject);
       if (res && res.id) {
         onSuccess(res.id);
         onClose();
@@ -1185,12 +1189,15 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   projects = [],
   defaultProject = null,
 }) => {
+  const ctxProject = useProject();
   const writableProjects = projects.filter((p) => p.kind !== 'sub_workspace');
   const [targetProject, setTargetProject] = useState<string>(
     initialNote?.project ||
       defaultProject ||
+      ctxProject ||
       (writableProjects.length === 1 ? writableProjects[0].id : writableProjects[0]?.id || '')
   );
+  const effectiveNoteProject = initialNote?.project || targetProject || defaultProject || ctxProject;
   const [noteId, setNoteId] = useState<string>(initialNote?.id || '');
   const [title, setTitle] = useState<string>(initialNote?.title || '');
   const [kind, setKind] = useState<string>(initialNote?.kind || 'note');
@@ -1309,7 +1316,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     if (!noteId || !noteId.startsWith('N')) return;
     try {
       setLoadingRuns(true);
-      const res = await api.listRuns({ note: noteId });
+      const res = await api.listRuns({ note: noteId }, effectiveNoteProject);
       const runs = (res.runs || []).filter((r) => r.mode === 'triage' || r.note_id === noteId);
       setTriageRuns(runs);
 
@@ -1319,7 +1326,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       if (targetRun) {
         if (targetRun.proposal_status === 'pending') {
           try {
-            const propRes = await api.getTriageProposal(targetRun.run_id);
+            const propRes = await api.getTriageProposal(targetRun.run_id, effectiveNoteProject);
             setSelectedRunProposal({
               runId: targetRun.run_id,
               proposal: propRes.proposal,
@@ -1353,7 +1360,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     } finally {
       setLoadingRuns(false);
     }
-  }, [noteId]);
+  }, [noteId, effectiveNoteProject]);
 
   useEffect(() => {
     if (isOpen && noteId && noteId.startsWith('N')) {
@@ -1392,7 +1399,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     setTriageActionError(null);
     if (run.proposal_status === 'pending') {
       try {
-        const propRes = await api.getTriageProposal(run.run_id);
+        const propRes = await api.getTriageProposal(run.run_id, effectiveNoteProject);
         setSelectedRunProposal({
           runId: run.run_id,
           proposal: propRes.proposal,
@@ -1451,7 +1458,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       if (Object.keys(payloadEdits).length > 0) {
         payload.edits = payloadEdits;
       }
-      const res = await api.acceptTriage(selectedRunProposal.runId, payload);
+      const res = await api.acceptTriage(selectedRunProposal.runId, payload, effectiveNoteProject);
 
       if (res && res.tasks_created) {
         setTriageSuccessTasks(res.tasks_created);
@@ -1515,14 +1522,14 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           about: about.trim() || '-',
           body,
           status: 'draft',
-        });
+        }, effectiveNoteProject);
         targetId = resAdd.id;
         setNoteId(targetId);
         setCurrentHash(resAdd.bundle_sha256);
         lastSavedValues.current = { title: createTitle, kind, about, body };
       }
 
-      const resUpload = await api.uploadInboxAttachment(targetId, file, filename);
+      const resUpload = await api.uploadInboxAttachment(targetId, file, filename, effectiveNoteProject);
       if (resUpload.attachment) {
         setAttachments((prev) => {
           if (!prev.includes(resUpload.attachment)) {
@@ -1618,7 +1625,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     if (!window.confirm(`Delete attachment "${attName}"?`)) return;
 
     try {
-      const res = await api.deleteInboxAttachment(noteId, attName);
+      const res = await api.deleteInboxAttachment(noteId, attName, effectiveNoteProject);
       setAttachments((prev) => prev.filter((a) => a !== attName));
       setAttachmentDetails((prev) => prev.filter((a) => a.name !== attName));
       if (res.bundle_sha256) {
@@ -1631,7 +1638,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   };
 
   const handleDownloadPdf = (attName: string) => {
-    downloadAttachmentBlob(() => api.getInboxAttachment(noteId, attName), attName).catch((err) => {
+    downloadAttachmentBlob(() => api.getInboxAttachment(noteId, attName, effectiveNoteProject), attName).catch((err) => {
       setInlineError(`Failed to download ${attName}: ${err?.message || err}`);
     });
   };
@@ -1653,13 +1660,10 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       if (!silent) setInlineError('Title is required');
       return false;
     }
-    const effectiveProject = initialNote?.project || targetProject;
+    const effectiveProject = effectiveNoteProject;
     if (isCommonView && writableProjects.length > 0 && !effectiveProject) {
       if (!silent) setInlineError('Target project is required');
       return false;
-    }
-    if (effectiveProject) {
-      setCurrentProject(effectiveProject);
     }
 
     setIsSaving(true);
@@ -1674,7 +1678,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           about: about.trim() || '-',
           body,
           status,
-        });
+        }, effectiveProject);
         setNoteId(res.id);
         setCurrentHash(res.bundle_sha256);
         lastSavedValues.current = { title: title.trim(), kind, about, body };
@@ -1688,7 +1692,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
           body,
           status,
           expect_hash: currentHash,
-        });
+        }, effectiveProject);
         setCurrentHash(res.bundle_sha256);
         lastSavedValues.current = { title: title.trim(), kind, about, body };
         onSaved();
@@ -1710,7 +1714,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const handleReloadConflict = async () => {
     if (!noteId) return;
     try {
-      const res = await api.getInboxNote(noteId);
+      const res = await api.getInboxNote(noteId, effectiveNoteProject);
       if (res.note) {
         setTitle(res.note.title || '');
         setKind(res.note.kind || 'note');
@@ -1738,7 +1742,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const handleKeepMineConflict = async () => {
     if (!noteId) return;
     try {
-      const res = await api.getInboxNote(noteId);
+      const res = await api.getInboxNote(noteId, effectiveNoteProject);
       const latestHash = res.note.bundle_sha256;
       setCurrentHash(latestHash);
 
@@ -1749,7 +1753,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
         body,
         status,
         expect_hash: latestHash,
-      });
+      }, effectiveNoteProject);
       setCurrentHash(editRes.bundle_sha256);
       lastSavedValues.current = { title: title.trim(), kind, about, body };
       setConflictError(null);
@@ -1783,7 +1787,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       const res = await api.editInboxNote(noteId, {
         status: 'ready',
         expect_hash: currentHash,
-      });
+      }, effectiveNoteProject);
       setStatus('ready');
       setCurrentHash(res.bundle_sha256);
       onSaved();
@@ -1800,7 +1804,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const handleReopen = async () => {
     if (!noteId) return;
     try {
-      const res = await api.reopenInboxNote(noteId);
+      const res = await api.reopenInboxNote(noteId, effectiveNoteProject);
       setStatus(res.status || 'ready');
       onSaved();
     } catch (err: any) {
@@ -1813,7 +1817,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
     if (!noteId) return;
     setIsConvertingMicro(true);
     try {
-      const res = await microtaskAndLabelsApi.inboxToMicrotask(noteId);
+      const res = await microtaskAndLabelsApi.inboxToMicrotask(noteId, undefined, effectiveNoteProject);
       if (res && res.id) {
         setCreatedTasks((prev) => [...prev, res.id]);
         onSaved();
@@ -1832,7 +1836,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       return;
     }
     try {
-      const res = await api.discardInboxNote(noteId, { reason: discardReason.trim() });
+      const res = await api.discardInboxNote(noteId, { reason: discardReason.trim() }, effectiveNoteProject);
       setStatus(res.status || 'discarded');
       setShowDiscardPrompt(false);
       onSaved();
@@ -1845,7 +1849,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
   const handleConfirmResolve = async () => {
     const prod = resolveProduced.trim() || createdTasks.join(', ') || '-';
     try {
-      const res = await api.resolveInboxNote(noteId, { produced: prod, by: 'owner' });
+      const res = await api.resolveInboxNote(noteId, { produced: prod, by: 'owner' }, effectiveNoteProject);
       setStatus(res.status || 'processed');
       setShowResolvePrompt(false);
       onSaved();
@@ -2232,7 +2236,6 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                 value={targetProject}
                 onChange={(e) => {
                   setTargetProject(e.target.value);
-                  setCurrentProject(e.target.value);
                 }}
                 style={{
                   width: '100%',
@@ -2456,10 +2459,10 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
                   <AttachmentItem
                     key={name}
                     name={name}
-                    context={{ type: 'note', id: noteId }}
+                    context={{ type: 'note', id: noteId || '-', project: effectiveNoteProject }}
                     details={attachmentDetails}
                     thumbnailSize={64}
-                    canRemove={true}
+                    canRemove={Boolean(noteId && noteId !== '-')}
                     onRemove={() => handleRemoveAttachment(name)}
                     onBlobLoaded={(attName, url) => {
                       setAttachmentBlobUrls((prev) => ({ ...prev, [attName]: url }));
@@ -3148,8 +3151,10 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       {/* Convert to Task Sub-Dialog */}
       {noteId && (
         <ConvertToTaskDialog
+          project={effectiveNoteProject}
           note={{
             id: noteId,
+            project: effectiveNoteProject || undefined,
             title,
             kind,
             status,
@@ -3176,7 +3181,7 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
         <TextViewerModal
           filename={viewingTextAttachment.filename}
           size={viewingTextAttachment.size}
-          fetchContent={() => api.getInboxAttachment(noteId, viewingTextAttachment.filename)}
+          fetchContent={() => api.getInboxAttachment(noteId, viewingTextAttachment.filename, effectiveNoteProject)}
           onClose={() => setViewingTextAttachment(null)}
         />
       )}
@@ -3185,8 +3190,10 @@ const NoteEditorModal: React.FC<NoteEditorModalProps> = ({
       {noteId && showRunDialog && (
         <RunDialog
           isOpen={true}
+          project={effectiveNoteProject}
           note={{
             id: noteId,
+            project: effectiveNoteProject,
             title,
             bundle_sha256: currentHash,
           }}
@@ -3220,6 +3227,8 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
   projects = [],
   selectedProject = null,
 }) => {
+  const defaultProject = useProject();
+  const effectiveProject = selectedProject || defaultProject;
   const [notes, setNotes] = useState<InboxNoteItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -3238,7 +3247,7 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
     try {
       const res = isCommonView
         ? await api.getWorkspaceInbox()
-        : await api.listInboxNotes();
+        : await api.listInboxNotes(undefined, effectiveProject);
       if (res && res.notes) {
         setNotes(res.notes);
       }
@@ -3250,7 +3259,7 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
     } finally {
       setLoading(false);
     }
-  }, [onRefreshNotesCount, isCommonView]);
+  }, [onRefreshNotesCount, isCommonView, effectiveProject]);
 
   useEffect(() => {
     loadNotes();
@@ -3507,9 +3516,6 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
               <div
                 key={`${note.project || ''}-${note.id || note.folder_name || note.title}`}
                 onClick={() => {
-                  if (note.project) {
-                    setCurrentProject(note.project);
-                  }
                   setEditingNote(note);
                   setIsEditorOpen(true);
                 }}
@@ -3661,11 +3667,8 @@ export const InboxPanel: React.FC<InboxPanelProps> = ({
           isOpen={isEditorOpen}
           isCommonView={isCommonView}
           projects={projects}
-          defaultProject={selectedProject}
+          defaultProject={effectiveProject}
           onClose={() => {
-            if (isCommonView) {
-              setCurrentProject(null);
-            }
             setIsEditorOpen(false);
             setEditingNote(null);
           }}

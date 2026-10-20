@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Activity, CheckCircle2, AlertTriangle, XCircle, Terminal, HardDrive, Trash2, Wrench, Loader2, Info, FileCode } from 'lucide-react';
 import { EnvStatusResponse, SkillEntry, StructuredConflict } from '../types';
-import { api } from '../api';
+import { api, useProjectContext } from '../api';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface EnvironmentDoctorProps {
@@ -22,6 +22,40 @@ const isFindingFixable = (sc: StructuredConflict): boolean => {
 };
 
 export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, onRefresh }) => {
+  const { selectedProject, fallbackProject, isCommonView, projects } = useProjectContext();
+  const writableProjects = projects.filter((p) => p.kind !== 'sub_workspace');
+  const [targetProject, setTargetProject] = useState<string>(
+    selectedProject || fallbackProject || writableProjects[0]?.id || ''
+  );
+  const [overrideStatus, setOverrideStatus] = useState<EnvStatusResponse | null>(null);
+
+  useEffect(() => {
+    if (selectedProject) {
+      setTargetProject(selectedProject);
+      setOverrideStatus(null);
+    } else if (!targetProject && (fallbackProject || writableProjects[0]?.id)) {
+      setTargetProject(fallbackProject || writableProjects[0]?.id || '');
+    }
+  }, [selectedProject, fallbackProject, projects]);
+
+  const effectiveProject = selectedProject || targetProject || fallbackProject;
+
+  useEffect(() => {
+    if (!isCommonView || !targetProject || targetProject === fallbackProject) {
+      setOverrideStatus(null);
+      return;
+    }
+    let active = true;
+    api.getEnvStatus(targetProject).then((res) => {
+      if (active) setOverrideStatus(res);
+    }).catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [isCommonView, targetProject, fallbackProject, status]);
+
+  const effectiveStatus = overrideStatus || status;
+
   const [loadingAction, setLoadingAction] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -32,18 +66,23 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
     onRefetchAction: () => Promise<ConfirmDialogPreviewData>;
   }) | null>(null);
 
-  if (!status) {
+  if (!effectiveStatus) {
     return <div style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>Loading environment status...</div>;
   }
 
-  const { clis, source_repos, environments, stray } = status;
+  const clis = effectiveStatus.clis || {};
+  const source_repos = effectiveStatus.source_repos || {};
+  const environments = effectiveStatus.environments || {};
+  const stray = effectiveStatus.stray || [];
 
   // Count fixable findings and advice findings
   let toFixCount = 0;
   let adviceCount = 0;
 
   Object.values(environments).forEach((scopes) => {
+    if (!scopes || typeof scopes !== 'object') return;
     Object.values(scopes).forEach((sinfo) => {
+      if (!sinfo || typeof sinfo !== 'object') return;
       if (sinfo.structured_conflicts && sinfo.structured_conflicts.length > 0) {
         sinfo.structured_conflicts.forEach((sc) => {
           if (isFindingFixable(sc)) {
@@ -65,7 +104,7 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
     setLoadingAction('resolve-conflicts');
     setErrorMessage(null);
     try {
-      const res = await api.previewResolveConflicts();
+      const res = await api.previewResolveConflicts(effectiveProject);
       const planItems = res.plan || [];
       const hasExecutableActions = planItems.some(
         (item: any) => item.action && item.action.toLowerCase() !== 'advise'
@@ -80,12 +119,12 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
         hash: res.plan_hash,
         onApplyAction: async (hash?: string) => {
           if (!hash) throw new Error('Plan hash is required to apply conflict resolution');
-          await api.resolveConflicts(hash);
+          await api.resolveConflicts(hash, effectiveProject);
           setConfirmData(null);
           onRefresh();
         },
         onRefetchAction: async () => {
-          const r = await api.previewResolveConflicts();
+          const r = await api.previewResolveConflicts(effectiveProject);
           setConfirmData((prev) =>
             prev
               ? {
@@ -117,7 +156,7 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
     setLoadingAction(`remove-${assistant}-${scope}-${skill}`);
     setErrorMessage(null);
     try {
-      const res = await api.previewRemoveSkill(skill, assistant, scope as any);
+      const res = await api.previewRemoveSkill(skill, assistant, scope as any, effectiveProject);
       setConfirmData({
         title: `Remove Skill '${skill}'`,
         summary: `Remove skill **${skill}** from **${assistant}** (${scope} scope).`,
@@ -126,12 +165,12 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
         hash: res.plan_hash,
         onApplyAction: async (hash?: string) => {
           if (!hash) throw new Error('Plan hash is required to remove skill');
-          await api.removeSkill(skill, assistant, scope as any, hash);
+          await api.removeSkill(skill, assistant, scope as any, hash, effectiveProject);
           setConfirmData(null);
           onRefresh();
         },
         onRefetchAction: async () => {
-          const r = await api.previewRemoveSkill(skill, assistant, scope as any);
+          const r = await api.previewRemoveSkill(skill, assistant, scope as any, effectiveProject);
           return {
             summary: `Remove skill **${skill}** from **${assistant}** (${scope} scope).`,
             plan: r.plan,
@@ -149,6 +188,43 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
 
   return (
     <div style={{ padding: '1.5rem', maxWidth: '1200px', margin: '0 auto' }}>
+      {isCommonView && writableProjects.length > 1 && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '1rem',
+            padding: '0.75rem 1rem',
+            backgroundColor: '#1e293b',
+            border: '1px solid #334155',
+            borderRadius: '0.5rem',
+            marginBottom: '1rem',
+          }}
+        >
+          <span style={{ fontSize: '0.82rem', color: '#cbd5e1', fontWeight: 600 }}>
+            Inspecting Project Scope:
+          </span>
+          <select
+            value={targetProject}
+            onChange={(e) => setTargetProject(e.target.value)}
+            style={{
+              backgroundColor: '#0f172a',
+              color: '#f8fafc',
+              border: '1px solid #475569',
+              padding: '0.35rem 0.65rem',
+              borderRadius: '0.375rem',
+              fontSize: '0.82rem',
+            }}
+          >
+            {writableProjects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.id} ({p.kind})
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
         <div>
           <h1 style={{ fontSize: '1.4rem', fontWeight: 700, color: '#f8fafc' }}>Environment Health & Drift Doctor</h1>
@@ -356,9 +432,12 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
             </div>
 
             <div style={{ padding: '1rem' }}>
-              {Object.entries(scopes).map(([scope, sinfo]) => {
+              {Object.entries(scopes || {}).map(([scope, sinfo]) => {
+                if (!sinfo || typeof sinfo !== 'object' || (!('skills' in sinfo) && !('skill_entries' in sinfo))) {
+                  return null;
+                }
                 // Collect skill entries
-                const entries: SkillEntry[] = sinfo.skill_entries || Object.entries(sinfo.skills).map(([sname, sdata]) => ({
+                const entries: SkillEntry[] = sinfo.skill_entries || Object.entries(sinfo.skills || {}).map(([sname, sdata]) => ({
                   name: sname,
                   origin: 'standalone',
                   scope,
@@ -506,7 +585,7 @@ export const EnvironmentDoctor: React.FC<EnvironmentDoctorProps> = ({ status, on
                       })
                     ) : (
                       /* Legacy text conflicts fallback */
-                      sinfo.conflicts.map((c, idx) => (
+                      (sinfo.conflicts || []).map((c, idx) => (
                         <div
                           key={idx}
                           style={{

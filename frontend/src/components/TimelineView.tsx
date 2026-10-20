@@ -16,7 +16,7 @@ import {
   WorkspaceProjectInfo,
   TaskItem,
 } from '../types';
-import { api, timelineApi } from '../api';
+import { api, timelineApi, useProject } from '../api';
 import { TimelineCard } from './TimelineCard';
 import { TimelineArrows, ArrowPosition } from './TimelineArrows';
 import { TimelineReadyQueue } from './TimelineReadyQueue';
@@ -57,6 +57,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
   tasks = [],
   sharedFilters: externalFilters,
 }) => {
+  const defaultProject = useProject();
   const [graph, setGraph] = useState<TaskGraphResponse | null>(null);
   const [loading, setLoading] = useState(!isCommonView);
   const [error, setError] = useState<string | null>(null);
@@ -92,14 +93,14 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
     }
     try {
       setError(null);
-      const res = await timelineApi.getTasksGraph();
+      const res = await timelineApi.getTasksGraph(undefined, defaultProject);
       setGraph(res);
     } catch (err: any) {
       setError(err?.message || 'Failed to load task graph');
     } finally {
       setLoading(false);
     }
-  }, [isCommonView]);
+  }, [isCommonView, defaultProject]);
 
   useEffect(() => {
     fetchGraph();
@@ -328,7 +329,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
 
   // Priority edit handler
   const handleRequestSetPriority = async (taskId: string, priority: 'P0' | 'P1' | 'P2' | 'P3', reason?: string) => {
-    const prev = await timelineApi.previewSetPriority(taskId, { priority, reason });
+    const prev = await timelineApi.previewSetPriority(taskId, { priority, reason }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Set Priority on ${taskId} to ${priority}`,
@@ -336,13 +337,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setPriority(taskId, { priority, reason, expect_task_hash: h });
+        await timelineApi.setPriority(taskId, { priority, reason, expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetPriority(taskId, { priority, reason });
+        const p = await timelineApi.previewSetPriority(taskId, { priority, reason }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -350,7 +351,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
 
   // Size edit handler
   const handleRequestSetSize = async (taskId: string, size: TaskSize) => {
-    const prev = await timelineApi.previewSetSize(taskId, { size });
+    const prev = await timelineApi.previewSetSize(taskId, { size }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Set Size on ${taskId} to ${size}`,
@@ -358,13 +359,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setSize(taskId, { size, expect_task_hash: h });
+        await timelineApi.setSize(taskId, { size, expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetSize(taskId, { size });
+        const p = await timelineApi.previewSetSize(taskId, { size }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -372,7 +373,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
 
   // Add dependency handler
   const handleRequestAddDep = async (taskId: string, depId: string) => {
-    const prev = await timelineApi.previewSetDeps(taskId, { add: [depId] });
+    const prev = await timelineApi.previewSetDeps(taskId, { add: [depId] }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Add Dependency: ${depId} → ${taskId}`,
@@ -380,13 +381,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setDeps(taskId, { add: [depId], expect_task_hash: h });
+        await timelineApi.setDeps(taskId, { add: [depId], expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetDeps(taskId, { add: [depId] });
+        const p = await timelineApi.previewSetDeps(taskId, { add: [depId] }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -394,7 +395,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
 
   // Remove dependency handler
   const handleRequestRemoveDep = async (taskId: string, depId: string) => {
-    const prev = await timelineApi.previewSetDeps(taskId, { remove: [depId] });
+    const prev = await timelineApi.previewSetDeps(taskId, { remove: [depId] }, defaultProject);
     setConfirmDialogState({
       isOpen: true,
       title: `Remove Dependency: ${depId} → ${taskId}`,
@@ -402,13 +403,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
       diff: prev.diff,
       hash: prev.hash || prev.task_hash,
       onApply: async (h) => {
-        await timelineApi.setDeps(taskId, { remove: [depId], expect_task_hash: h });
+        await timelineApi.setDeps(taskId, { remove: [depId], expect_task_hash: h }, defaultProject);
         setConfirmDialogState(null);
         await fetchGraph();
         onRefresh?.();
       },
       onRefetch: async () => {
-        const p = await timelineApi.previewSetDeps(taskId, { remove: [depId] });
+        const p = await timelineApi.previewSetDeps(taskId, { remove: [depId] }, defaultProject);
         return { diff: p.diff, hash: p.hash || p.task_hash };
       },
     });
@@ -420,6 +421,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
       // Pass standard task item structure so BacklogManager can open TaskDetailModal
       onSelectTask({
         id: node.id,
+        project: defaultProject || undefined,
         title: node.title,
         state: node.state,
         priority: node.priority,

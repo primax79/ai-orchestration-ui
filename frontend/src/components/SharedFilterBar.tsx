@@ -12,7 +12,7 @@ import { TaskKind, TaskState, SharedFilterState, LabelsResponse, LabelCountItem,
 import { KindBadge, KIND_CONFIGS } from './KindBadge';
 import { LabelChip } from './LabelChip';
 import { ProjectChip } from './ProjectBadges';
-import { microtaskAndLabelsApi, getCurrentProject } from '../api';
+import { microtaskAndLabelsApi, useProjectContext } from '../api';
 
 const SHARED_FILTERS_KEY = 'ai-orch:shared-filters';
 
@@ -78,29 +78,60 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
   showGroupByLabel = false,
   style,
 }) => {
+  const { selectedProject, fallbackProject, isCommonView, projects: ctxProjects } = useProjectContext();
   const [showLabelDropdown, setShowLabelDropdown] = useState(false);
   const [showStateDropdown, setShowStateDropdown] = useState(false);
   const [showProjectDropdown, setShowProjectDropdown] = useState(false);
-  const [repoLabels, setRepoLabels] = useState<string[]>(availableLabels);
+  const [fetchedLabels, setFetchedLabels] = useState<string[]>([]);
+
+  const projsToQuery = availableProjects.length > 0 ? availableProjects : ctxProjects;
+  const projectIdsKey = projsToQuery.map((p) => p.id).join(',');
 
   useEffect(() => {
     let isMounted = true;
-    if (!getCurrentProject() && showProjectControls) {
-      setRepoLabels(Array.from(new Set(availableLabels)).sort());
+    const isCommon = showProjectControls || isCommonView;
+    if (isCommon && projsToQuery.length > 0) {
+      Promise.all(
+        projsToQuery.map((p) =>
+          microtaskAndLabelsApi.getLabels(p.id).catch(() => ({ ok: false, labels: [] as LabelCountItem[] }))
+        )
+      )
+        .then((results) => {
+          if (!isMounted) return;
+          const set = new Set<string>();
+          results.forEach((res) => {
+            if (res && Array.isArray(res.labels)) {
+              res.labels.forEach((l: LabelCountItem) => set.add(l.label));
+            }
+          });
+          setFetchedLabels(Array.from(set).sort());
+        })
+        .catch(() => {});
       return () => {
         isMounted = false;
       };
     }
-    microtaskAndLabelsApi.getLabels().then((res: LabelsResponse) => {
-      if (isMounted && res && Array.isArray(res.labels)) {
-        const set = new Set([...availableLabels, ...res.labels.map((l: LabelCountItem) => l.label)]);
-        setRepoLabels(Array.from(set).sort());
-      }
-    }).catch(() => {});
+
+    const targetProj = selectedProject || fallbackProject;
+    if (!targetProj) {
+      return () => {
+        isMounted = false;
+      };
+    }
+    microtaskAndLabelsApi
+      .getLabels(targetProj)
+      .then((res: LabelsResponse) => {
+        if (isMounted && res && Array.isArray(res.labels)) {
+          setFetchedLabels(res.labels.map((l: LabelCountItem) => l.label));
+        }
+      })
+      .catch(() => {});
     return () => {
       isMounted = false;
     };
-  }, [availableLabels, showProjectControls]);
+  }, [selectedProject, fallbackProject, isCommonView, showProjectControls, projectIdsKey]);
+
+  const repoLabels = Array.from(new Set([...availableLabels, ...fetchedLabels])).sort();
 
   const updateFilters = (patch: Partial<SharedFilterState>) => {
     const next = { ...filters, ...patch };

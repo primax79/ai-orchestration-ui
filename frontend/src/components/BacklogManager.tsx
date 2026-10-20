@@ -31,7 +31,7 @@ import {
   formatTaskIdentifier,
   getPlacementWarnings,
 } from './ProjectBadges';
-import { api, setCurrentProject } from '../api';
+import { api, useProject } from '../api';
 
 export type BacklogView = 'queue' | 'kanban' | 'tree' | 'timeline';
 
@@ -101,6 +101,8 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   onOpenTask,
   onSelectCoordTarget,
 }) => {
+  const defaultProject = useProject();
+  const effectiveProject = selectedProject || defaultProject;
   const [viewMode, setViewMode] = useState<BacklogView>(getStoredView);
   const [showDone, setShowDone] = useState<boolean>(getStoredShowDone);
   const [treeStates, setTreeStates] = useState<TaskState[]>(getStoredTreeStates);
@@ -117,9 +119,6 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
 
   const handleOpenTaskModal = (t: TaskItem) => {
-    if (t.project) {
-      setCurrentProject(t.project);
-    }
     if (onOpenTask) {
       onOpenTask(t);
     }
@@ -194,7 +193,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
     setSyncingIndex(true);
     setSyncError(null);
     try {
-      const res = await api.previewSyncIndex();
+      const res = await api.previewSyncIndex(effectiveProject);
       setSyncConfirmData({
         title: 'Synchronize 00-INDEX.md',
         summary: res.in_sync
@@ -215,14 +214,14 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
     if (!hash) {
       throw new Error('Hash is required to apply index synchronization');
     }
-    await api.syncIndex(hash);
+    await api.syncIndex(hash, effectiveProject);
     setSyncConfirmData(null);
     setIndexOutOfSync(false);
     onRefresh();
   };
 
   const handleRefetchSyncPreview = async () => {
-    const res = await api.previewSyncIndex();
+    const res = await api.previewSyncIndex(effectiveProject);
     return {
       summary: res.in_sync
         ? '`tasks/00-INDEX.md` is currently in sync with all task headers.'
@@ -440,15 +439,16 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
             <LabelList labels={t.labels} maxVisible={3} size="xs" />
           </div>
         )}
-        {isCommonView && t.project === '_workspace' && t.coordinates && t.coordinates.length > 0 && (
+        {t.project === '_workspace' && (t.coordinates?.length || (t as any).coordinates_refs?.length) ? (
           <div style={{ marginBottom: '0.4rem' }}>
             <CoordinatesExpansionList
               coordinates={t.coordinates}
+              task={t}
               onSelectTarget={onSelectCoordTarget}
               compact={true}
             />
           </div>
-        )}
+        ) : null}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.7rem', color: '#64748b' }}>
           <span>{t.executor || 'self'}</span>
           <span style={{ color: '#475569' }}>{t.category}</span>
@@ -841,12 +841,13 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                       </button>
                     </div>
 
-                    {isCommonView && t.project === '_workspace' && t.coordinates && t.coordinates.length > 0 && (
+                    {t.project === '_workspace' && (t.coordinates?.length || (t as any).coordinates_refs?.length) ? (
                       <CoordinatesExpansionList
                         coordinates={t.coordinates}
+                        task={t}
                         onSelectTarget={onSelectCoordTarget}
                       />
-                    )}
+                    ) : null}
                   </div>
                 );
               })}
@@ -1094,10 +1095,8 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
           task={selectedTask}
           tree={data?.tree}
           onSelectTask={handleOpenTaskModal}
+          onSelectCoordTarget={onSelectCoordTarget}
           onClose={() => {
-            if (isCommonView) {
-              setCurrentProject(null);
-            }
             setSelectedTask(null);
           }}
           onActionComplete={onRefresh}

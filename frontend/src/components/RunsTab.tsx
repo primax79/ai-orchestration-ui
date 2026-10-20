@@ -12,7 +12,7 @@ import {
   Ban,
 } from 'lucide-react';
 import { TaskItem, RunRecord, shortTitle } from '../types';
-import { api, setCurrentProject } from '../api';
+import { api, useProject } from '../api';
 import { ProjectChip } from './ProjectBadges';
 
 interface RunsTabProps {
@@ -20,6 +20,7 @@ interface RunsTabProps {
   tasks?: TaskItem[];
   refreshKey?: number;
   isCommonView?: boolean;
+  selectedProject?: string | null;
 }
 
 export const RunsTab: React.FC<RunsTabProps> = ({
@@ -27,7 +28,10 @@ export const RunsTab: React.FC<RunsTabProps> = ({
   tasks = [],
   refreshKey = 0,
   isCommonView = false,
+  selectedProject = null,
 }) => {
+  const defaultProject = useProject();
+  const effectiveProject = selectedProject || defaultProject;
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -42,14 +46,16 @@ export const RunsTab: React.FC<RunsTabProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = isCommonView ? await api.getWorkspaceRuns() : await api.listRuns();
+      const res = isCommonView
+        ? await api.getWorkspaceRuns()
+        : await api.listRuns(undefined, effectiveProject);
       setRuns(res.runs || []);
     } catch (e: any) {
       setError(e?.data?.error || e?.message || String(e));
     } finally {
       setLoading(false);
     }
-  }, [isCommonView]);
+  }, [isCommonView, effectiveProject]);
 
   useEffect(() => {
     loadAllRuns();
@@ -64,7 +70,7 @@ export const RunsTab: React.FC<RunsTabProps> = ({
       const activeRuns = runs.filter((r) => r.status === 'running' || r.status === 'starting');
       for (const ar of activeRuns) {
         try {
-          const updated = await api.getRun(ar.run_id, ar.project);
+          const updated = await api.getRun(ar.run_id, ar.project || effectiveProject);
           if (updated && updated.run) {
             setRuns((prev) =>
               prev.map((item) => (item.run_id === updated.run.run_id ? { ...updated.run, project: ar.project || updated.run.project } : item))
@@ -77,7 +83,7 @@ export const RunsTab: React.FC<RunsTabProps> = ({
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [runs]);
+  }, [runs, effectiveProject]);
 
   // WebSocket live reload debounced 300ms on changed runs or tasks
   useEffect(() => {
@@ -122,16 +128,13 @@ export const RunsTab: React.FC<RunsTabProps> = ({
   }, [tasks]);
 
   const handleRowClick = async (run: RunRecord) => {
-    if (run.project) {
-      setCurrentProject(run.project);
-    }
     let targetTask = (run.project && taskMap.get(`${run.project}/${run.task_id}`)) || taskMap.get(run.task_id);
     if (!targetTask) {
       // Try to construct a minimal TaskItem if not in the cached list
       targetTask = {
         kind: 'emergent',
         id: run.task_id,
-        project: run.project,
+        project: run.project || effectiveProject || undefined,
         title: `Task ${run.task_id}`,
         category: 'task',
         priority: 'P1',

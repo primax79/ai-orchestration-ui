@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { FileText, FileDown, Image as ImageIcon, Loader2, X } from 'lucide-react';
 import { AttachmentDetail } from '../types';
-import { api } from '../api';
+import { api, useProject } from '../api';
 
 export function formatFileSize(bytes?: number): string {
   if (bytes === undefined || bytes === null || isNaN(bytes)) return '';
@@ -61,8 +61,8 @@ export async function downloadAttachmentBlob(
 }
 
 export type AttachmentContext =
-  | { type: 'note'; id: string }
-  | { type: 'task'; id: string };
+  | { type: 'note'; id: string; project?: string | null }
+  | { type: 'task'; id: string; project?: string | null };
 
 export interface AttachmentItemProps {
   name: string;
@@ -87,6 +87,8 @@ export const AttachmentItem: React.FC<AttachmentItemProps> = ({
   onOpenTextViewer,
   onDownloadPdf,
 }) => {
+  const defaultProject = useProject();
+  const targetProj = context.project || defaultProject;
   const info = getAttachmentInfo(name, details);
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(info.class === 'image');
@@ -104,8 +106,8 @@ export const AttachmentItem: React.FC<AttachmentItemProps> = ({
 
     const fetchPromise =
       context.type === 'note'
-        ? api.getInboxAttachment(context.id, name)
-        : api.getTaskAttachment(context.id, name);
+        ? api.getInboxAttachment(context.id, name, targetProj)
+        : api.getTaskAttachment(context.id, name, targetProj);
 
     fetchPromise
       .then((blob) => {
@@ -130,7 +132,7 @@ export const AttachmentItem: React.FC<AttachmentItemProps> = ({
         URL.revokeObjectURL(url);
       }
     };
-  }, [context.type, context.id, name, info.class]);
+  }, [context.type, context.id, name, info.class, targetProj]);
 
   // IMAGE: render thumbnail
   if (info.class === 'image') {

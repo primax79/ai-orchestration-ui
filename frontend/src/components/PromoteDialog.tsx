@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowUpRight, X, Loader2, AlertCircle } from 'lucide-react';
-import { microtaskAndLabelsApi } from '../api';
+import { microtaskAndLabelsApi, useProject } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
 
 interface PromoteDialogProps {
   taskId: string;
+  project?: string | null;
   taskTitle?: string;
   isOpen: boolean;
   onClose: () => void;
@@ -25,12 +26,15 @@ const COMMON_CATEGORIES = [
 
 export const PromoteDialog: React.FC<PromoteDialogProps> = ({
   taskId,
+  project,
   taskTitle,
   isOpen,
   onClose,
   onSuccess,
   taskHash,
 }) => {
+  const defaultProject = useProject();
+  const targetProject = project || defaultProject;
   const [category, setCategory] = useState('maintenance');
   const [customCategory, setCustomCategory] = useState('');
   const [isCustom, setIsCustom] = useState(false);
@@ -71,7 +75,7 @@ export const PromoteDialog: React.FC<PromoteDialogProps> = ({
       const res = await microtaskAndLabelsApi.previewPromoteMicrotask(taskId, {
         category: targetCategory,
         expect_task_hash: taskHash,
-      });
+      }, targetProject);
 
       setPreviewData({
         isOpen: true,
@@ -92,7 +96,7 @@ export const PromoteDialog: React.FC<PromoteDialogProps> = ({
     await microtaskAndLabelsApi.promoteMicrotask(taskId, {
       category: targetCategory,
       expect_task_hash: hashToUse,
-    });
+    }, targetProject);
     setPreviewData(null);
     onSuccess();
     onClose();

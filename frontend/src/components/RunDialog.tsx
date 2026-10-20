@@ -19,24 +19,28 @@ import {
   RunPreviewPayload,
   shortTitle,
 } from '../types';
-import { api } from '../api';
+import { api, useProject } from '../api';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface RunDialogProps {
   isOpen: boolean;
+  project?: string | null;
   task?: TaskItem;
-  note?: { id: string; title: string; bundle_sha256?: string; [key: string]: any };
+  note?: { id: string; title: string; project?: string | null; bundle_sha256?: string; [key: string]: any };
   onClose: () => void;
   onRunStarted: (runId: string) => void;
 }
 
 export const RunDialog: React.FC<RunDialogProps> = ({
   isOpen,
+  project,
   task,
   note,
   onClose,
   onRunStarted,
 }) => {
+  const defaultProject = useProject();
+  const targetProject = project || task?.project || note?.project || defaultProject;
   const targetId = note?.id || task?.id || '';
   const targetTitle = note?.title || task?.title || '';
   const isNote = Boolean(note?.id);
@@ -74,13 +78,13 @@ export const RunDialog: React.FC<RunDialogProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     loadOptions();
-  }, [isOpen, task?.id, note?.id]);
+  }, [isOpen, task?.id, note?.id, targetProject]);
 
   const loadOptions = async () => {
     setLoadingOptions(true);
     setOptionsError(null);
     try {
-      const res = await api.getRunOptions(isNote ? { note: note!.id } : { task: task!.id });
+      const res = await api.getRunOptions(isNote ? { note: note!.id } : { task: task!.id }, targetProject);
       setOptions(res);
 
       // Initialize form with defaults
@@ -167,8 +171,8 @@ export const RunDialog: React.FC<RunDialogProps> = ({
       allow_dirty_base: allowDirtyBase || undefined,
     };
 
-    return await api.previewRun(payload);
-  }, [task?.id, note?.id, isNote, mode, tool, profile, model, variant, effort, isolation, targetRun, instructions, allowSameTool, allowDirtyBase]);
+    return await api.previewRun(payload, targetProject);
+  }, [task?.id, note?.id, isNote, mode, tool, profile, model, variant, effort, isolation, targetRun, instructions, allowSameTool, allowDirtyBase, targetProject]);
 
   useEffect(() => {
     if (!isOpen || !options) return;
@@ -238,7 +242,7 @@ export const RunDialog: React.FC<RunDialogProps> = ({
     };
 
     try {
-      const res = await api.startRun(payload);
+      const res = await api.startRun(payload, targetProject);
       if (res && res.run_id) {
         setIsConfirmOpen(false);
         onRunStarted(res.run_id);
