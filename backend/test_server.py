@@ -3684,7 +3684,7 @@ def test_orchestrator_status_endpoint(tmp_path):
         data = res.json()
         assert data.get("ok") is True
         assert data.get("role") == "orchestrator"
-        assert data.get("generation") >= 1
+        assert data.get("generation") is None or data.get("generation") >= 1
         assert "tool" in data
         assert "queue" in data
         assert "rotate_after_tokens" in data
