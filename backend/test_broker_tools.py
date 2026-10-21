@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import time
 from typing import Any
 import pytest
@@ -25,6 +26,7 @@ from backend.broker.server import (
     acquire_broker_lock,
     create_broker_server,
     get_ai_orch_bin,
+    normalize_cli_error,
     strip_none,
 )
 from backend.test_broker import ShimClient, _cleanup_broker_process
@@ -833,7 +835,7 @@ async def test_tasks_set_all_fields_and_preview(test_env):
 
 @pytest.mark.asyncio
 async def test_transition_and_question_stale_expect_hash(test_env):
-    """Test stale expect_hash on tasks.transition and questions.answer."""
+    """Test stale expect_hash on tasks.transition, tasks.set, and questions.answer."""
     cfg_dir = test_env["config_dir"]
     server = create_broker_server(cfg_dir)
 
@@ -851,7 +853,8 @@ async def test_transition_and_question_stale_expect_hash(test_env):
     assert res_tr.is_error
     data_tr = json.loads(res_tr.content[0].text)
     assert data_tr["ok"] is False
-    assert "mismatch" in data_tr["error"].lower() or "mismatch" in data_tr["message"].lower()
+    assert data_tr["error"] == "hash-mismatch"
+    assert data_tr["message"] and not data_tr["message"].startswith("{")
     assert_no_nulls(data_tr)
 
     # 2. tasks.transition with stale hash (preview)
@@ -869,7 +872,8 @@ async def test_transition_and_question_stale_expect_hash(test_env):
     assert res_tr_prev.is_error
     data_tr_prev = json.loads(res_tr_prev.content[0].text)
     assert data_tr_prev["ok"] is False
-    assert "mismatch" in data_tr_prev["error"].lower() or "mismatch" in data_tr_prev["message"].lower()
+    assert data_tr_prev["error"] == "hash-mismatch"
+    assert data_tr_prev["message"] and not data_tr_prev["message"].startswith("{")
     assert_no_nulls(data_tr_prev)
 
     # 3. questions.answer with stale hash
@@ -904,8 +908,48 @@ async def test_transition_and_question_stale_expect_hash(test_env):
     assert res_q_ans_stale.is_error
     data_q_ans_stale = json.loads(res_q_ans_stale.content[0].text)
     assert data_q_ans_stale["ok"] is False
-    assert "mismatch" in data_q_ans_stale["error"].lower() or "mismatch" in data_q_ans_stale["message"].lower()
+    assert data_q_ans_stale["error"] == "hash-mismatch"
+    assert data_q_ans_stale["message"] and not data_q_ans_stale["message"].startswith("{")
     assert_no_nulls(data_q_ans_stale)
+
+    # 4. tasks.set with stale hash (actual)
+    res_set = await server.call_tool(
+        "tasks.set",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "id": "T001",
+            "field": "priority",
+            "value": "P1",
+            "expect_hash": "stale_hash_deadbeef_1234",
+        },
+    )
+    assert res_set.is_error
+    data_set = json.loads(res_set.content[0].text)
+    assert data_set["ok"] is False
+    assert data_set["error"] == "hash-mismatch"
+    assert data_set["message"] and not data_set["message"].startswith("{")
+    assert_no_nulls(data_set)
+
+    # 5. tasks.set with stale hash (preview)
+    res_set_prev = await server.call_tool(
+        "tasks.set",
+        {
+            "workspace": "test-ws",
+            "project": "pkg-a",
+            "id": "T001",
+            "field": "priority",
+            "value": "P1",
+            "expect_hash": "stale_hash_deadbeef_1234",
+            "preview": True,
+        },
+    )
+    assert res_set_prev.is_error
+    data_set_prev = json.loads(res_set_prev.content[0].text)
+    assert data_set_prev["ok"] is False
+    assert data_set_prev["error"] == "hash-mismatch"
+    assert data_set_prev["message"] and not data_set_prev["message"].startswith("{")
+    assert_no_nulls(data_set_prev)
 
 
 @pytest.mark.asyncio
@@ -968,4 +1012,385 @@ async def test_error_handling_and_no_nulls(test_env):
     assert data_task["ok"] is False
     assert data_task["error"] == "task-not-found"
     assert_no_nulls(data_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subcmd", [["shim", "--local"], ["local"]])
+async def test_broker_local_stdio_mode(test_env, subcmd):
+    """Test python -m backend.broker shim --local and local speaking MCP over stdio with no lock/broker.json."""
+    cfg_dir = test_env["config_dir"]
+    ui_root = pathlib.Path(__file__).resolve().parent.parent
+    venv_python = ui_root / ".venv" / "bin" / "python"
+    py_exe = str(venv_python) if venv_python.is_file() else sys.executable
+
+    env = os.environ.copy()
+    env["AI_ORCHESTRATION_CONFIG"] = str(cfg_dir)
+
+    proc = subprocess.Popen(
+        [py_exe, "-m", "backend.broker", *subcmd],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(ui_root),
+        env=env,
+    )
+
+    try:
+        def rpc_call(req: dict[str, Any]) -> dict[str, Any]:
+            line = json.dumps(req) + "\n"
+            proc.stdin.write(line.encode("utf-8"))
+            proc.stdin.flush()
+            resp_line = proc.stdout.readline().decode("utf-8").strip()
+            assert resp_line, "Empty response from stdio MCP server"
+            return json.loads(resp_line)
+
+        # 1. initialize
+        init_res = rpc_call({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+        })
+        assert init_res.get("result", {}).get("serverInfo", {}).get("name") == "ai-orchestration-broker"
+
+        # 2. notifications/initialized
+        proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n").encode("utf-8"))
+        proc.stdin.flush()
+
+        # 3. tools/list
+        tools_res = rpc_call({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        })
+        tool_names = [t["name"] for t in tools_res.get("result", {}).get("tools", [])]
+        assert "whoami" in tool_names
+        assert "tasks.list" in tool_names
+
+        # 4. tools/call whoami
+        whoami_res = rpc_call({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "whoami",
+                "arguments": {},
+            },
+        })
+        content_whoami = json.loads(whoami_res["result"]["content"][0]["text"])
+        assert content_whoami["ok"] is True
+        assert "broker" in content_whoami
+
+        # 5. tools/call tasks.list
+        tasks_res = rpc_call({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "tasks.list",
+                "arguments": {
+                    "workspace": "test-ws",
+                    "project": "pkg-a",
+                },
+            },
+        })
+        content_tasks = json.loads(tasks_res["result"]["content"][0]["text"])
+        assert content_tasks["ok"] is True
+        assert any(t["id"] == "T001" for t in content_tasks["items"])
+
+        # In-process local mode MUST NOT create broker.json or broker.lock
+        assert not (cfg_dir / "broker.json").exists(), "broker.json should not exist in --local mode"
+        assert not (cfg_dir / "broker.lock").exists(), "broker.lock should not exist in --local mode"
+
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+@pytest.mark.asyncio
+async def test_project_field_and_workspace_distinction(test_env):
+    """Test project field on tasks.next, questions.list, and tasks.list items,
+    plus workspace-level _workspace distinction and cross-project same-id questions.
+    """
+    cfg_dir = test_env["config_dir"]
+    ws_dir = test_env["ws_dir"]
+    bin_path = get_ai_orch_bin()
+
+    # 1. Setup second project pkg-b
+    pkg_b_dir = ws_dir / "packages" / "pkg-b"
+    pkg_b_tasks = pkg_b_dir / "tasks"
+    pkg_b_tasks.mkdir(parents=True, exist_ok=True)
+    (pkg_b_tasks / "00-INDEX.md").write_text("# Tasks (Pkg B)\n\n## Tasks\n- [T002: Second project task](feature/T002-feature-b.md)\n\n## Questions\n- [Q001: Choice in B](questions/Q001-choice-b.md)\n", encoding="utf-8")
+    t002_dir = pkg_b_tasks / "feature"
+    t002_dir.mkdir(parents=True, exist_ok=True)
+    (t002_dir / "T002-feature-b.md").write_text(
+        """# T002 Second project task
+
+- id: T002
+- title: Second project task
+- category: feature
+- priority: P2
+- priority-reason: Core task for pkg-b
+- next-up: yes
+- state: open
+- executor: kilo
+- depends-on: -
+- decider: -
+- sources: -
+- paths: -
+- handoff: Read README
+- short: Feature B
+
+## Goal
+Goal B.
+
+## Steps
+- [ ] Step 1.
+
+## Verification
+- [ ] Verify B.
+""",
+        encoding="utf-8",
+    )
+
+    # Question Q001 in pkg-b
+    q_b_dir = pkg_b_tasks / "questions"
+    q_b_dir.mkdir(parents=True, exist_ok=True)
+    (q_b_dir / "Q001-choice-b.md").write_text(
+        """# Q001 Choice in B
+
+- id: Q001
+- question: Which database for B?
+- status: open
+- blocks: -
+- decider: owner
+- asked-by: owner
+- asked: 2026-10-21
+- origin-run: -
+- open-answer: yes
+- recommended: -
+- short: Choice B
+
+## Context
+DB options.
+
+## Options
+- **A** — PostgreSQL
+- **B** — SQLite
+
+## Answer
+- choice: -
+- text: -
+- answered-by: -
+- answered: -
+""",
+        encoding="utf-8",
+    )
+
+    # 2. Setup Question Q001 in pkg-a
+    pkg_a_tasks = ws_dir / "packages" / "pkg-a" / "tasks"
+    q_a_dir = pkg_a_tasks / "questions"
+    q_a_dir.mkdir(parents=True, exist_ok=True)
+    (q_a_dir / "Q001-choice-a.md").write_text(
+        """# Q001 Choice in A
+
+- id: Q001
+- question: Which framework for A?
+- status: open
+- blocks: -
+- decider: owner
+- asked-by: owner
+- asked: 2026-10-21
+- origin-run: -
+- open-answer: yes
+- recommended: -
+- short: Choice A
+
+## Context
+Framework options.
+
+## Options
+- **A** — React
+- **B** — Vue
+
+## Answer
+- choice: -
+- text: -
+- answered-by: -
+- answered: -
+""",
+        encoding="utf-8",
+    )
+    # Update pkg-a 00-INDEX.md to list Q001
+    pkg_a_idx = pkg_a_tasks / "00-INDEX.md"
+    pkg_a_idx.write_text(pkg_a_idx.read_text(encoding="utf-8") + "\n## Questions\n- [Q001: Choice in A](questions/Q001-choice-a.md)\n", encoding="utf-8")
+
+    # 3. Setup workspace-level coordination task in ws_dir / "tasks"
+    ws_tasks = ws_dir / "tasks"
+    ws_coord_dir = ws_tasks / "coordination"
+    ws_coord_dir.mkdir(parents=True, exist_ok=True)
+    (ws_coord_dir / "T099-workspace-coordination.md").write_text(
+        """# T099 Workspace coordination
+
+- id: T099
+- title: Workspace coordination
+- category: coordination
+- priority: P1
+- priority-reason: High-level workspace coordination
+- next-up: yes
+- state: open
+- executor: kilo
+- depends-on: -
+- decider: -
+- sources: -
+- paths: -
+- handoff: -
+- short: Coord task
+
+## Goal
+Workspace coordination goal.
+
+## Steps
+- [ ] Coordinate.
+
+## Verification
+- [ ] Done.
+""",
+        encoding="utf-8",
+    )
+    (ws_tasks / "00-INDEX.md").write_text("# Tasks (Workspace)\n\n## Tasks\n- [T099: Workspace coordination](coordination/T099-workspace-coordination.md)\n", encoding="utf-8")
+
+    # Git commit all new files
+    subprocess.run(["git", "add", "."], cwd=str(ws_dir), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Add pkg-b and coordination tasks"], cwd=str(ws_dir), capture_output=True, check=True)
+
+    # Re-run projects discover so pkg-b is registered in config
+    p_disc = subprocess.run(
+        [str(bin_path), "projects", "discover", "test-ws", "--config-dir", str(cfg_dir), "--json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    disc_hash = json.loads(p_disc.stdout)["plan_hash"]
+    subprocess.run(
+        [str(bin_path), "projects", "discover", "test-ws", "--apply", "--expect-hash", disc_hash, "--config-dir", str(cfg_dir), "--json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    server = create_broker_server(cfg_dir)
+
+    # A. tasks.list with project: every item must carry "project": "pkg-a"
+    res_tl = await server.call_tool("tasks.list", {"workspace": "test-ws", "project": "pkg-a"})
+    assert not res_tl.is_error
+    data_tl = json.loads(res_tl.content[0].text)
+    assert data_tl["ok"] is True
+    assert len(data_tl["items"]) > 0
+    for item in data_tl["items"]:
+        assert item.get("project") == "pkg-a"
+
+    # B. tasks.next per-project: every item must carry "project": "pkg-a"
+    res_tn_a = await server.call_tool("tasks.next", {"workspace": "test-ws", "project": "pkg-a"})
+    assert not res_tn_a.is_error
+    data_tn_a = json.loads(res_tn_a.content[0].text)
+    assert data_tn_a["ok"] is True
+    assert len(data_tn_a["items"]) > 0
+    for item in data_tn_a["items"]:
+        assert item.get("project") == "pkg-a"
+
+    # C. tasks.next workspace-wide: carries project, scope ("workspace" vs "project")
+    res_tn_ws = await server.call_tool("tasks.next", {"workspace": "test-ws"})
+    assert not res_tn_ws.is_error
+    data_tn_ws = json.loads(res_tn_ws.content[0].text)
+    assert data_tn_ws["ok"] is True
+    items_ws = data_tn_ws["items"]
+    assert len(items_ws) >= 2
+    for item in items_ws:
+        assert "project" in item
+        assert "scope" in item
+        if item["project"] == "_workspace":
+            assert item["scope"] == "workspace"
+        else:
+            assert item["scope"] == "project"
+
+    assert any(it["id"] == "T099" and it["project"] == "_workspace" and it["scope"] == "workspace" for it in items_ws)
+    assert any(it["id"] == "T001" and it["project"] == "pkg-a" and it["scope"] == "project" for it in items_ws)
+    assert any(it["id"] == "T002" and it["project"] == "pkg-b" and it["scope"] == "project" for it in items_ws)
+
+    # D. questions.list per-project: every item carries "project": "pkg-a"
+    res_ql_a = await server.call_tool("questions.list", {"workspace": "test-ws", "project": "pkg-a"})
+    assert not res_ql_a.is_error
+    data_ql_a = json.loads(res_ql_a.content[0].text)
+    assert data_ql_a["ok"] is True
+    assert len(data_ql_a["items"]) == 1
+    assert data_ql_a["items"][0]["id"] == "Q001"
+    assert data_ql_a["items"][0]["project"] == "pkg-a"
+
+    # E. questions.list workspace-wide: does NOT drop same-id questions (Q001) across projects
+    res_ql_ws = await server.call_tool("questions.list", {"workspace": "test-ws"})
+    assert not res_ql_ws.is_error
+    data_ql_ws = json.loads(res_ql_ws.content[0].text)
+    assert data_ql_ws["ok"] is True
+    q_items = data_ql_ws["items"]
+    # Both Q001 from pkg-a and Q001 from pkg-b MUST be present!
+    q_tuples = [(it["project"], it["id"]) for it in q_items]
+    assert ("pkg-a", "Q001") in q_tuples
+    assert ("pkg-b", "Q001") in q_tuples
+    for item in q_items:
+        assert "project" in item
+
+
+def test_normalize_cli_error_unit():
+    """Unit test for normalize_cli_error helper."""
+    # 1. Exact kebab-case mapping for hash-mismatch
+    code, msg = normalize_cli_error({"error": "task-hash-mismatch", "message": "Hash failed"}, "", "", "fail", "failed")
+    assert code == "hash-mismatch"
+    assert msg == "Hash failed"
+
+    # 2. Human sentence in data['error']
+    code, msg = normalize_cli_error({"error": "Task hash mismatch: expected a, got b"}, "", "", "fail", "failed")
+    assert code == "hash-mismatch"
+    assert msg == "Task hash mismatch: expected a, got b"
+
+    # 3. question-hash-mismatch
+    code, msg = normalize_cli_error({"error": "question-hash-mismatch"}, "", "", "fail", "failed")
+    assert code == "hash-mismatch"
+    assert msg == "Question hash mismatch"
+
+    # 4. not found
+    code, msg = normalize_cli_error({"error": "Task not found: T999"}, "", "", "fail", "failed")
+    assert code == "not-found"
+    assert msg == "Task not found: T999"
+
+    # 5. broker-owns-writes
+    code, msg = normalize_cli_error({"error": "broker-owns-writes active"}, "", "", "fail", "failed")
+    assert code == "broker-owns-writes"
+
+    # 6. lock timeout
+    code, msg = normalize_cli_error({"error": "Timed out waiting for lock timeout"}, "", "", "fail", "failed")
+    assert code == "lock-timeout"
+
+    # 7. invalid transition vs invalid argument
+    code, msg = normalize_cli_error({"error": "Cannot transition from open to done"}, "", "", "transition-failed", "failed")
+    assert code == "invalid-transition"
+    code, msg = normalize_cli_error({"error": "Invalid choice: X"}, "", "", "questions-answer-failed", "failed")
+    assert code == "invalid-argument"
+
+    # 8. Never fall back to raw JSON stdout
+    code, msg = normalize_cli_error(None, '{"ok": false, "raw": "json"}', "", "cli-failed", "Command failed")
+    assert not msg.startswith("{")
+    assert msg == "Command failed"
+    assert code == "cli-failed"
+
 
