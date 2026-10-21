@@ -7,6 +7,12 @@ import {
   BookOpen,
   Compass,
   FileQuestion,
+  Zap,
+  CheckSquare,
+  Target,
+  CornerDownRight,
+  Layers,
+  FileText,
 } from 'lucide-react';
 import { TaskKind } from '../types';
 
@@ -68,6 +74,55 @@ export const KIND_CONFIGS: Record<string, KindConfig> = {
     border: 'rgba(192, 132, 252, 0.4)',
     icon: Compass,
   },
+  emergent: {
+    label: 'Emergent',
+    color: '#fbbf24',
+    bg: 'rgba(251, 191, 36, 0.15)',
+    border: 'rgba(251, 191, 36, 0.4)',
+    icon: Zap,
+  },
+  initiative_task: {
+    label: 'Plan task',
+    color: '#34d399',
+    bg: 'rgba(52, 211, 153, 0.15)',
+    border: 'rgba(52, 211, 153, 0.4)',
+    icon: CheckSquare,
+  },
+  plan_task: {
+    label: 'Plan task',
+    color: '#34d399',
+    bg: 'rgba(52, 211, 153, 0.15)',
+    border: 'rgba(52, 211, 153, 0.4)',
+    icon: CheckSquare,
+  },
+  initiative: {
+    label: 'Initiative',
+    color: '#a78bfa',
+    bg: 'rgba(167, 139, 250, 0.15)',
+    border: 'rgba(167, 139, 250, 0.4)',
+    icon: Target,
+  },
+  subtask: {
+    label: 'Subtask',
+    color: '#94a3b8',
+    bg: 'rgba(148, 163, 184, 0.15)',
+    border: 'rgba(148, 163, 184, 0.35)',
+    icon: CornerDownRight,
+  },
+  micro: {
+    label: 'Micro',
+    color: '#e2e8f0',
+    bg: 'rgba(226, 232, 240, 0.12)',
+    border: 'rgba(226, 232, 240, 0.3)',
+    icon: Layers,
+  },
+  task: {
+    label: 'Task',
+    color: '#cbd5e1',
+    bg: 'rgba(203, 213, 225, 0.12)',
+    border: 'rgba(203, 213, 225, 0.3)',
+    icon: FileText,
+  },
 };
 
 export const KindBadge: React.FC<KindBadgeProps> = ({
@@ -78,13 +133,15 @@ export const KindBadge: React.FC<KindBadgeProps> = ({
 }) => {
   if (!kind) return null;
   const normalized = kind.toLowerCase();
-  const config = KIND_CONFIGS[normalized] || {
-    label: kind,
-    color: '#94a3b8',
-    bg: 'rgba(148, 163, 184, 0.1)',
-    border: 'rgba(148, 163, 184, 0.25)',
-    icon: FileQuestion,
-  };
+  const config =
+    KIND_CONFIGS[normalized] ||
+    KIND_CONFIGS[normalized.replace(/[\s-]+/g, '_')] || {
+      label: kind,
+      color: '#94a3b8',
+      bg: 'rgba(148, 163, 184, 0.1)',
+      border: 'rgba(148, 163, 184, 0.25)',
+      icon: FileQuestion,
+    };
 
   const IconComponent = config.icon;
 
@@ -112,3 +169,21 @@ export const KindBadge: React.FC<KindBadgeProps> = ({
     </span>
   );
 };
+
+export function getEffectiveTaskKind(t?: {
+  fields?: Record<string, any> | null;
+  kind?: string | null;
+  category?: string | null;
+} | null): string | undefined {
+  if (!t) return undefined;
+  return (
+    (t.fields?.kind?.value ? String(t.fields.kind.value) : undefined) ||
+    (t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative'
+      ? t.kind
+      : undefined) ||
+    (t.category && KIND_CONFIGS[t.category.toLowerCase()]
+      ? t.category.toLowerCase()
+      : undefined) ||
+    (t.kind || undefined)
+  );
+}

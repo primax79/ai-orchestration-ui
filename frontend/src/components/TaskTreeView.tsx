@@ -27,7 +27,7 @@ import {
 } from '../types';
 import { taskStructureApi, useProject } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
-import { KindBadge } from './KindBadge';
+import { KindBadge, KIND_CONFIGS } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { PromoteDialog } from './PromoteDialog';
 import { matchTaskFilters } from './SharedFilterBar';
@@ -211,6 +211,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         handoff: t.handoff,
         labels: t.labels,
         kind: t.kind,
+        fields: t.fields,
         conditional: t.conditional,
         conditions: t.conditions,
         coordinates: t.coordinates,
@@ -607,6 +608,15 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
     const canReopen = node.is_leaf && CLOSED_STATES.includes(node.state as TaskState);
     const warnings = getPlacementWarnings(node);
     const idDisplay = isCommonView ? formatTaskIdentifier(node, true) : node.id;
+    const effectiveKind =
+      (node.fields?.kind?.value ? String(node.fields.kind.value) : undefined) ||
+      (node.kind && node.kind !== 'emergent' && node.kind !== 'initiative_task' && node.kind !== 'initiative'
+        ? node.kind
+        : undefined) ||
+      (node.category && KIND_CONFIGS[node.category.toLowerCase()]
+        ? node.category.toLowerCase()
+        : undefined) ||
+      node.kind;
 
     return (
       <div key={nodeId} style={{ display: 'flex', flexDirection: 'column' }}>
@@ -734,9 +744,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
               micro
             </span>
           )}
-          {node.kind && (
-            <KindBadge kind={node.kind} size={11} />
-          )}
+          <KindBadge kind={effectiveKind} size={11} showLabel={true} />
 
           {/* Title */}
           <span
@@ -1284,11 +1292,18 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
                                     micro
                                   </span>
                                 )}
-                                {t.fields?.kind?.value ? (
-                                  <KindBadge kind={String(t.fields.kind.value)} size={11} />
-                                ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' ? (
-                                  <KindBadge kind={t.kind} size={11} />
-                                ) : null}
+                                {(() => {
+                                  const effectiveKind =
+                                    (t.fields?.kind?.value ? String(t.fields.kind.value) : undefined) ||
+                                    (t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative'
+                                      ? t.kind
+                                      : undefined) ||
+                                    (t.category && KIND_CONFIGS[t.category.toLowerCase()]
+                                      ? t.category.toLowerCase()
+                                      : undefined) ||
+                                    t.kind;
+                                  return <KindBadge kind={effectiveKind} size={11} showLabel={true} />;
+                                })()}
                                 <span
                                   style={{
                                     fontSize: '0.85rem',
