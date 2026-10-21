@@ -85,15 +85,20 @@ def _git_repo_root(path: pathlib.Path) -> pathlib.Path | None:
     return None
 
 
-def is_git_ignored(path: pathlib.Path, ws_path: pathlib.Path) -> bool:
-    """Check whether path is ignored by git, asked of the repository that owns it."""
+def _check_git_ignore_in_repo(repo: pathlib.Path, target: pathlib.Path, is_nested_repo: bool) -> bool:
+    """Ask `repo` whether `target` is git-ignored.
+
+    If `target` is itself a nested git repository (`is_nested_repo=True`), it is only
+    considered ignored by `repo` when `repo`'s matching ignore rule is NOT a blanket
+    root wildcard (`*` or `/*` used in allowlist wrapper workspaces like ai-coding-tools).
+    """
     try:
-        if (path / ".git").exists():
-            return False
-        repo = _git_repo_root(path)
-        if repo is None:
-            return False
-        rel = path.relative_to(repo)
+        rel = target.relative_to(repo)
+    except ValueError:
+        return False
+    if str(rel) in ("", "."):
+        return False
+    if not is_nested_repo:
         proc = subprocess.run(
             ["git", "check-ignore", "-q", str(rel)],
             cwd=str(repo),
@@ -101,8 +106,186 @@ def is_git_ignored(path: pathlib.Path, ws_path: pathlib.Path) -> bool:
             check=False,
         )
         return proc.returncode == 0
+    proc = subprocess.run(
+        ["git", "check-ignore", "-v", str(rel)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    for line in (proc.stdout or "").splitlines():
+        tab_part = line.split("\t", 1)[0]
+        parts = tab_part.split(":", 2)
+        if len(parts) == 3:
+            pattern = parts[2].strip()
+            if pattern in ("*", "/*"):
+                return False
+    return True
+
+
+def is_git_ignored(path: pathlib.Path, ws_path: pathlib.Path) -> bool:
+    """Check whether path is ignored by git, asked of the workspace repo and enclosing repo."""
+    try:
+        has_own_git = (path / ".git").exists()
+        ws_repo = _git_repo_root(ws_path)
+        parent_repo = _git_repo_root(path.parent) if has_own_git else _git_repo_root(path)
+
+        repos_to_check: list[pathlib.Path] = []
+        if ws_repo is not None:
+            repos_to_check.append(ws_repo)
+        if parent_repo is not None and parent_repo not in repos_to_check:
+            repos_to_check.append(parent_repo)
+
+        for repo in repos_to_check:
+            if _check_git_ignore_in_repo(repo, path, is_nested_repo=(has_own_git and repo != path)):
+                return True
+        return False
     except Exception:
         return False
+
+
+def _match_ignore_pattern(rel_posix: str, name: str, slug: str, raw_pat: str) -> bool:
+    """Match a single gitignore-style pattern against a workspace-relative path, folder name, or slug."""
+    import fnmatch
+
+    pat = raw_pat.strip()
+    if not pat:
+        return False
+    while pat.startswith("./"):
+        pat = pat[2:]
+    anchored = pat.startswith("/")
+    if anchored:
+        pat = pat.lstrip("/")
+    dir_only = pat.endswith("/")
+    if dir_only:
+        pat = pat.rstrip("/")
+    if not pat:
+        return False
+
+    rel_norm = rel_posix.strip("/")
+    if not rel_norm or rel_norm == ".":
+        return False
+
+    has_slash = "/" in pat
+    if has_slash or anchored or dir_only:
+        if rel_norm == pat or rel_norm.startswith(pat + "/"):
+            return True
+        if fnmatch.fnmatchcase(rel_norm, pat) or fnmatch.fnmatchcase(rel_norm, pat + "/*"):
+            return True
+        parts = rel_norm.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            if fnmatch.fnmatchcase(prefix, pat):
+                return True
+        return False
+
+    if fnmatch.fnmatchcase(name, pat) or fnmatch.fnmatchcase(slug, pat):
+        return True
+    for part in rel_norm.split("/"):
+        if fnmatch.fnmatchcase(part, pat) or fnmatch.fnmatchcase(sanitize_slug(part), pat):
+            return True
+    return False
+
+
+class WorkspaceDiscoveryFilter:
+    """Evaluates `[workspace.discovery]` include/exclude globs and `.ai-orchestration/projects-ignore`."""
+
+    def __init__(
+        self,
+        include_patterns: list[str] | None = None,
+        ignore_rules: list[tuple[str, bool]] | None = None,
+    ) -> None:
+        self.include_patterns: list[str] = [p.strip() for p in (include_patterns or []) if p and p.strip()]
+        self.ignore_rules: list[tuple[str, bool]] = ignore_rules or []
+        self.has_negations: bool = any(neg for _, neg in self.ignore_rules)
+
+    def is_excluded(self, rel_posix: str, name: str, slug: str) -> bool:
+        excluded = False
+        for pat, is_negated in self.ignore_rules:
+            if _match_ignore_pattern(rel_posix, name, slug, pat):
+                excluded = not is_negated
+        return excluded
+
+    def can_prune_dir(self, rel_posix: str, dir_name: str) -> bool:
+        if self.has_negations:
+            return False
+        slug = sanitize_slug(dir_name)
+        return self.is_excluded(rel_posix, dir_name, slug)
+
+    def allows_project(self, rel_posix: str, name: str, slug: str) -> bool:
+        if rel_posix in (".", ""):
+            return not self.is_excluded(rel_posix, "_workspace", "_workspace")
+        if self.is_excluded(rel_posix, name, slug):
+            return False
+        if self.include_patterns:
+            return any(_match_ignore_pattern(rel_posix, name, slug, inc) for inc in self.include_patterns)
+        return True
+
+
+def _load_toml_simple(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        import tomllib
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def load_workspace_discovery_filter(ws_path: pathlib.Path) -> WorkspaceDiscoveryFilter:
+    """Load discovery include/exclude rules from `orchestration.toml` and `.ai-orchestration/projects-ignore`."""
+    include_patterns: list[str] = []
+    ignore_rules: list[tuple[str, bool]] = []
+
+    for cfg_cand in (
+        ws_path / "orchestration.toml",
+        ws_path / ".ai-orchestration" / "orchestration.toml",
+        ws_path / ".ai-orchestration.local.toml",
+    ):
+        if cfg_cand.is_file() and not cfg_cand.is_symlink():
+            try:
+                data = _load_toml_simple(cfg_cand)
+                ws_sec = data.get("workspace")
+                if isinstance(ws_sec, dict):
+                    disc = ws_sec.get("discovery")
+                    if isinstance(disc, dict):
+                        inc = disc.get("include")
+                        if isinstance(inc, list):
+                            include_patterns.extend(str(x) for x in inc if x)
+                        for key in ("exclude", "ignore"):
+                            exc = disc.get(key)
+                            if isinstance(exc, list):
+                                for item in exc:
+                                    s = str(item).strip()
+                                    if not s or s.startswith("#"):
+                                        continue
+                                    if s.startswith("!"):
+                                        ignore_rules.append((s[1:].strip(), True))
+                                    else:
+                                        ignore_rules.append((s, False))
+            except Exception:
+                pass
+
+    for ign_file in (
+        ws_path / ".ai-orchestration" / "projects-ignore",
+        ws_path / ".ai-orchignore",
+    ):
+        if ign_file.is_file() and not ign_file.is_symlink():
+            try:
+                for raw_line in ign_file.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("!"):
+                        pat = line[1:].strip()
+                        if pat:
+                            ignore_rules.append((pat, True))
+                    else:
+                        ignore_rules.append((line, False))
+            except Exception:
+                pass
+
+    return WorkspaceDiscoveryFilter(include_patterns=include_patterns, ignore_rules=ignore_rules)
 
 
 def compute_tree_hash(tasks_dir: pathlib.Path) -> str:
@@ -318,15 +501,42 @@ class ProjectResolver:
 
     def invalidate(self) -> None:
         self._cached_ws_path = None
+        self._cached_sig: str | None = None
         self._cached_projects = []
         self._cached_sub_workspaces = []
 
+    def _compute_discovery_sig(self) -> str:
+        ws_path = self.workspace
+        parts: list[str] = [str(ws_path)]
+        for p in (
+            ws_path,
+            ws_path / ".gitignore",
+            ws_path / "orchestration.toml",
+            ws_path / ".ai-orchestration" / "orchestration.toml",
+            ws_path / ".ai-orchestration.local.toml",
+            ws_path / ".ai-orchestration" / "projects-ignore",
+            ws_path / ".ai-orchignore",
+            self._get_db_path(),
+        ):
+            try:
+                st = p.lstat()
+                parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                parts.append(f"{p.name}:0")
+        return "|".join(parts)
+
     def get_workspace_info(self) -> tuple[str, list[ProjectInfo], list[dict[str, Any]]]:
-        if self._cached_ws_path == self.workspace and self._cached_projects:
+        sig = self._compute_discovery_sig()
+        if (
+            self._cached_ws_path == self.workspace
+            and getattr(self, "_cached_sig", None) == sig
+            and self._cached_projects
+        ):
             return self._cached_mode, list(self._cached_projects), list(self._cached_sub_workspaces)
 
         mode, projects, sub_workspaces = self._resolve_workspace()
         self._cached_ws_path = self.workspace
+        self._cached_sig = sig
         self._cached_mode = mode
         self._cached_projects = projects
         self._cached_sub_workspaces = sub_workspaces
@@ -403,6 +613,7 @@ class ProjectResolver:
 
     def _try_registered_workspace(self, ws_path: pathlib.Path) -> tuple[str, list[ProjectInfo], list[dict[str, Any]]] | None:
         """Try resolving workspace via registered SQLite DB or ai-orch CLI."""
+        disc_filter = load_workspace_discovery_filter(ws_path)
         # Check SQLite DB first (instant, robust)
         db_path = self._get_db_path()
         if db_path.is_file():
@@ -431,6 +642,9 @@ class ProjectResolver:
                         for ow in other_ws:
                             ow_p = pathlib.Path(ow["canonical_path"]).resolve()
                             if ws_path in ow_p.parents:
+                                rel_ow = ow_p.relative_to(ws_path).as_posix()
+                                if not disc_filter.allows_project(rel_ow, ow_p.name, ow["slug"]):
+                                    continue
                                 sub_workspaces.append({
                                     "uuid": ow["uuid"],
                                     "slug": ow["slug"],
@@ -443,12 +657,16 @@ class ProjectResolver:
                         has_workspace_slug = False
                         for pr in proj_rows:
                             slug = pr["slug"]
+                            rel_p = pr["rel_path"] or "."
+                            rel_posix = str(rel_p).replace("\\", "/")
+                            name_p = "_workspace" if slug == "_workspace" else pathlib.PurePosixPath(rel_posix).name
+                            if not disc_filter.allows_project(rel_posix, name_p, slug):
+                                continue
                             if slug == "_workspace":
                                 has_workspace_slug = True
                                 kind = "_workspace"
                             else:
                                 kind = "project"
-                            rel_p = pr["rel_path"] or "."
                             p_root = (ws_path / rel_p).resolve()
                             projects.append(ProjectInfo(
                                 id=slug,
@@ -460,7 +678,11 @@ class ProjectResolver:
                             ))
 
                         # Plus _workspace if <root>/tasks/00-INDEX.md exists (or <root>/tasks exists)
-                        if not has_workspace_slug and ((ws_path / "tasks" / "00-INDEX.md").is_file() or (ws_path / "tasks").is_dir()):
+                        if (
+                            not has_workspace_slug
+                            and disc_filter.allows_project(".", "_workspace", "_workspace")
+                            and ((ws_path / "tasks" / "00-INDEX.md").is_file() or (ws_path / "tasks").is_dir())
+                        ):
                             projects.insert(0, ProjectInfo(
                                 id="_workspace",
                                 path=".",
@@ -505,6 +727,10 @@ class ProjectResolver:
                             kind = item.get("kind", "project")
                             slug = item.get("slug")
                             rel_p = item.get("path") or "."
+                            rel_posix = str(rel_p).replace("\\", "/")
+                            name_p = "_workspace" if slug == "_workspace" else pathlib.PurePosixPath(rel_posix).name
+                            if not disc_filter.allows_project(rel_posix, name_p, slug):
+                                continue
                             p_root = (ws_path / rel_p).resolve()
                             if kind == "sub_workspace":
                                 sub_workspaces.append({
@@ -525,7 +751,11 @@ class ProjectResolver:
                                     uuid=item.get("uuid"),
                                 ))
 
-                        if not has_workspace_slug and ((ws_path / "tasks" / "00-INDEX.md").is_file() or (ws_path / "tasks").is_dir()):
+                        if (
+                            not has_workspace_slug
+                            and disc_filter.allows_project(".", "_workspace", "_workspace")
+                            and ((ws_path / "tasks" / "00-INDEX.md").is_file() or (ws_path / "tasks").is_dir())
+                        ):
                             projects.insert(0, ProjectInfo(
                                 id="_workspace",
                                 path=".",
@@ -540,15 +770,22 @@ class ProjectResolver:
         return None
 
     def _try_discovered_workspace(self, ws_path: pathlib.Path) -> tuple[str, list[ProjectInfo], list[dict[str, Any]]] | None:
-        """Discover candidate folders with tasks/00-INDEX.md or tasks/ directory respecting exclusions."""
+        """Discover candidate folders with tasks/00-INDEX.md respecting exclusions, symlinks, and ignore rules."""
         candidate_folders: list[pathlib.Path] = []
+        disc_filter = load_workspace_discovery_filter(ws_path)
 
         # Root tasks candidate
-        root_has_tasks = (ws_path / "tasks" / "00-INDEX.md").is_file() or (ws_path / "tasks").is_dir()
-        if root_has_tasks:
+        root_tasks = ws_path / "tasks"
+        root_index = root_tasks / "00-INDEX.md"
+        if (
+            not root_tasks.is_symlink()
+            and not root_index.is_symlink()
+            and root_index.is_file()
+            and disc_filter.allows_project(".", "_workspace", "_workspace")
+        ):
             candidate_folders.append(ws_path)
 
-        for root, dirs, _ in os.walk(str(ws_path)):
+        for root, dirs, _ in os.walk(str(ws_path), followlinks=False):
             # Prune hidden dirs and excluded dirs in-place
             dirs[:] = [
                 d for d in dirs
@@ -556,7 +793,17 @@ class ProjectResolver:
             ]
 
             for d in list(dirs):
-                folder_p = (pathlib.Path(root) / d).resolve()
+                raw_p = pathlib.Path(root) / d
+                if raw_p.is_symlink():
+                    dirs.remove(d)
+                    continue
+
+                folder_p = raw_p.resolve()
+                try:
+                    rel_posix = folder_p.relative_to(ws_path).as_posix()
+                except ValueError:
+                    dirs.remove(d)
+                    continue
 
                 # Skip kilo worktree or similar
                 if any(part in (".kilo", "worktrees") for part in folder_p.parts):
@@ -567,15 +814,31 @@ class ProjectResolver:
                     dirs.remove(d)
                     continue
 
+                if disc_filter.can_prune_dir(rel_posix, d):
+                    dirs.remove(d)
+                    continue
+
+                tasks_dir = folder_p / "tasks"
+                index_file = tasks_dir / "00-INDEX.md"
                 if (
-                    (folder_p / "tasks" / "00-INDEX.md").is_file()
-                    or (folder_p / "tasks" / "AGENTS.md").is_file()
-                    or (folder_p / "tasks" / "CONTEXT.md").is_file()
+                    not tasks_dir.is_symlink()
+                    and not index_file.is_symlink()
+                    and index_file.is_file()
                 ):
                     candidate_folders.append(folder_p)
 
+        # Filter inner folders through disc_filter (handles negation / include rules)
+        filtered_candidates: list[pathlib.Path] = []
+        for f in candidate_folders:
+            if f == ws_path:
+                filtered_candidates.append(f)
+            else:
+                rel_posix = f.relative_to(ws_path).as_posix()
+                if disc_filter.allows_project(rel_posix, f.name, sanitize_slug(f.name)):
+                    filtered_candidates.append(f)
+
         # Inner folders (excluding ws_path itself)
-        inner_candidates = [f for f in candidate_folders if f != ws_path]
+        inner_candidates = [f for f in filtered_candidates if f != ws_path]
 
         # If there are inner candidate projects, this is discovered multi-project mode
         if inner_candidates:
@@ -583,7 +846,7 @@ class ProjectResolver:
             projects: list[ProjectInfo] = []
 
             # Deterministic sorting: root first if present, then sorted by path
-            sorted_candidates = sorted(candidate_folders, key=lambda p: (0 if p == ws_path else 1, str(p)))
+            sorted_candidates = sorted(filtered_candidates, key=lambda p: (0 if p == ws_path else 1, str(p)))
 
             for folder in sorted_candidates:
                 if folder == ws_path:
@@ -591,7 +854,7 @@ class ProjectResolver:
                     rel_p = "."
                     kind = "_workspace"
                 else:
-                    rel_p = str(folder.relative_to(ws_path))
+                    rel_p = folder.relative_to(ws_path).as_posix()
                     raw_slug = sanitize_slug(folder.name)
                     p_id = raw_slug
                     suffix = 2

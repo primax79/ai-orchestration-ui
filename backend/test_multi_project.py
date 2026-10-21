@@ -832,3 +832,72 @@ def test_common_view_carries_conditional_tasks(auth_headers):
             assert by_id["proj-a"]["conditional"] == 0
         finally:
             state.workspace = old_ws
+
+
+def test_project_discovery_hygiene_and_ignore_config():
+    """Verify T049 discovery hygiene in ProjectResolver and Navbar empty-projects toggle:
+    1. Only folders with tasks/00-INDEX.md are discovered (never bare tasks/ or bare .git).
+    2. Git-ignored folders with their own .git (e.g. ansible-playbooks/, security_audit/) are skipped.
+    3. Symlinked folders are never followed.
+    4. .ai-orchestration/projects-ignore filters by folder subtree (e.g. liferay62/, source_codes/) and by name/slug glob, with !negation, and invalidates resolver cache automatically when updated.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ws_path = pathlib.Path(tmp_dir).resolve() / "ws"
+        ws_path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=str(ws_path), check=True)
+        (ws_path / ".gitignore").write_text("/ansible-playbooks/\nsecurity_audit/\n", encoding="utf-8")
+
+        # Root task tree
+        _create_minimal_task_tree(ws_path / "tasks", "01", "root", "01.1", "Root Task", state="open")
+
+        # Git-ignored nested git repo with both Ansible roles and a tasks/00-INDEX.md
+        ans = ws_path / "ansible-playbooks"
+        ans.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=str(ans), check=True)
+        (ans / "roles" / "389ds_backup" / "tasks").mkdir(parents=True)
+        (ans / "roles" / "389ds_backup" / "tasks" / "main.yml").write_text("---\n", encoding="utf-8")
+        _create_minimal_task_tree(ans / "ignored-proj" / "tasks", "01", "ig", "01.1", "Ignored", state="open")
+
+        # Symlink to external project
+        ext = pathlib.Path(tmp_dir).resolve() / "ext_lib"
+        _create_minimal_task_tree(ext / "tasks", "01", "ext", "01.1", "Ext", state="open")
+        (ws_path / "libs-jdk17").symlink_to(ext)
+
+        # Subprojects under liferay62/, source_codes/, and modules/
+        for rel in (
+            "liferay62/old-hook",
+            "source_codes/courses",
+            "modules/portal-accept-invite-portlet",
+            "modules/portal-messages-portlet",
+            "modules/active-service",
+        ):
+            _create_minimal_task_tree(ws_path / rel / "tasks", "01", "sub", "01.1", f"Task {rel}", state="open")
+
+        resolver = ProjectResolver(ws_path)
+        mode, projs, _ = resolver.get_workspace_info()
+        assert mode == "discovered"
+        ids_before = {p.id for p in projs}
+        assert "389ds-backup" not in ids_before
+        assert "ignored-proj" not in ids_before
+        assert "libs-jdk17" not in ids_before
+        assert "ext-lib" not in ids_before
+        assert {"_workspace", "old-hook", "courses", "portal-accept-invite-portlet", "portal-messages-portlet", "active-service"} == ids_before
+
+        # Write .ai-orchestration/projects-ignore and verify cache auto-invalidates without calling resolver.invalidate()
+        ign = ws_path / ".ai-orchestration" / "projects-ignore"
+        ign.parent.mkdir(parents=True, exist_ok=True)
+        ign.write_text(
+            "liferay62/\n"
+            "source_codes/\n"
+            "portal-*-portlet\n"
+            "!portal-messages-portlet\n",
+            encoding="utf-8",
+        )
+        _, projs_after, _ = resolver.get_workspace_info()
+        ids_after = {p.id for p in projs_after}
+        assert ids_after == {"_workspace", "portal-messages-portlet", "active-service"}
+
+    navbar_tsx = (pathlib.Path(__file__).resolve().parent.parent / "frontend" / "src" / "components" / "Navbar.tsx").read_text(encoding="utf-8")
+    assert "showEmptyProjects" in navbar_tsx
+    assert "Toggle empty projects" in navbar_tsx
+

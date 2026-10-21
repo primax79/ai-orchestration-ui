@@ -45,6 +45,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   const [width, setWidth] = useState<number>(() => {
     return typeof window !== 'undefined' ? window.innerWidth : 1200;
   });
+  const [showEmptyProjects, setShowEmptyProjects] = useState<boolean>(false);
 
   useEffect(() => {
     const handleResize = () => {
@@ -334,41 +335,86 @@ export const Navbar: React.FC<NavbarProps> = ({
                 if (ac !== bc) return bc - ac;
                 return a.id.localeCompare(b.id);
               });
+              const isProjectEmpty = (p: (typeof workspace.projects)[number]) => {
+                if (p.kind === '_workspace') return false;
+                const pc = getProjActiveCounts(p.counts);
+                return pc.nonClosed === 0;
+              };
+              const emptyProjectsCount = sortedProjects.filter((p) => isProjectEmpty(p)).length;
+              const nonEmptyProjects = sortedProjects.filter(
+                (p) => !isProjectEmpty(p) || p.id === selectedProject
+              );
+              const visibleProjects =
+                showEmptyProjects || nonEmptyProjects.length === 0
+                  ? sortedProjects
+                  : nonEmptyProjects;
+              const allCountLabel =
+                !showEmptyProjects && emptyProjectsCount > 0 && visibleProjects.length < workspace.projects.length
+                  ? `${visibleProjects.length}/${workspace.projects.length}`
+                  : `${workspace.projects.length}`;
               return (
-                <select
-                  aria-label="Project selector"
-                  title="Switch project or view all projects"
-                  value={selectedProject || '__all__'}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    onSelectProject(val === '__all__' ? null : val);
-                  }}
-                  style={{
-                    padding: '0.3rem 0.5rem',
-                    backgroundColor: '#0f172a',
-                    border: '1px solid #4f46e5',
-                    borderRadius: '0.375rem',
-                    color: '#f8fafc',
-                    fontSize: '0.8rem',
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                    maxWidth: isIconOnly ? '220px' : '360px',
-                    outline: 'none',
-                  }}
-                >
-                  <option value="__all__">
-                    All projects ({workspace.projects.length}) — {totals.nonClosed} (waiting: {totals.waiting}, open: {totals.open}, progress: {totals.progress})
-                  </option>
-                  {sortedProjects.map((p) => {
-                    const pc = getProjActiveCounts(p.counts);
-                    const subTag = p.kind === 'sub_workspace' ? ' [sub_workspace]' : '';
-                    return (
-                      <option key={p.id} value={p.id}>
-                        {p.id}{subTag} — {pc.nonClosed} (waiting: {pc.waiting}, open: {pc.open}, progress: {pc.progress})
-                      </option>
-                    );
-                  })}
-                </select>
+                <>
+                  <select
+                    aria-label="Project selector"
+                    title="Switch project or view all projects"
+                    value={selectedProject || '__all__'}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      onSelectProject(val === '__all__' ? null : val);
+                    }}
+                    style={{
+                      padding: '0.3rem 0.5rem',
+                      backgroundColor: '#0f172a',
+                      border: '1px solid #4f46e5',
+                      borderRadius: '0.375rem',
+                      color: '#f8fafc',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      maxWidth: isIconOnly ? '220px' : '360px',
+                      outline: 'none',
+                    }}
+                  >
+                    <option value="__all__">
+                      All projects ({allCountLabel}) — {totals.nonClosed} (waiting: {totals.waiting}, open: {totals.open}, progress: {totals.progress})
+                    </option>
+                    {visibleProjects.map((p) => {
+                      const pc = getProjActiveCounts(p.counts);
+                      const subTag = p.kind === 'sub_workspace' ? ' [sub_workspace]' : '';
+                      return (
+                        <option key={p.id} value={p.id}>
+                          {p.id}{subTag} — {pc.nonClosed} (waiting: {pc.waiting}, open: {pc.open}, progress: {pc.progress})
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {emptyProjectsCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowEmptyProjects((prev) => !prev)}
+                      aria-label="Toggle empty projects"
+                      title={
+                        showEmptyProjects
+                          ? `Hide ${emptyProjectsCount} project(s) with 0 active tasks`
+                          : `Show ${emptyProjectsCount} project(s) with 0 active tasks`
+                      }
+                      style={{
+                        padding: '0.25rem 0.45rem',
+                        backgroundColor: showEmptyProjects ? '#312e81' : '#0f172a',
+                        border: `1px solid ${showEmptyProjects ? '#6366f1' : '#334155'}`,
+                        borderRadius: '0.375rem',
+                        color: showEmptyProjects ? '#e0e7ff' : '#94a3b8',
+                        fontSize: '0.72rem',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                        flexShrink: 0,
+                      }}
+                    >
+                      {showEmptyProjects ? `Hide empty (${emptyProjectsCount})` : `Show empty (+${emptyProjectsCount})`}
+                    </button>
+                  )}
+                </>
               );
             })()}
           </div>
