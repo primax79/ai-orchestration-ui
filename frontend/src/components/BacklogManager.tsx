@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Kanban,
   ListOrdered,
@@ -19,7 +19,7 @@ import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { TimelineView } from './TimelineView';
 import { TaskTreeView } from './TaskTreeView';
-import { KindBadge } from './KindBadge';
+import { KindBadge, KIND_CONFIGS } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { MicrotaskQuickAdd } from './MicrotaskQuickAdd';
 import { SharedFilterBar, getStoredSharedFilters, matchTaskFilters } from './SharedFilterBar';
@@ -115,6 +115,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   const [selectedTask, setSelectedTask] = useState<TaskItem | null>(null);
   const [syncingIndex, setSyncingIndex] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [showAllCommonQueue, setShowAllCommonQueue] = useState<boolean>(false);
 
   // Index sync states
   const [indexOutOfSync, setIndexOutOfSync] = useState(false);
@@ -170,30 +171,79 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   // Filter tasks based on sharedFilters
   const filteredTasks = tasks.filter((t) => matchTaskFilters(t, sharedFilters));
 
-  // Queue tasks: in project view emergent only with next_up === 'yes'; in common view, next_up === 'yes' if present, else all open/active tasks
-  const queueTasks = (() => {
-    const base = tasks.filter((t) => {
+  // Queue tasks:
+  // In single-project view: emergent tasks marked next_up === 'yes' (up to 5).
+  // In all-projects common view: compact next-up list (max 10 overall, max 3/project) by default,
+  // with toggle to show all active tasks across projects.
+  const priorityOrder: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+  const sortTasksByPriorityAndId = (a: TaskItem, b: TaskItem) => {
+    const pA = priorityOrder[a.priority] ?? 99;
+    const pB = priorityOrder[b.priority] ?? 99;
+    if (pA !== pB) return pA - pB;
+    return (a.qualified_id || a.id).localeCompare(b.qualified_id || b.id);
+  };
+
+  const baseTasks = useMemo(() => {
+    return tasks.filter((t) => {
       if (isClosedState(t.state) || t.is_done) return false;
       if (!matchTaskFilters(t, sharedFilters)) return false;
       return true;
     });
-    const nextUpCandidates = base.filter((t) => {
-      if (!isCommonView && t.kind !== 'emergent' && t.category !== 'micro') return false;
-      if (!isCommonView && /^\d+\.\d+/.test(t.id)) return false;
+  }, [tasks, sharedFilters]);
+
+  const allQueueCandidates = useMemo(() => {
+    return [...baseTasks].sort(sortTasksByPriorityAndId);
+  }, [baseTasks]);
+
+  const compactCommonQueueTasks = useMemo(() => {
+    const projectTasksMap = new Map<string, TaskItem[]>();
+    for (const t of allQueueCandidates) {
+      const proj = t.project || '_workspace';
+      if (!projectTasksMap.has(proj)) {
+        projectTasksMap.set(proj, []);
+      }
+      projectTasksMap.get(proj)!.push(t);
+    }
+
+    const compactCandidates: TaskItem[] = [];
+    for (const [_proj, pTasks] of projectTasksMap.entries()) {
+      const nextUp = pTasks.filter((t) => t.next_up === 'yes');
+      if (nextUp.length > 0) {
+        compactCandidates.push(...nextUp.slice(0, 3));
+      } else {
+        const topActive = pTasks.filter(
+          (t) =>
+            (t.state === 'open' || t.state === 'in progress') &&
+            (t.priority === 'P0' || t.priority === 'P1')
+        );
+        compactCandidates.push(...topActive.slice(0, 2));
+      }
+    }
+
+    if (compactCandidates.length === 0 && allQueueCandidates.length > 0) {
+      for (const [_proj, pTasks] of projectTasksMap.entries()) {
+        const topActive = pTasks.filter(
+          (t) => t.state === 'open' || t.state === 'in progress'
+        );
+        compactCandidates.push(...topActive.slice(0, 2));
+      }
+    }
+
+    return compactCandidates.sort(sortTasksByPriorityAndId).slice(0, 10);
+  }, [allQueueCandidates]);
+
+  const queueTasks = useMemo(() => {
+    if (isCommonView) {
+      return showAllCommonQueue ? allQueueCandidates : compactCommonQueueTasks;
+    }
+    const nextUpCandidates = baseTasks.filter((t) => {
+      if (t.kind !== 'emergent' && t.category !== 'micro') return false;
+      if (/^\d+\.\d+/.test(t.id)) return false;
       if (t.next_up !== 'yes') return false;
       return true;
     });
-    const listToSort = isCommonView && nextUpCandidates.length === 0 ? base : nextUpCandidates;
-    return listToSort
-      .sort((a, b) => {
-        const pOrder: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
-        const pA = pOrder[a.priority] ?? 99;
-        const pB = pOrder[b.priority] ?? 99;
-        if (pA !== pB) return pA - pB;
-        return (a.qualified_id || a.id).localeCompare(b.qualified_id || b.id);
-      })
-      .slice(0, isCommonView ? 100 : 5);
-  })();
+    return nextUpCandidates.sort(sortTasksByPriorityAndId).slice(0, 5);
+  }, [isCommonView, showAllCommonQueue, allQueueCandidates, compactCommonQueueTasks, baseTasks]);
 
   const handleOpenSyncPreview = async () => {
     setSyncingIndex(true);
@@ -358,6 +408,15 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   const renderKanbanCard = (t: TaskItem) => {
     const warnings = getPlacementWarnings(t);
     const idDisplay = isCommonView ? formatTaskIdentifier(t, true) : t.id;
+    const effectiveKind =
+      (t.fields?.kind?.value ? String(t.fields.kind.value) : undefined) ||
+      (t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative'
+        ? t.kind
+        : undefined) ||
+      (t.category && KIND_CONFIGS[t.category.toLowerCase()]
+        ? t.category.toLowerCase()
+        : undefined) ||
+      t.kind;
     return (
       <div
         key={t.qualified_id || `${t.project || ''}-${t.id}`}
@@ -401,11 +460,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                 micro
               </span>
             )}
-            {t.fields?.kind?.value ? (
-              <KindBadge kind={String(t.fields.kind.value)} size={11} />
-            ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative' ? (
-              <KindBadge kind={t.kind} size={11} />
-            ) : null}
+            <KindBadge kind={effectiveKind} size={11} showLabel={true} />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
             <span
@@ -686,19 +741,101 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
       {viewMode === 'queue' && (
         <div>
           <div style={{
-            fontSize: '0.85rem',
-            color: '#94a3b8',
-            marginBottom: '0.75rem',
             display: 'flex',
+            justifyContent: 'space-between',
             alignItems: 'center',
+            marginBottom: '0.75rem',
+            flexWrap: 'wrap',
             gap: '0.5rem',
           }}>
-            <ArrowRight size={14} color="#818cf8" style={{ flexShrink: 0 }} />
-            <span>
-              {isCommonView
-                ? 'Active tasks across workspace projects (ordered by priority).'
-                : 'What to start next: emergent tasks marked next-up (initiative tasks join once the timeline engine lands).'}
-            </span>
+            <div style={{
+              fontSize: '0.85rem',
+              color: '#94a3b8',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+            }}>
+              <ArrowRight size={14} color="#818cf8" style={{ flexShrink: 0 }} />
+              <span>
+                {isCommonView
+                  ? (showAllCommonQueue
+                      ? `All active tasks across workspace projects (${allQueueCandidates.length} tasks).`
+                      : `Compact next-up tasks across workspace projects (${compactCommonQueueTasks.length} of ${allQueueCandidates.length} active).`)
+                  : 'What to start next: emergent tasks marked next-up (initiative tasks join once the timeline engine lands).'}
+              </span>
+            </div>
+
+            {isCommonView && (allQueueCandidates.length > compactCommonQueueTasks.length || showAllCommonQueue) && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => setShowAllCommonQueue(!showAllCommonQueue)}
+                  style={{
+                    background: '#1e293b',
+                    border: '1px solid #334155',
+                    borderRadius: '0.25rem',
+                    padding: '0.3rem 0.65rem',
+                    color: '#cbd5e1',
+                    cursor: 'pointer',
+                    fontSize: '0.75rem',
+                    fontWeight: 500,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    transition: 'border-color 0.15s ease, background-color 0.15s ease',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = '#6366f1';
+                    e.currentTarget.style.backgroundColor = '#243046';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = '#334155';
+                    e.currentTarget.style.backgroundColor = '#1e293b';
+                  }}
+                >
+                  {showAllCommonQueue ? (
+                    <>
+                      <EyeOff size={13} color="#94a3b8" />
+                      <span>Show compact next-up ({compactCommonQueueTasks.length})</span>
+                    </>
+                  ) : (
+                    <>
+                      <Eye size={13} color="#818cf8" />
+                      <span>Show all active tasks ({allQueueCandidates.length})</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleViewChange('tree')}
+                  style={{
+                    background: '#1e293b',
+                    border: '1px solid #334155',
+                    borderRadius: '0.25rem',
+                    padding: '0.3rem 0.65rem',
+                    color: '#cbd5e1',
+                    cursor: 'pointer',
+                    fontSize: '0.75rem',
+                    fontWeight: 500,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    transition: 'border-color 0.15s ease, background-color 0.15s ease',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = '#6366f1';
+                    e.currentTarget.style.backgroundColor = '#243046';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = '#334155';
+                    e.currentTarget.style.backgroundColor = '#1e293b';
+                  }}
+                >
+                  <FolderTree size={13} color="#818cf8" />
+                  <span>View in Tree</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {queueTasks.length > 0 ? (
@@ -706,6 +843,15 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
               {renderCardListWithGrouping(queueTasks, (t) => {
                 const warnings = getPlacementWarnings(t);
                 const idDisplay = isCommonView ? formatTaskIdentifier(t, true) : t.id;
+                const effectiveKind =
+                  (t.fields?.kind?.value ? String(t.fields.kind.value) : undefined) ||
+                  (t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative'
+                    ? t.kind
+                    : undefined) ||
+                  (t.category && KIND_CONFIGS[t.category.toLowerCase()]
+                    ? t.category.toLowerCase()
+                    : undefined) ||
+                  t.kind;
                 return (
                   <div
                     key={t.qualified_id || `${t.project || ''}-${t.id}`}
@@ -764,11 +910,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                             micro
                           </span>
                         )}
-                        {t.fields?.kind?.value ? (
-                          <KindBadge kind={String(t.fields.kind.value)} size={11} />
-                        ) : t.kind && t.kind !== 'emergent' && t.kind !== 'initiative_task' && t.kind !== 'initiative' ? (
-                          <KindBadge kind={t.kind} size={11} />
-                        ) : null}
+                        <KindBadge kind={effectiveKind} size={11} showLabel={true} />
                       </div>
 
                       {/* Title */}
@@ -879,6 +1021,78 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                   </div>
                 );
               })}
+
+              {isCommonView && (allQueueCandidates.length > compactCommonQueueTasks.length || showAllCommonQueue) && (
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '0.75rem',
+                  marginTop: '0.5rem',
+                  padding: '0.6rem 0.85rem',
+                  backgroundColor: '#1e293b',
+                  border: '1px solid #334155',
+                  borderRadius: '0.375rem',
+                }}>
+                  <span style={{ fontSize: '0.8rem', color: '#94a3b8' }}>
+                    {showAllCommonQueue
+                      ? `Showing all ${allQueueCandidates.length} active tasks across workspace projects.`
+                      : `Showing ${compactCommonQueueTasks.length} compact next-up tasks (${allQueueCandidates.length} total active).`}
+                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <button
+                      type="button"
+                      onClick={() => setShowAllCommonQueue(!showAllCommonQueue)}
+                      style={{
+                        background: '#0f172a',
+                        border: '1px solid #475569',
+                        borderRadius: '0.25rem',
+                        padding: '0.3rem 0.65rem',
+                        color: '#f8fafc',
+                        cursor: 'pointer',
+                        fontSize: '0.75rem',
+                        fontWeight: 500,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                      }}
+                    >
+                      {showAllCommonQueue ? (
+                        <>
+                          <EyeOff size={13} color="#94a3b8" />
+                          <span>Show compact next-up ({compactCommonQueueTasks.length})</span>
+                        </>
+                      ) : (
+                        <>
+                          <Eye size={13} color="#818cf8" />
+                          <span>Show all active tasks ({allQueueCandidates.length})</span>
+                        </>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleViewChange('tree')}
+                      style={{
+                        background: '#0f172a',
+                        border: '1px solid #475569',
+                        borderRadius: '0.25rem',
+                        padding: '0.3rem 0.65rem',
+                        color: '#cbd5e1',
+                        cursor: 'pointer',
+                        fontSize: '0.75rem',
+                        fontWeight: 500,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                      }}
+                    >
+                      <FolderTree size={13} color="#818cf8" />
+                      <span>View in Tree</span>
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div style={{
@@ -895,10 +1109,16 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
             }}>
               <ListOrdered size={32} color="#64748b" />
               <div style={{ fontSize: '0.95rem', fontWeight: 600, color: '#f1f5f9' }}>
-                No emergent tasks marked next-up
+                {isCommonView ? 'No active tasks found' : 'No emergent tasks marked next-up'}
               </div>
               <div style={{ fontSize: '0.85rem', color: '#94a3b8', maxWidth: '480px', lineHeight: 1.4 }}>
-                To queue a task here, set <code style={{ backgroundColor: '#0f172a', padding: '0.1rem 0.35rem', borderRadius: '0.2rem', color: '#a5b4fc', fontSize: '0.8rem' }}>**Next up:** yes</code> in its markdown header, or open the task details to flag it.
+                {isCommonView ? (
+                  'There are currently no active tasks matching the filters across workspace projects.'
+                ) : (
+                  <>
+                    To queue a task here, set <code style={{ backgroundColor: '#0f172a', padding: '0.1rem 0.35rem', borderRadius: '0.2rem', color: '#a5b4fc', fontSize: '0.8rem' }}>**Next up:** yes</code> in its markdown header, or open the task details to flag it.
+                  </>
+                )}
               </div>
             </div>
           )}
