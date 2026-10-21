@@ -89,9 +89,107 @@ def make_tool_result(data: dict[str, Any], is_error: bool = False) -> CallToolRe
     return CallToolResult(content=[TextContent(type="text", text=text)], is_error=is_error)
 
 
+_KEBAB_REGEX = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
 def make_error_result(error_code: str, message: str) -> CallToolResult:
     kebab = error_code.strip().replace("_", "-")
-    return make_tool_result({"ok": False, "error": kebab, "message": message}, is_error=True)
+    clean_msg = message.strip()
+    if clean_msg.startswith("{"):
+        try:
+            parsed = json.loads(clean_msg)
+            if isinstance(parsed, dict):
+                clean_msg = str(parsed.get("message") or parsed.get("error") or "Operation failed")
+        except Exception:
+            clean_msg = "Operation failed"
+    return make_tool_result({"ok": False, "error": kebab, "message": clean_msg}, is_error=True)
+
+
+def normalize_cli_error(
+    data: dict[str, Any] | None,
+    stdout: str,
+    stderr: str,
+    default_code: str,
+    default_msg: str,
+) -> tuple[str, str]:
+    default_kebab = default_code.strip().replace("_", "-")
+    if not _KEBAB_REGEX.match(default_kebab):
+        default_kebab = "error"
+
+    code = default_kebab
+    msg = ""
+
+    if isinstance(data, dict):
+        raw_err = str(data.get("error") or "").strip()
+        raw_msg = str(data.get("message") or "").strip()
+        if not raw_msg and isinstance(data.get("errors"), list) and data["errors"]:
+            raw_msg = "; ".join(str(x) for x in data["errors"])
+
+        if raw_err and _KEBAB_REGEX.match(raw_err):
+            if raw_err in ("task-hash-mismatch", "question-hash-mismatch", "hash-mismatch"):
+                code = "hash-mismatch"
+                msg = raw_msg or ("Task hash mismatch" if "task" in raw_err else ("Question hash mismatch" if "question" in raw_err else "Hash mismatch"))
+            else:
+                code = raw_err
+                msg = raw_msg or raw_err
+        else:
+            # raw_err is not a kebab-case code; it is a human error message
+            msg = raw_msg or raw_err
+            if not msg:
+                clean_stderr = stderr.strip()
+                clean_stdout = stdout.strip()
+                if clean_stderr and not clean_stderr.startswith("{"):
+                    msg = clean_stderr
+                elif clean_stdout and not clean_stdout.startswith("{"):
+                    msg = clean_stdout
+                else:
+                    msg = default_msg
+
+            msg_lower = msg.lower()
+            if "hash mismatch" in msg_lower or "hash-mismatch" in msg_lower:
+                code = "hash-mismatch"
+            elif "not found" in msg_lower:
+                code = "not-found"
+            elif "broker-owns-writes" in msg_lower:
+                code = "broker-owns-writes"
+            elif "lock-timeout" in msg_lower or "lock timeout" in msg_lower:
+                code = "lock-timeout"
+            elif "invalid" in msg_lower or "cannot transition" in msg_lower:
+                code = "invalid-transition" if "transition" in default_kebab else "invalid-argument"
+            else:
+                code = default_kebab
+    else:
+        clean_stderr = stderr.strip()
+        clean_stdout = stdout.strip()
+        if clean_stderr and not clean_stderr.startswith("{"):
+            msg = clean_stderr
+        elif clean_stdout and not clean_stdout.startswith("{"):
+            msg = clean_stdout
+        else:
+            msg = default_msg
+
+        msg_lower = msg.lower()
+        if "hash mismatch" in msg_lower or "hash-mismatch" in msg_lower:
+            code = "hash-mismatch"
+        elif "not found" in msg_lower:
+            code = "not-found"
+        elif "broker-owns-writes" in msg_lower:
+            code = "broker-owns-writes"
+        elif "lock-timeout" in msg_lower or "lock timeout" in msg_lower:
+            code = "lock-timeout"
+        elif "invalid" in msg_lower or "cannot transition" in msg_lower:
+            code = "invalid-transition" if "transition" in default_kebab else "invalid-argument"
+        else:
+            code = default_kebab
+
+    # Never fall back to raw JSON
+    if msg.lstrip().startswith("{"):
+        msg = default_msg
+
+    if not code or not _KEBAB_REGEX.match(code):
+        code = default_kebab
+
+    return code, msg
 
 
 def paginate_items(
@@ -361,9 +459,10 @@ async def resolve_project_tasks_dir(
 
 
 class BrokerTokenAuthMiddleware:
-    def __init__(self, app: ASGIApp, token: str):
+    def __init__(self, app: ASGIApp, token: str, config_dir: pathlib.Path | None = None):
         self.app = app
         self.token = token
+        self.config_dir = config_dir
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
@@ -383,6 +482,33 @@ class BrokerTokenAuthMiddleware:
             candidate = token_hdr or bearer_token
             if not candidate or not hmac.compare_digest(candidate, self.token):
                 response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                await response(scope, receive, send)
+                return
+
+            if path == "/cli" and scope.get("method", "").upper() == "POST":
+                req = Request(scope, receive)
+                try:
+                    body = await req.json()
+                except Exception:
+                    response = JSONResponse({"ok": False, "error": "invalid-json", "message": "Invalid JSON body"}, status_code=400)
+                    await response(scope, receive, send)
+                    return
+                argv = body.get("argv") if isinstance(body, dict) else None
+                cwd_raw = body.get("cwd") if isinstance(body, dict) else None
+                if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+                    response = JSONResponse({"ok": False, "error": "invalid-argument", "message": "argv must be a list of strings"}, status_code=400)
+                    await response(scope, receive, send)
+                    return
+                cfg = self.config_dir or get_broker_config_dir()
+                cwd_path = pathlib.Path(cwd_raw).resolve() if cwd_raw else None
+                rc, data, stdout_str, stderr_str = await run_ai_orch_cli(argv, cfg, cwd=cwd_path)
+                response = JSONResponse({
+                    "ok": rc == 0,
+                    "returncode": rc,
+                    "stdout": stdout_str,
+                    "stderr": stderr_str,
+                    "data": data,
+                })
                 await response(scope, receive, send)
                 return
 
@@ -424,8 +550,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
     ) -> CallToolResult:
         rc, data, stdout, stderr = await run_ai_orch_cli(["workspace", "list", "--json"], config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_msg = (data.get("error") if data else None) or stderr or stdout or "Failed to list workspaces"
-            return make_error_result("workspace-list-failed", err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, "workspace-list-failed", "Failed to list workspaces")
+            return make_error_result(code, msg)
 
         items_raw = data.get("items", [])
         formatted_items: list[dict[str, Any]] = []
@@ -470,8 +596,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
     ) -> CallToolResult:
         rc, data, stdout, stderr = await run_ai_orch_cli(["projects", "list", workspace, "--json"], config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_msg = (data.get("error") if data else None) or stderr or stdout or f"Failed to list projects for workspace '{workspace}'"
-            return make_error_result("projects-list-failed", err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, "projects-list-failed", f"Failed to list projects for workspace '{workspace}'")
+            return make_error_result(code, msg)
 
         items = data.get("items", [])
         out_items = [
@@ -521,8 +647,9 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
             if not (tasks_dir / "00-INDEX.md").is_file():
                 return make_error_result("index-not-found", f"Path {project_path}/tasks does not contain 00-INDEX.md")
             rc, data, stdout, stderr = await run_ai_orch_cli(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"], config_dir)
-            if rc != 0 or not data:
-                return make_error_result("tasks-list-failed", stderr or stdout or "tasks list failed")
+            if rc != 0 or not data or not data.get("ok"):
+                code, msg = normalize_cli_error(data, stdout, stderr, "tasks-list-failed", "tasks list failed")
+                return make_error_result(code, msg)
             return CallToolResult(content=[TextContent(type="text", text=_apply_notice(stdout))], is_error=False)
         else:
             if not workspace:
@@ -535,7 +662,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"], config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            return make_error_result("tasks-list-failed", (data.get("error") if data else None) or stderr or stdout or "tasks list failed")
+            code, msg = normalize_cli_error(data, stdout, stderr, "tasks-list-failed", "tasks list failed")
+            return make_error_result(code, msg)
 
         tree = data.get("tree", {})
         raw_items: list[dict[str, Any]] = []
@@ -576,6 +704,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
                 "depends_on": list(node.get("depends_on", [])),
                 "hash": node.get("task_hash") or node.get("bundle_sha256") or "",
             }
+            if project:
+                row["project"] = project
             if node.get("size"):
                 row["size"] = node["size"]
             if node.get("parent"):
@@ -611,7 +741,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"], config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            return make_error_result("tasks-list-failed", (data.get("error") if data else None) or stderr or stdout or "tasks list failed")
+            code, msg = normalize_cli_error(data, stdout, stderr, "tasks-list-failed", "tasks list failed")
+            return make_error_result(code, msg)
 
         tree = data.get("tree", {})
         if id not in tree:
@@ -686,36 +817,43 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
         cursor: str | None = None,
         limit: int | None = None,
     ) -> CallToolResult:
-        tasks_dirs: list[pathlib.Path] = []
+        tasks_targets: list[tuple[str, pathlib.Path]] = []
         if project:
             td, err = await resolve_project_tasks_dir(workspace, project, config_dir)
             if err or not td:
                 return make_error_result("project-not-found" if "Project" in (err or "") else "workspace-not-found", err or "Tasks dir resolution failed")
-            tasks_dirs.append(td)
+            tasks_targets.append((project, td))
         else:
-            rc, data, _, _ = await run_ai_orch_cli(["projects", "list", workspace, "--json"], config_dir)
             ws_path, _, ws_err = await resolve_workspace_info(workspace, config_dir)
             if ws_err or not ws_path:
                 return make_error_result("workspace-not-found", ws_err or "Workspace not found")
+
+            rc, data, stdout, stderr = await run_ai_orch_cli(["projects", "list", workspace, "--json"], config_dir)
+            seen_slugs: set[str] = set()
             if rc == 0 and data and data.get("ok"):
                 for pr in data.get("items", []):
+                    slug = pr.get("slug") or ""
                     p_path = pr.get("path", ".")
                     cand = (ws_path / p_path / "tasks").resolve() if p_path != "." else (ws_path / "tasks")
                     if cand.is_dir() and (cand / "00-INDEX.md").is_file():
-                        tasks_dirs.append(cand)
-            if not tasks_dirs:
-                cand = ws_path / "tasks"
-                if cand.is_dir() and (cand / "00-INDEX.md").is_file():
-                    tasks_dirs.append(cand)
+                        tasks_targets.append((slug, cand))
+                        if slug:
+                            seen_slugs.add(slug)
+
+            ws_tasks = ws_path / "tasks"
+            if ws_tasks.is_dir() and (ws_tasks / "00-INDEX.md").is_file() and "_workspace" not in seen_slugs:
+                tasks_targets.append(("_workspace", ws_tasks))
+                seen_slugs.add("_workspace")
 
         raw_items: list[dict[str, Any]] = []
-        for td in tasks_dirs:
-            rc, data, _, _ = await run_ai_orch_cli(["tasks", "next", "--tasks-dir", str(td), "--json"], config_dir)
+        for proj_slug, td in tasks_targets:
+            rc, data, stdout, stderr = await run_ai_orch_cli(["tasks", "next", "--tasks-dir", str(td), "--json"], config_dir)
             if rc == 0 and data and data.get("ok"):
                 ready_tasks = data.get("tasks", [])
                 for t in ready_tasks:
                     row: dict[str, Any] = {
                         "id": t["id"],
+                        "project": proj_slug,
                         "short_title": t.get("short_title") or t.get("short") or t.get("title", ""),
                         "title": t.get("title", ""),
                         "state": t.get("canonical_state") or t.get("state", "open"),
@@ -724,11 +862,16 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
                         "depends_on": list(t.get("depends_on", [])),
                         "hash": t.get("task_hash") or t.get("bundle_sha256") or t.get("hash", ""),
                     }
+                    if not project:
+                        row["scope"] = "workspace" if proj_slug == "_workspace" else "project"
                     if t.get("size"):
                         row["size"] = t["size"]
                     if t.get("parent"):
                         row["parent"] = t["parent"]
                     raw_items.append(row)
+            elif project:
+                code, msg = normalize_cli_error(data, stdout, stderr, "tasks-next-failed", "tasks next failed")
+                return make_error_result(code, msg)
 
         paged_items, next_cursor, truncated = paginate_items(
             raw_items,
@@ -752,7 +895,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(["tasks", "graph", "--tasks-dir", str(tasks_dir), "--json"], config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            return make_error_result("tasks-graph-failed", (data.get("error") if data else None) or stderr or stdout or "tasks graph failed")
+            code, msg = normalize_cli_error(data, stdout, stderr, "tasks-graph-failed", "tasks graph failed")
+            return make_error_result(code, msg)
 
         nodes = [
             {
@@ -799,6 +943,14 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
         prio = priority or "P2"
         p_reason = priority_reason or f"Task: {title}"
 
+        if expect_hash and parent:
+            rc_l, data_l, _, _ = await run_ai_orch_cli(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"], config_dir)
+            parent_hash = ""
+            if rc_l == 0 and data_l and "tree" in data_l and parent in data_l["tree"]:
+                parent_hash = data_l["tree"][parent].get("task_hash") or data_l["tree"][parent].get("bundle_sha256", "")
+            if parent_hash and expect_hash != parent_hash:
+                return make_error_result("hash-mismatch", f"Parent task hash '{parent_hash}' does not match expect_hash '{expect_hash}'")
+
         if preview:
             return make_tool_result({
                 "ok": True,
@@ -830,9 +982,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(cli_args, config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_code = (data.get("error") if data else None) or "tasks-new-failed"
-            err_msg = (data.get("message") if data else None) or stderr or stdout or "tasks new failed"
-            return make_error_result(err_code, err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, "tasks-new-failed", "tasks new failed")
+            return make_error_result(code, msg)
 
         t_id = data["id"]
         rel_path = data.get("rel_path") or data.get("file_path", "")
@@ -878,7 +1029,7 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
             current_hash = data_l["tree"][id].get("task_hash") or data_l["tree"][id].get("bundle_sha256", "")
 
         if expect_hash and current_hash and expect_hash != current_hash:
-            return make_error_result("task-hash-mismatch", f"Task hash '{current_hash}' does not match expect_hash '{expect_hash}'")
+            return make_error_result("hash-mismatch", f"Task hash '{current_hash}' does not match expect_hash '{expect_hash}'")
 
         if preview:
             return make_tool_result({
@@ -904,9 +1055,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(cli_args, config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_code = (data.get("error") if data else None) or "transition-failed"
-            err_msg = (data.get("message") if data else None) or stderr or stdout or "Transition failed"
-            return make_error_result(err_code, err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, "transition-failed", "Transition failed")
+            return make_error_result(code, msg)
 
         res_hash = data.get("bundle_sha256") or data.get("task_hash", "")
         if not res_hash:
@@ -962,6 +1112,12 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         cli_args.extend(["--tasks-dir", str(tasks_dir), "--json"])
         if expect_hash:
+            rc_l, data_l, _, _ = await run_ai_orch_cli(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"], config_dir)
+            current_hash = ""
+            if rc_l == 0 and data_l and "tree" in data_l and id in data_l["tree"]:
+                current_hash = data_l["tree"][id].get("task_hash") or data_l["tree"][id].get("bundle_sha256", "")
+            if current_hash and expect_hash != current_hash:
+                return make_error_result("hash-mismatch", f"Task hash '{current_hash}' does not match expect_hash '{expect_hash}'")
             cli_args.extend(["--expect-task-hash", expect_hash])
         if idempotency_key:
             cli_args.extend(["--idempotency-key", idempotency_key])
@@ -970,9 +1126,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(cli_args, config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_code = (data.get("error") if data else None) or f"{cli_subcmd}-failed"
-            err_msg = (data.get("message") if data else None) or stderr or stdout or f"Command {cli_subcmd} failed"
-            return make_error_result(err_code, err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, f"{cli_subcmd}-failed", f"Command {cli_subcmd} failed")
+            return make_error_result(code, msg)
 
         resp: dict[str, Any] = {
             "ok": True,
@@ -997,32 +1152,38 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
         cursor: str | None = None,
         limit: int | None = None,
     ) -> CallToolResult:
-        tasks_dirs: list[pathlib.Path] = []
+        tasks_targets: list[tuple[str, pathlib.Path]] = []
         if project:
             tasks_dir, err = await resolve_project_tasks_dir(workspace, project, config_dir)
             if err or not tasks_dir:
                 return make_error_result("project-not-found" if "Project" in (err or "") else "workspace-not-found", err or "Tasks dir resolution failed")
-            tasks_dirs.append(tasks_dir)
+            tasks_targets.append((project, tasks_dir))
         else:
-            rc, data, _, _ = await run_ai_orch_cli(["projects", "list", workspace, "--json"], config_dir)
             ws_path, _, ws_err = await resolve_workspace_info(workspace, config_dir)
             if ws_err or not ws_path:
                 return make_error_result("workspace-not-found", ws_err or "Workspace not found")
+
+            rc, data, stdout, stderr = await run_ai_orch_cli(["projects", "list", workspace, "--json"], config_dir)
+            seen_slugs: set[str] = set()
             if rc == 0 and data and data.get("ok"):
                 for pr in data.get("items", []):
+                    slug = pr.get("slug") or ""
                     p_path = pr.get("path", ".")
                     cand = (ws_path / p_path / "tasks").resolve() if p_path != "." else (ws_path / "tasks")
                     if cand.is_dir() and (cand / "00-INDEX.md").is_file():
-                        tasks_dirs.append(cand)
-            if not tasks_dirs:
-                cand = ws_path / "tasks"
-                if cand.is_dir() and (cand / "00-INDEX.md").is_file():
-                    tasks_dirs.append(cand)
+                        tasks_targets.append((slug, cand))
+                        if slug:
+                            seen_slugs.add(slug)
+
+            ws_tasks = ws_path / "tasks"
+            if ws_tasks.is_dir() and (ws_tasks / "00-INDEX.md").is_file() and "_workspace" not in seen_slugs:
+                tasks_targets.append(("_workspace", ws_tasks))
+                seen_slugs.add("_workspace")
 
         raw_items: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
+        seen_ids: set[tuple[str, str]] = set()
 
-        for td in tasks_dirs:
+        for proj_slug, td in tasks_targets:
             cli_args = ["questions", "list", "--tasks-dir", str(td), "--json"]
             if status:
                 cli_args.extend(["--status", status])
@@ -1030,15 +1191,16 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
             rc, data, stdout, stderr = await run_ai_orch_cli(cli_args, config_dir)
             if rc != 0 or not data or not data.get("ok"):
                 if project:
-                    return make_error_result("questions-list-failed", (data.get("error") if data else None) or stderr or stdout or "questions list failed")
+                    code, msg = normalize_cli_error(data, stdout, stderr, "questions-list-failed", "questions list failed")
+                    return make_error_result(code, msg)
                 continue
 
             raw_questions = data.get("questions", [])
             for q in raw_questions:
                 qid = q["id"]
-                if qid in seen_ids:
+                if (proj_slug, qid) in seen_ids:
                     continue
-                seen_ids.add(qid)
+                seen_ids.add((proj_slug, qid))
                 blocks_list: list[str] = []
                 if q.get("blocks_parsed"):
                     blocks_list = [b[0] for b in q["blocks_parsed"] if b and b[0]]
@@ -1047,6 +1209,7 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
                 raw_items.append({
                     "id": qid,
+                    "project": proj_slug,
                     "short_title": q.get("short_title") or q.get("short") or q.get("title") or qid,
                     "question": q["question"],
                     "status": q.get("status", "open"),
@@ -1123,9 +1286,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(cli_args, config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_code = (data.get("error") if data else None) or "questions-ask-failed"
-            err_msg = (data.get("message") if data else None) or stderr or stdout or "questions ask failed"
-            return make_error_result(err_code, err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, "questions-ask-failed", "questions ask failed")
+            return make_error_result(code, msg)
 
         q_id = data["id"]
         file_path = data.get("file_path") or (tasks_dir / data.get("rel_path", ""))
@@ -1168,7 +1330,7 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
             current_hash = hashlib.sha256(q_file.read_bytes()).hexdigest()
 
         if expect_hash and current_hash and expect_hash != current_hash:
-            return make_error_result("question-hash-mismatch", f"Question hash '{current_hash}' does not match expect_hash '{expect_hash}'")
+            return make_error_result("hash-mismatch", f"Question hash '{current_hash}' does not match expect_hash '{expect_hash}'")
 
         if preview:
             return make_tool_result({
@@ -1192,9 +1354,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(cli_args, config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_code = (data.get("error") if data else None) or "questions-answer-failed"
-            err_msg = (data.get("message") if data else None) or stderr or stdout or "questions answer failed"
-            return make_error_result(err_code, err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, "questions-answer-failed", "questions answer failed")
+            return make_error_result(code, msg)
 
         new_hash = ""
         if q_file and q_file.is_file():
@@ -1248,9 +1409,8 @@ def create_broker_server(config_dir: pathlib.Path) -> MCPServer:
 
         rc, data, stdout, stderr = await run_ai_orch_cli(cli_args, config_dir)
         if rc != 0 or not data or not data.get("ok"):
-            err_code = (data.get("error") if data else None) or "inbox-add-failed"
-            err_msg = (data.get("message") if data else None) or stderr or stdout or "inbox add failed"
-            return make_error_result(err_code, err_msg)
+            code, msg = normalize_cli_error(data, stdout, stderr, "inbox-add-failed", "inbox add failed")
+            return make_error_result(code, msg)
 
         rel_path = data.get("rel_path") or data.get("file_path", "")
         note_hash = ""
@@ -1362,7 +1522,7 @@ async def serve_async(
         transport_security=sec,
         streamable_http_path="/mcp",
     )
-    app = BrokerTokenAuthMiddleware(starlette_app, token)
+    app = BrokerTokenAuthMiddleware(starlette_app, token, config_dir)
 
     config = uvicorn.Config(
         app,
@@ -1405,3 +1565,20 @@ def serve(
     config_dir: pathlib.Path | None = None,
 ) -> None:
     asyncio.run(serve_async(port=port, host=host, config_dir=config_dir))
+
+
+async def serve_stdio_async(config_dir: pathlib.Path | None = None) -> None:
+    """Run broker MCP server in-process over stdio without lock, broker.json, or HTTP."""
+    if config_dir is None:
+        config_dir = get_broker_config_dir()
+    server = create_broker_server(config_dir)
+    await server.run_stdio_async()
+
+
+def serve_stdio(config_dir: pathlib.Path | None = None) -> None:
+    """Run broker MCP server in-process over stdio without lock, broker.json, or HTTP."""
+    if config_dir is None:
+        config_dir = get_broker_config_dir()
+    server = create_broker_server(config_dir)
+    server.run(transport="stdio")
+

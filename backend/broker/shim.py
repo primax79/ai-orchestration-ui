@@ -210,6 +210,11 @@ def write_jsonrpc_response(payload: dict[str, Any]) -> None:
 
 
 async def main() -> None:
+    if "--local" in sys.argv:
+        from backend.broker.server import serve_stdio_async
+        await serve_stdio_async()
+        return
+
     config_dir = get_config_dir()
 
     while True:
