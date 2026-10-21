@@ -567,7 +567,11 @@ class ProjectResolver:
                     dirs.remove(d)
                     continue
 
-                if (folder_p / "tasks" / "00-INDEX.md").is_file() or (folder_p / "tasks").is_dir():
+                if (
+                    (folder_p / "tasks" / "00-INDEX.md").is_file()
+                    or (folder_p / "tasks" / "AGENTS.md").is_file()
+                    or (folder_p / "tasks" / "CONTEXT.md").is_file()
+                ):
                     candidate_folders.append(folder_p)
 
         # Inner folders (excluding ws_path itself)

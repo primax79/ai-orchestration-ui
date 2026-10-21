@@ -304,44 +304,73 @@ export const Navbar: React.FC<NavbarProps> = ({
               </span>
             </div>
 
-            {workspace.projects && workspace.projects.length > 1 && onSelectProject && (
-              <select
-                aria-label="Project selector"
-                title="Switch project or view all projects"
-                value={selectedProject || '__all__'}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  onSelectProject(val === '__all__' ? null : val);
-                }}
-                style={{
-                  padding: '0.3rem 0.5rem',
-                  backgroundColor: '#0f172a',
-                  border: '1px solid #4f46e5',
-                  borderRadius: '0.375rem',
-                  color: '#f8fafc',
-                  fontSize: '0.8rem',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  maxWidth: isIconOnly ? '130px' : '210px',
-                  outline: 'none',
-                }}
-              >
-                <option value="__all__">All projects ({workspace.projects.length})</option>
-                {workspace.projects.map((p) => {
-                  const isSub = p.kind === 'sub_workspace';
-                  const kindSuffix = isSub
-                    ? ' (sub_workspace — read-only)'
-                    : p.kind === '_workspace'
-                    ? ' (_workspace)'
-                    : ' (project)';
-                  return (
-                    <option key={p.id} value={p.id}>
-                      {p.id}{kindSuffix}
-                    </option>
-                  );
-                })}
-              </select>
-            )}
+            {workspace.projects && workspace.projects.length > 1 && onSelectProject && (() => {
+              const getProjActiveCounts = (c?: Record<string, number | undefined>) => {
+                const counts = c || {};
+                const waiting = (counts.waiting || 0) + (counts.blocked || 0) + (counts.paused || 0);
+                const open = (counts.open || 0) + (counts.todo || 0) + (counts.bounced || 0);
+                const progress = (counts['in progress'] || 0) + (counts.in_progress || 0) + (counts.delivered || 0) + (counts.verified || 0);
+                const nonClosed = waiting + open + progress;
+                return { waiting, open, progress, nonClosed };
+              };
+              const totals = workspace.projects.reduce(
+                (acc, p) => {
+                  const pc = getProjActiveCounts(p.counts);
+                  acc.waiting += pc.waiting;
+                  acc.open += pc.open;
+                  acc.progress += pc.progress;
+                  acc.nonClosed += pc.nonClosed;
+                  return acc;
+                },
+                { waiting: 0, open: 0, progress: 0, nonClosed: 0 }
+              );
+              const sortedProjects = [...workspace.projects].sort((a, b) => {
+                if (a.kind === '_workspace' && b.kind !== '_workspace') return -1;
+                if (b.kind === '_workspace' && a.kind !== '_workspace') return 1;
+                const ac = getProjActiveCounts(a.counts).nonClosed;
+                const bc = getProjActiveCounts(b.counts).nonClosed;
+                if (ac > 0 && bc === 0) return -1;
+                if (bc > 0 && ac === 0) return 1;
+                if (ac !== bc) return bc - ac;
+                return a.id.localeCompare(b.id);
+              });
+              return (
+                <select
+                  aria-label="Project selector"
+                  title="Switch project or view all projects"
+                  value={selectedProject || '__all__'}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    onSelectProject(val === '__all__' ? null : val);
+                  }}
+                  style={{
+                    padding: '0.3rem 0.5rem',
+                    backgroundColor: '#0f172a',
+                    border: '1px solid #4f46e5',
+                    borderRadius: '0.375rem',
+                    color: '#f8fafc',
+                    fontSize: '0.8rem',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    maxWidth: isIconOnly ? '220px' : '360px',
+                    outline: 'none',
+                  }}
+                >
+                  <option value="__all__">
+                    All projects ({workspace.projects.length}) — {totals.nonClosed} (waiting: {totals.waiting}, open: {totals.open}, progress: {totals.progress})
+                  </option>
+                  {sortedProjects.map((p) => {
+                    const pc = getProjActiveCounts(p.counts);
+                    const subTag = p.kind === 'sub_workspace' ? ' [sub_workspace]' : '';
+                    return (
+                      <option key={p.id} value={p.id}>
+                        {p.id}{subTag} — {pc.nonClosed} (waiting: {pc.waiting}, open: {pc.open}, progress: {pc.progress})
+                      </option>
+                    );
+                  })}
+                </select>
+              );
+            })()}
           </div>
         )}
 
