@@ -56,7 +56,9 @@ const ALL_STATES: TaskState[] = [
   'dropped',
 ];
 const CLOSED_STATES: TaskState[] = ['done', 'done with a caveat', 'dropped'];
-export const DEFAULT_TREE_STATES = ALL_STATES.filter((st) => !CLOSED_STATES.includes(st));
+export const DEFAULT_TREE_STATES = ALL_STATES.filter(
+  (st) => !CLOSED_STATES.includes(st) && st !== 'paused'
+);
 
 const getStoredExpanded = (): Record<string, boolean> => {
   try {

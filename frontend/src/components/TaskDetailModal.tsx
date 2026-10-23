@@ -2217,8 +2217,8 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                   )
                 )}
 
-                {/* Pause button when in progress */}
-                {currentTask.state === 'in progress' && (
+                {/* Pause button for any active / non-paused / non-closed task */}
+                {!['paused', 'verified', 'done', 'done with a caveat', 'dropped'].includes(currentTask.state) && (
                   <button
                     onClick={() => handleTransition('paused')}
                     disabled={loading}
@@ -2240,27 +2240,48 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                   </button>
                 )}
 
-                {/* Resume button when paused */}
+                {/* Resume buttons when paused */}
                 {currentTask.state === 'paused' && (
-                  <button
-                    onClick={() => handleTransition('in progress')}
-                    disabled={loading}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.3rem',
-                      padding: '0.4rem 0.8rem',
-                      borderRadius: '0.375rem',
-                      border: 'none',
-                      backgroundColor: '#6366f1',
-                      color: '#fff',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
-                    <span>Resume Task (In Progress)</span>
-                  </button>
+                  <>
+                    <button
+                      onClick={() => handleTransition('open')}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #6366f1',
+                        backgroundColor: 'transparent',
+                        color: '#a5b4fc',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+                      <span>Resume (Open)</span>
+                    </button>
+                    <button
+                      onClick={() => handleTransition('in progress')}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
+                        border: 'none',
+                        backgroundColor: '#6366f1',
+                        color: '#fff',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {loading ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+                      <span>Resume (In Progress)</span>
+                    </button>
+                  </>
                 )}
 
                 {/* R6: Generic delivered transition is HIDDEN when task has runs */}

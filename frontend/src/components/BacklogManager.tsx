@@ -13,6 +13,8 @@ import {
   Loader2,
   Eye,
   EyeOff,
+  Pause,
+  Play,
 } from 'lucide-react';
 import { TaskItem, TaskListResponse, TaskState, SharedFilterState, WorkspaceProjectInfo } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
@@ -51,12 +53,23 @@ const getStoredView = (): BacklogView => {
 };
 
 const TREE_STATES_KEY = 'ai-orch:tree-visible-states';
+const SHOW_PAUSED_KEY = 'ai-orch:backlog-show-paused';
 const ALL_STATES: TaskState[] = [
   'open', 'in progress', 'paused', 'bounced', 'waiting', 'blocked',
   'delivered', 'verified', 'done', 'done with a caveat', 'dropped',
 ];
 const CLOSED_STATES: TaskState[] = ['done', 'done with a caveat', 'dropped'];
-const DEFAULT_TREE_STATES = ALL_STATES.filter((st) => !CLOSED_STATES.includes(st));
+const DEFAULT_TREE_STATES = ALL_STATES.filter(
+  (st) => !CLOSED_STATES.includes(st) && st !== 'paused'
+);
+
+const getStoredShowPaused = (): boolean => {
+  try {
+    return localStorage.getItem(SHOW_PAUSED_KEY) === 'true';
+  } catch {
+    return false;
+  }
+};
 
 const getStoredTreeStates = (): TaskState[] => {
   try {
@@ -111,6 +124,8 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   const effectiveProject = selectedProject || defaultProject;
   const [viewMode, setViewMode] = useState<BacklogView>(getStoredView);
   const [showDone, setShowDone] = useState<boolean>(getStoredShowDone);
+  const [showPaused, setShowPaused] = useState<boolean>(getStoredShowPaused);
+  const [pausingTaskId, setPausingTaskId] = useState<string | null>(null);
   const [treeStates, setTreeStates] = useState<TaskState[]>(getStoredTreeStates);
   const [selectedTask, setSelectedTask] = useState<TaskItem | null>(null);
   const [syncingIndex, setSyncingIndex] = useState(false);
@@ -162,10 +177,50 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
     open: tasks.filter((t) => t.state === 'open').length,
     inProgress: tasks.filter((t) => t.state === 'in progress').length,
     waiting: tasks.filter((t) => t.state === 'waiting' || t.state === 'blocked').length,
+    paused: tasks.filter((t) => t.state === 'paused').length,
     delivered: tasks.filter((t) => t.state === 'delivered').length,
     verified: tasks.filter((t) => t.state === 'verified').length,
     done: tasks.filter((t) => isClosedState(t.state) || t.is_done).length,
     conditional: tasks.filter((t) => t.conditional).length,
+  };
+
+  const handleToggleShowPaused = () => {
+    setShowPaused((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SHOW_PAUSED_KEY, String(next));
+      } catch {
+        // Ignore storage errors
+      }
+      setTreeStates((curr) => {
+        const updated: TaskState[] = next
+          ? curr.includes('paused')
+            ? curr
+            : [...curr, 'paused']
+          : curr.filter((s) => s !== 'paused');
+        try {
+          localStorage.setItem(TREE_STATES_KEY, JSON.stringify(updated));
+        } catch {}
+        return updated;
+      });
+      return next;
+    });
+  };
+
+  const handleQuickTogglePause = async (e: React.MouseEvent, t: TaskItem) => {
+    e.stopPropagation();
+    const key = t.qualified_id || `${t.project || ''}-${t.id}`;
+    if (pausingTaskId === key) return;
+    setPausingTaskId(key);
+    try {
+      const targetState: TaskState = t.state === 'paused' ? 'open' : 'paused';
+      await api.transitionTask(t.id, targetState, undefined, undefined, (t.project || effectiveProject) ?? undefined);
+      onRefresh();
+    } catch (err: any) {
+      setSyncError(`Failed to update task ${t.id}: ${err?.message || err}`);
+    } finally {
+      setPausingTaskId(null);
+    }
   };
 
   // Filter tasks based on sharedFilters
@@ -186,10 +241,11 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   const baseTasks = useMemo(() => {
     return tasks.filter((t) => {
       if (isClosedState(t.state) || t.is_done) return false;
+      if (!showPaused && t.state === 'paused') return false;
       if (!matchTaskFilters(t, sharedFilters)) return false;
       return true;
     });
-  }, [tasks, sharedFilters]);
+  }, [tasks, sharedFilters, showPaused]);
 
   const allQueueCandidates = useMemo(() => {
     return [...baseTasks].sort(sortTasksByPriorityAndId);
@@ -343,11 +399,20 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
 
   const visibleColumns: KanbanColumnDef[] = [
     // Waiting first: tasks blocked on a decision are the ones that need the owner.
-    { id: 'waiting_blocked', title: 'Waiting / Paused / Blocked', states: ['waiting', 'paused', 'blocked'], color: '#f59e0b' },
+    { id: 'waiting_blocked', title: 'Waiting / Blocked', states: ['waiting', 'blocked'], color: '#f59e0b' },
     { id: 'open', title: 'Open', states: ['open'], color: '#94a3b8' },
     { id: 'in_progress', title: 'In Progress', states: ['in progress', 'bounced'], color: '#6366f1' },
     { id: 'delivered_verified', title: 'Delivered / Verified', color: '#0ea5e9', isSplit: true },
   ];
+
+  if (showPaused) {
+    visibleColumns.push({
+      id: 'paused',
+      title: 'Paused',
+      states: ['paused'],
+      color: '#d97706',
+    });
+  }
 
   if (showDone) {
     visibleColumns.push({
@@ -463,6 +528,28 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
             <KindBadge kind={effectiveKind} size={11} showLabel={true} />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
+            {!isClosedState(t.state) && t.state !== 'verified' && !isSubWorkspaceReadOnly && (
+              <button
+                type="button"
+                onClick={(e) => handleQuickTogglePause(e, t)}
+                title={t.state === 'paused' ? 'Resume task (set to open)' : 'Pause task (exclude from active queue)'}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '0.15rem 0.3rem',
+                  borderRadius: '0.2rem',
+                  border: `1px solid ${t.state === 'paused' ? '#6366f1' : '#475569'}`,
+                  backgroundColor: t.state === 'paused' ? '#312e81' : '#1e293b',
+                  color: t.state === 'paused' ? '#e0e7ff' : '#cbd5e1',
+                  cursor: 'pointer',
+                  fontSize: '0.65rem',
+                  gap: '0.2rem',
+                }}
+              >
+                {t.state === 'paused' ? <Play size={10} /> : <Pause size={10} />}
+              </button>
+            )}
             <span
               style={{
                 fontSize: '0.7rem',
@@ -594,6 +681,28 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
           <span style={{ fontSize: '0.85rem', color: '#94a3b8', backgroundColor: '#1e293b', padding: '0.2rem 0.6rem', borderRadius: '1rem', border: '1px solid #334155' }}>
             {stats.total} total task(s)
           </span>
+          {(stats.paused > 0 || showPaused) && (
+            <button
+              type="button"
+              onClick={handleToggleShowPaused}
+              title="Paused tasks are excluded from active queues and boards by default"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.35rem',
+                fontSize: '0.8rem',
+                padding: '0.2rem 0.6rem',
+                borderRadius: '1rem',
+                border: `1px solid ${showPaused ? '#d97706' : '#334155'}`,
+                backgroundColor: showPaused ? '#451a03' : '#1e293b',
+                color: showPaused ? '#fde68a' : '#cbd5e1',
+                cursor: 'pointer',
+              }}
+            >
+              <Pause size={12} color="#f59e0b" />
+              <span>{showPaused ? `Hide paused (${stats.paused})` : `Show paused (${stats.paused})`}</span>
+            </button>
+          )}
           {isCommonView && onIncludeClosedChange && (
             <button
               type="button"
@@ -704,6 +813,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
           { label: 'Open', count: stats.open, color: '#94a3b8' },
           { label: 'In Progress', count: stats.inProgress, color: '#6366f1' },
           { label: 'Waiting/Blocked', count: stats.waiting, color: '#f59e0b' },
+          ...(stats.paused > 0 ? [{ label: 'Paused', count: stats.paused, color: '#d97706' }] : []),
           { label: 'Delivered', count: stats.delivered, color: '#0ea5e9' },
           { label: 'Verified', count: stats.verified, color: '#10b981' },
           ...(stats.conditional > 0 ? [{ label: 'Conditional', count: stats.conditional, color: '#f59e0b' }] : []),
@@ -986,6 +1096,32 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                         <span style={{ color: '#64748b' }}>Assigned:</span>
                         <strong style={{ color: '#cbd5e1', fontWeight: 600 }}>{t.executor || 'self'}</strong>
                       </span>
+
+                      {/* Quick Pause / Resume button */}
+                      {!isClosedState(t.state) && t.state !== 'verified' && !isSubWorkspaceReadOnly && (
+                        <button
+                          type="button"
+                          onClick={(e) => handleQuickTogglePause(e, t)}
+                          title={t.state === 'paused' ? 'Resume task (set to open)' : 'Pause task (exclude from active queue)'}
+                          style={{
+                            background: t.state === 'paused' ? '#312e81' : '#0f172a',
+                            border: `1px solid ${t.state === 'paused' ? '#6366f1' : '#334155'}`,
+                            borderRadius: '0.25rem',
+                            padding: '0.25rem 0.5rem',
+                            color: t.state === 'paused' ? '#e0e7ff' : '#f59e0b',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.25rem',
+                            fontSize: '0.75rem',
+                            flexShrink: 0,
+                            fontWeight: 500,
+                          }}
+                        >
+                          {t.state === 'paused' ? <Play size={13} /> : <Pause size={13} />}
+                          <span>{t.state === 'paused' ? 'Resume' : 'Pause'}</span>
+                        </button>
+                      )}
 
                       {/* Handoff copy button */}
                       <button

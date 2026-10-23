@@ -308,7 +308,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             {workspace.projects && workspace.projects.length > 1 && onSelectProject && (() => {
               const getProjActiveCounts = (c?: Record<string, number | undefined>) => {
                 const counts = c || {};
-                const waiting = (counts.waiting || 0) + (counts.blocked || 0) + (counts.paused || 0);
+                const waiting = (counts.waiting || 0) + (counts.blocked || 0);
                 const open = (counts.open || 0) + (counts.todo || 0) + (counts.bounced || 0);
                 const progress = (counts['in progress'] || 0) + (counts.in_progress || 0) + (counts.delivered || 0) + (counts.verified || 0);
                 const nonClosed = waiting + open + progress;
