@@ -406,7 +406,8 @@ export const UnregisteredWorkspaceBanner: React.FC<{
   rootPath: string;
 }> = ({ rootPath }) => {
   const [copied, setCopied] = useState(false);
-  const cliCommand = `ai-orch workspace register ${rootPath}`;
+  const quotedPath = /\s/.test(rootPath) ? `"${rootPath.replace(/"/g, '\\"')}"` : rootPath;
+  const cliCommand = `ai-orch projects discover ${quotedPath} --apply`;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(cliCommand);
