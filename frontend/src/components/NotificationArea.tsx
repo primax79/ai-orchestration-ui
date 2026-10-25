@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Bell,
   CheckCheck,
@@ -26,6 +27,37 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
   const [recentEvents, setRecentEvents] = useState<OrchestrationEvent[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  // The navbar clips its children (overflow: hidden), so the panel is rendered
+  // in a portal with a fixed position computed from the bell button.
+  const [panelPos, setPanelPos] = useState<{ top: number; right: number; width: number; maxHeight: number } | null>(null);
+
+  const updatePanelPos = useCallback(() => {
+    const anchor = dropdownRef.current;
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    const top = rect.bottom + 8;
+    const width = Math.min(360, window.innerWidth - 16);
+    // Right-align with the bell, but keep 8px from both window edges.
+    const right = Math.min(Math.max(8, window.innerWidth - rect.right), window.innerWidth - width - 8);
+    setPanelPos({
+      top,
+      right,
+      width,
+      maxHeight: Math.max(160, Math.min(480, window.innerHeight - top - 8)),
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!isOpen) return;
+    updatePanelPos();
+    window.addEventListener('resize', updatePanelPos);
+    window.addEventListener('scroll', updatePanelPos, true);
+    return () => {
+      window.removeEventListener('resize', updatePanelPos);
+      window.removeEventListener('scroll', updatePanelPos, true);
+    };
+  }, [isOpen, updatePanelPos]);
 
   const fetchNotifications = useCallback(async () => {
     if (!targetProject) return;
@@ -51,7 +83,10 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
   // Close dropdown when clicking outside
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      const inAnchor = dropdownRef.current?.contains(target);
+      const inPanel = panelRef.current?.contains(target);
+      if (!inAnchor && !inPanel) {
         setIsOpen(false);
       }
     };
@@ -172,14 +207,15 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
         )}
       </button>
 
-      {isOpen && (
+      {isOpen && panelPos && createPortal(
         <div
+          ref={panelRef}
           style={{
-            position: 'absolute',
-            top: 'calc(100% + 8px)',
-            right: 0,
-            width: '360px',
-            maxHeight: '480px',
+            position: 'fixed',
+            top: panelPos.top,
+            right: panelPos.right,
+            width: panelPos.width,
+            maxHeight: panelPos.maxHeight,
             backgroundColor: '#1e293b',
             border: '1px solid #334155',
             borderRadius: '0.5rem',
@@ -465,7 +501,8 @@ export const NotificationArea: React.FC<NotificationAreaProps> = ({ onNavigate }
               View Full Event Stream &rarr;
             </button>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );
