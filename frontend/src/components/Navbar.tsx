@@ -70,18 +70,57 @@ export const Navbar: React.FC<NavbarProps> = ({
     return () => ro.disconnect();
   }, []);
 
-  const isShort = width < 1600; // full labels need ~1580 px with the logo and workspace chip
-  const isIconOnly = width < 1200; // short labels need ~1200 px
+  // Row 1: logo + tabs (grouped) on the left, status controls (live, bell,
+  // refresh) on the right. Tab labels are full, short or icon-only, whichever
+  // fits; workspace/project controls join row 1 only when there is room,
+  // otherwise they take a second row. Nothing is ever clipped or scrolled away.
+  const row1Ref = useRef<HTMLDivElement | null>(null);
+  const statusRef = useRef<HTMLDivElement | null>(null);
+  const projRef = useRef<HTMLDivElement | null>(null);
+  const measureRefs = {
+    full: useRef<HTMLDivElement | null>(null),
+    short: useRef<HTMLDivElement | null>(null),
+    icon: useRef<HTMLDivElement | null>(null),
+  };
+  const [labelMode, setLabelMode] = useState<'full' | 'short' | 'icon'>('icon');
+  const [twoRows, setTwoRows] = useState(true);
+  useEffect(() => {
+    const GAP = 12;
+    const measureNow = () => {
+      const row = row1Ref.current;
+      const st = statusRef.current;
+      if (!row || !st) return;
+      const avail = row.clientWidth - st.offsetWidth - GAP;
+      const w = (k: 'full' | 'short' | 'icon') => measureRefs[k].current?.offsetWidth ?? Infinity;
+      const mode = w('full') <= avail ? 'full' : w('short') <= avail ? 'short' : 'icon';
+      setLabelMode(mode);
+      const proj = projRef.current?.offsetWidth ?? 0;
+      setTwoRows(proj > 0 && w(mode) + proj + GAP > avail);
+    };
+    measureNow();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measureNow);
+    [row1Ref, statusRef, projRef, measureRefs.full, measureRefs.short, measureRefs.icon].forEach(
+      (r) => r.current && ro.observe(r.current)
+    );
+    return () => ro.disconnect();
+  });
+
+  // Window-width hints only for spacing; tab labels follow the measured fit below.
+  const medium = width < 1600;
+  const compact = width < 1200;
 
   const tabs = [
     {
       key: 'backlog' as const,
+      group: 'work',
       icon: <Layers size={16} />,
       label: 'Backlog & Tasks',
       shortLabel: 'Backlog',
     },
     {
       key: 'decisions' as const,
+      group: 'work',
       icon: <HelpCircle size={16} />,
       label: 'Decisions',
       shortLabel: 'Decisions',
@@ -90,6 +129,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     },
     {
       key: 'inbox' as const,
+      group: 'work',
       icon: <Inbox size={16} />,
       label: 'Inbox',
       shortLabel: 'Inbox',
@@ -98,6 +138,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     },
     {
       key: 'runs' as const,
+      group: 'run',
       icon: <Terminal size={16} />,
       label: 'Runs',
       shortLabel: 'Runs',
@@ -106,126 +147,123 @@ export const Navbar: React.FC<NavbarProps> = ({
     },
     {
       key: 'orchestrator' as const,
+      group: 'run',
       icon: <Bot size={16} />,
       label: 'Orchestrator Chat',
       shortLabel: 'Chat',
     },
     {
       key: 'use-cases' as const,
+      group: 'observe',
       icon: <CheckCircle2 size={16} />,
       label: 'Use Cases & Validation',
       shortLabel: 'Use Cases',
     },
     {
       key: 'triggers' as const,
+      group: 'observe',
       icon: <Zap size={16} />,
       label: 'Triggers',
       shortLabel: 'Triggers',
     },
     {
       key: 'events' as const,
+      group: 'observe',
       icon: <Radio size={16} />,
       label: 'Event Stream',
       shortLabel: 'Events',
     },
     {
       key: 'installer' as const,
+      group: 'setup',
       icon: <DownloadCloud size={16} />,
       label: 'Install Skills & MCP',
       shortLabel: 'Install',
     },
     {
       key: 'doctor' as const,
+      group: 'setup',
       icon: <Activity size={16} />,
       label: 'Environment Doctor',
       shortLabel: 'Doctor',
     },
     {
       key: 'config' as const,
+      group: 'setup',
       icon: <Settings size={16} />,
       label: 'Orchestrator Config',
       shortLabel: 'Config',
     },
   ];
 
-  return (
-    <header
-      ref={headerRef}
+  const renderTabs = (mode: 'full' | 'short' | 'icon', measure = false) => (
+    <div
       style={{
         display: 'flex',
         alignItems: 'center',
-        justifyContent: 'space-between',
-        padding: isIconOnly ? '0.5rem 0.75rem' : '0.75rem 1.5rem',
-        backgroundColor: '#1e293b',
-        borderBottom: '1px solid #334155',
-        // Tabs are never squeezed or scrolled out of view: when the row is too
-        // narrow, the workspace/project controls wrap to a second row instead.
-        flexWrap: 'wrap',
-        rowGap: '0.5rem',
-        columnGap: '0.75rem',
-        minHeight: '3.75rem',
-        boxSizing: 'border-box',
+        gap: mode === 'icon' ? '0.5rem' : '1rem',
+        flexWrap: 'nowrap',
+        flex: measure ? '0 0 auto' : '0 1 auto',
+        minWidth: 0,
       }}
     >
-      <style>{`
-        .nav-tabs-scroll::-webkit-scrollbar {
-          height: 3px;
-        }
-        .nav-tabs-scroll::-webkit-scrollbar-thumb {
-          background: #475569;
-          border-radius: 2px;
-        }
-      `}</style>
       <div
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: isIconOnly ? '0.5rem' : '1rem',
-          flexWrap: 'nowrap',
-          flex: '0 0 auto',
+          gap: '0.5rem',
+          fontWeight: 700,
+          fontSize: '1.1rem',
+          color: '#818cf8',
+          flexShrink: 0,
+          whiteSpace: 'nowrap',
         }}
       >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.5rem',
-            fontWeight: 700,
-            fontSize: '1.1rem',
-            color: '#818cf8',
-            flexShrink: 0,
-            whiteSpace: 'nowrap',
-          }}
-        >
-          <Layers size={22} style={{ flexShrink: 0 }} />
-          {!isIconOnly && <span style={{ whiteSpace: 'nowrap' }}>ai-orchestration</span>}
-        </div>
-
-        <nav
-          className="nav-tabs-scroll"
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.25rem',
-            marginLeft: isIconOnly ? '0.25rem' : '1rem',
-            flexWrap: 'nowrap',
-            flexShrink: 0,
-          }}
-        >
-          {tabs.map((tab) => {
+        <Layers size={22} style={{ flexShrink: 0 }} />
+        {mode !== 'icon' && <span style={{ whiteSpace: 'nowrap' }}>ai-orchestration</span>}
+      </div>
+      <nav
+        aria-hidden={measure ? true : undefined}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.25rem',
+          marginLeft: mode === 'icon' ? '0.25rem' : '1rem',
+          // Last resort on very narrow panels: icons wrap instead of being cut.
+          flexWrap: measure ? 'nowrap' : 'wrap',
+          rowGap: '0.25rem',
+          flexShrink: measure ? 0 : 1,
+          minWidth: 0,
+        }}
+      >
+          {tabs.map((tab, idx) => {
             const isActive = activeTab === tab.key;
             const hasBadge = tab.badge !== undefined && tab.badge > 0;
+            const newGroup = idx > 0 && tabs[idx - 1].group !== tab.group;
             return (
+              <React.Fragment key={tab.key}>
+              {newGroup && (
+                <span
+                  aria-hidden="true"
+                  style={{
+                    width: '1px',
+                    height: '1.25rem',
+                    backgroundColor: '#475569',
+                    margin: '0 0.35rem',
+                    flexShrink: 0,
+                  }}
+                />
+              )}
               <button
-                key={tab.key}
                 onClick={() => setActiveTab(tab.key)}
+                tabIndex={measure ? -1 : undefined}
                 title={tab.label}
                 aria-label={tab.label}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
                   gap: '0.4rem',
-                  padding: isIconOnly ? '0.4rem 0.6rem' : '0.4rem 0.8rem',
+                  padding: mode === 'icon' ? '0.4rem 0.6rem' : '0.4rem 0.8rem',
                   borderRadius: '0.375rem',
                   border: 'none',
                   cursor: 'pointer',
@@ -237,9 +275,9 @@ export const Navbar: React.FC<NavbarProps> = ({
                 }}
               >
                 {tab.icon}
-                {!isIconOnly && (
+                {mode !== 'icon' && (
                   <span style={{ whiteSpace: 'nowrap' }}>
-                    {isShort ? tab.shortLabel : tab.label}
+                    {mode === 'short' ? tab.shortLabel : tab.label}
                   </span>
                 )}
                 {hasBadge && (
@@ -257,7 +295,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                       padding: '0 0.3rem',
                       borderRadius: '1rem',
                       lineHeight: 1,
-                      marginLeft: isIconOnly ? '0.1rem' : '0.15rem',
+                      marginLeft: mode === 'icon' ? '0.1rem' : '0.15rem',
                       flexShrink: 0,
                       whiteSpace: 'nowrap',
                     }}
@@ -266,24 +304,26 @@ export const Navbar: React.FC<NavbarProps> = ({
                   </span>
                 )}
               </button>
+              </React.Fragment>
             );
           })}
-        </nav>
-      </div>
+      </nav>
+    </div>
+  );
 
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: isIconOnly ? '0.5rem' : '1rem',
-          fontSize: '0.85rem',
-          flex: '0 1 auto',
-          marginLeft: 'auto',
-          minWidth: 0,
-          maxWidth: '100%',
-          whiteSpace: 'nowrap',
-        }}
-      >
+  const renderProjectControls = () => (
+    <div
+      ref={projRef}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: compact ? '0.5rem' : '1rem',
+        fontSize: '0.85rem',
+        flex: '0 0 auto',
+        maxWidth: '100%',
+        whiteSpace: 'nowrap',
+      }}
+    >
         {workspace && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: 0, flexShrink: 1 }}>
             <div
@@ -297,7 +337,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 borderRadius: '0.375rem',
                 border: '1px solid #334155',
                 color: '#cbd5e1',
-                maxWidth: isIconOnly ? '120px' : isShort ? '160px' : '220px',
+                maxWidth: compact ? '120px' : medium ? '160px' : '220px',
                 minWidth: 0,
                 flexShrink: 1,
                 whiteSpace: 'nowrap',
@@ -392,7 +432,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                       cursor: 'pointer',
                       minWidth: 0,
                       flexShrink: 1,
-                      maxWidth: isIconOnly ? '220px' : '360px',
+                      maxWidth: compact ? '220px' : '360px',
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
@@ -444,6 +484,55 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
         )}
 
+    </div>
+  );
+
+  return (
+    <header
+      ref={headerRef}
+      style={{
+        position: 'relative',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'stretch',
+        justifyContent: 'center',
+        padding: compact ? '0.5rem 0.75rem' : '0.75rem 1.5rem',
+        backgroundColor: '#1e293b',
+        borderBottom: '1px solid #334155',
+        rowGap: '0.5rem',
+        minHeight: '3.75rem',
+        boxSizing: 'border-box',
+      }}
+    >
+      {/* Hidden copies used only to measure each label mode's width. */}
+      <div
+        aria-hidden="true"
+        style={{ position: 'absolute', left: 0, top: 0, width: 'max-content', visibility: 'hidden', pointerEvents: 'none', height: 0, overflow: 'hidden' }}
+      >
+        <div ref={measureRefs.full} style={{ display: 'flex', width: 'max-content' }}>{renderTabs('full', true)}</div>
+        <div ref={measureRefs.short} style={{ display: 'flex', width: 'max-content' }}>{renderTabs('short', true)}</div>
+        <div ref={measureRefs.icon} style={{ display: 'flex', width: 'max-content' }}>{renderTabs('icon', true)}</div>
+      </div>
+      <div
+        ref={row1Ref}
+        style={{ display: 'flex', alignItems: 'center', columnGap: '0.75rem', rowGap: '0.5rem', flexWrap: 'wrap', minWidth: 0 }}
+      >
+        {renderTabs(labelMode)}
+        {!twoRows && <div style={{ marginLeft: 'auto', display: 'flex', minWidth: 0 }}>{renderProjectControls()}</div>}
+        <div
+          ref={statusRef}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: compact ? '0.5rem' : '0.75rem',
+            fontSize: '0.85rem',
+            flex: '0 0 auto',
+            marginLeft: twoRows ? 'auto' : '0',
+            paddingLeft: twoRows ? 0 : '0.75rem',
+            borderLeft: twoRows ? 'none' : '1px solid #334155',
+            whiteSpace: 'nowrap',
+          }}
+        >
         <div
           style={{
             display: 'flex',
@@ -496,7 +585,11 @@ export const Navbar: React.FC<NavbarProps> = ({
         >
           <RefreshCw size={15} />
         </button>
+        </div>
       </div>
+      {twoRows && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', minWidth: 0 }}>{renderProjectControls()}</div>
+      )}
     </header>
   );
 };
