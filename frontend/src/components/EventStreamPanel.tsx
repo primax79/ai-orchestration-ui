@@ -194,7 +194,7 @@ export const EventStreamPanel: React.FC<EventStreamPanelProps> = ({ onNavigateTa
       style={{
         display: 'flex',
         flexDirection: 'column',
-        height: 'calc(100vh - 3.75rem)',
+        height: 'calc(100vh - var(--nav-h, 3.75rem))',
         backgroundColor: '#0f172a',
         color: '#f8fafc',
         boxSizing: 'border-box',

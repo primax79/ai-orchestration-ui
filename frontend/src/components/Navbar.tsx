@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Layers,
   HelpCircle,
@@ -56,6 +56,18 @@ export const Navbar: React.FC<NavbarProps> = ({
     return () => {
       window.removeEventListener('resize', handleResize);
     };
+  }, []);
+
+  const headerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const apply = () =>
+      document.documentElement.style.setProperty('--nav-h', `${el.offsetHeight}px`);
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
   const isShort = width < 1600; // full labels need ~1580 px with the logo and workspace chip
@@ -138,6 +150,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   return (
     <header
+      ref={headerRef}
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -145,11 +158,13 @@ export const Navbar: React.FC<NavbarProps> = ({
         padding: isIconOnly ? '0.5rem 0.75rem' : '0.75rem 1.5rem',
         backgroundColor: '#1e293b',
         borderBottom: '1px solid #334155',
-        flexWrap: 'nowrap',
-        gap: '0.75rem',
-        height: '3.75rem',
+        // Tabs are never squeezed or scrolled out of view: when the row is too
+        // narrow, the workspace/project controls wrap to a second row instead.
+        flexWrap: 'wrap',
+        rowGap: '0.5rem',
+        columnGap: '0.75rem',
+        minHeight: '3.75rem',
         boxSizing: 'border-box',
-        overflow: 'hidden',
       }}
     >
       <style>{`
@@ -167,9 +182,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           alignItems: 'center',
           gap: isIconOnly ? '0.5rem' : '1rem',
           flexWrap: 'nowrap',
-          minWidth: 0,
-          flex: '1 1 auto',
-          overflow: 'hidden',
+          flex: '0 0 auto',
         }}
       >
         <div
@@ -185,7 +198,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           }}
         >
           <Layers size={22} style={{ flexShrink: 0 }} />
-          <span style={{ whiteSpace: 'nowrap' }}>ai-orchestration</span>
+          {!isIconOnly && <span style={{ whiteSpace: 'nowrap' }}>ai-orchestration</span>}
         </div>
 
         <nav
@@ -196,11 +209,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             gap: '0.25rem',
             marginLeft: isIconOnly ? '0.25rem' : '1rem',
             flexWrap: 'nowrap',
-            overflowX: 'auto',
-            overflowY: 'hidden',
-            minWidth: 0,
-            flexShrink: 1,
-            scrollbarWidth: 'thin',
+            flexShrink: 0,
           }}
         >
           {tabs.map((tab) => {
@@ -268,8 +277,10 @@ export const Navbar: React.FC<NavbarProps> = ({
           alignItems: 'center',
           gap: isIconOnly ? '0.5rem' : '1rem',
           fontSize: '0.85rem',
-          flexShrink: 0,
+          flex: '0 1 auto',
+          marginLeft: 'auto',
           minWidth: 0,
+          maxWidth: '100%',
           whiteSpace: 'nowrap',
         }}
       >
@@ -363,15 +374,28 @@ export const Navbar: React.FC<NavbarProps> = ({
                       onSelectProject(val === '__all__' ? null : val);
                     }}
                     style={{
-                      padding: '0.3rem 0.5rem',
+                      // Own chevron and reserved right padding: the native arrow overlapped long labels.
+                      appearance: 'none',
+                      WebkitAppearance: 'none',
+                      padding: '0.3rem 1.75rem 0.3rem 0.5rem',
                       backgroundColor: '#0f172a',
+                      backgroundImage:
+                        "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23c7d2fe' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>\")",
+                      backgroundRepeat: 'no-repeat',
+                      backgroundPosition: 'right 0.5rem center',
+                      backgroundSize: '12px 12px',
                       border: '1px solid #4f46e5',
                       borderRadius: '0.375rem',
                       color: '#f8fafc',
                       fontSize: '0.8rem',
                       fontWeight: 600,
                       cursor: 'pointer',
+                      minWidth: 0,
+                      flexShrink: 1,
                       maxWidth: isIconOnly ? '220px' : '360px',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
                       outline: 'none',
                     }}
                   >
