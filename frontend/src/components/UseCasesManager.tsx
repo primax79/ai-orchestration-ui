@@ -80,14 +80,15 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) =
 
   const handleCreateUseCase = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newId || !newTitle) {
-      alert('ID and Title are required');
+    if (!newTitle) {
+      alert('Title is required');
       return;
     }
     setCreating(true);
     try {
       await api.createUseCase({
-        id: newId,
+        // Empty id: the engine assigns the next free UC### on save.
+        id: newId.trim(),
         title: newTitle,
         actor: newActor,
         priority: newPriority as any,
@@ -422,14 +423,13 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({ onRefresh }) =
 
             <div>
               <label style={{ fontSize: '0.75rem', fontWeight: 600, color: '#94a3b8', display: 'block', marginBottom: '0.25rem' }}>
-                Use Case ID (UC###)
+                Use Case ID (optional)
               </label>
               <input
                 type="text"
-                required
                 value={newId}
                 onChange={(e) => setNewId(e.target.value)}
-                placeholder="UC001"
+                placeholder="Leave empty: next free UC### is assigned on save"
                 style={{ width: '100%', padding: '0.5rem', backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '0.375rem', color: '#fff', fontSize: '0.85rem' }}
               />
             </div>

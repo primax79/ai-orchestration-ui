@@ -4508,11 +4508,12 @@ async def api_create_use_case(request: Request) -> JSONResponse:
     tasks_dir = state.tasks_dir(request)
     cmd = [
         "use-cases", "create",
-        "--id", str(body.get("id", "")),
         "--title", str(body.get("title", "")),
         "--tasks-dir", str(tasks_dir),
         "--json",
     ]
+    if str(body.get("id") or "").strip():
+        cmd.extend(["--id", str(body["id"]).strip()])  # empty: the engine assigns the next UC###
     for opt_field in ("actor", "status", "priority", "verification_type", "verification_command", "description", "preconditions", "scenario"):
         if body.get(opt_field):
             cmd.extend([f"--{opt_field.replace('_', '-')}", str(body[opt_field])])
@@ -4522,7 +4523,8 @@ async def api_create_use_case(request: Request) -> JSONResponse:
 
     code, data = await run_ai_orch(cmd)
     if code == 0:
-        await state.broadcast({"type": "use_cases_changed", "action": "created", "id": body.get("id")})
+        created_id = data.get("id") if isinstance(data, dict) else None
+        await state.broadcast({"type": "use_cases_changed", "action": "created", "id": created_id or body.get("id")})
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 400)
 
 
