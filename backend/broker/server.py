@@ -365,8 +365,10 @@ async def run_ai_orch_cli(
     if not bin_path.is_file():
         return 1, None, "", f"ai-orch CLI not found at {bin_path}"
 
-    cmd = [str(bin_path), *args]
+    cmd = [sys.executable, str(bin_path), *args]
     env = os.environ.copy()
+    py_dir = str(pathlib.Path(sys.executable).resolve().parent)
+    env["PATH"] = f"{py_dir}{os.pathsep}{env.get('PATH', '')}"
     env["AI_ORCHESTRATION_CONFIG"] = str(config_dir)
     env["AI_ORCH_BROKER_CHILD"] = "1"
 

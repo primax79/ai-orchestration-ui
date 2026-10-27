@@ -495,11 +495,6 @@ async def _run_ai_orch_process(args: list[str], timeout: float | None = None) ->
             else:
                 cmd_args = [*cmd_args, "--global-config", global_cfg]
 
-    if os.access(bin_path, os.X_OK):
-        cmd = [str(bin_path), *cmd_args]
-    else:
-        cmd = [sys.executable, str(bin_path), *cmd_args]
-
     if timeout is None:
         if any(action in cmd_args for action in ("install-skills", "register-mcp")):
             timeout = 600.0
@@ -507,8 +502,15 @@ async def _run_ai_orch_process(args: list[str], timeout: float | None = None) ->
             timeout = 60.0
 
     env = dict(os.environ)
+    py_dir = str(pathlib.Path(sys.executable).resolve().parent)
+    env["PATH"] = f"{py_dir}{os.pathsep}{env.get('PATH', '')}"
     if "AI_ORCHESTRATION_CONFIG" not in env:
         env["AI_ORCHESTRATION_CONFIG"] = str(get_config_dir() / "orchestration.toml")
+
+    if os.access(bin_path, os.X_OK):
+        cmd = [str(bin_path), *cmd_args]
+    else:
+        cmd = [sys.executable, str(bin_path), *cmd_args]
 
     try:
         proc = await asyncio.create_subprocess_exec(
