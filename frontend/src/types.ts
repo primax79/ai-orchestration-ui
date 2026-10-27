@@ -90,6 +90,8 @@ export interface TaskItem {
   profile?: CognitiveProfile;
   verification_mode?: VerificationMode;
   verifier?: string;
+  verify_by?: string | null;
+  'verify-by'?: string | null;
   file_path?: string;
   is_done?: boolean;
   bundle_sha256?: string;
@@ -1586,6 +1588,60 @@ export interface ProposedTaskEdits {
 
 export interface AcceptTriagePayload {
   edits?: Record<string | number, ProposedTaskEdits>;
+}
+
+export interface ValidateCloseTaskItem {
+  id: string;
+  task_id: string;
+  title: string;
+  short_title: string;
+  state: string;
+  raw_state?: string;
+  new_state?: string;
+  verify_by?: string | null;
+  verifier?: string;
+  path?: string[];
+  rel_path?: string;
+  task_hash?: string;
+}
+
+export interface ValidateClosePreviewPayload {
+  task_ids: string[];
+  note?: string;
+}
+
+export interface ValidateClosePreviewResponse {
+  ok: boolean;
+  dry_run?: boolean;
+  tasks: ValidateCloseTaskItem[];
+  task_ids: string[];
+  count: number;
+  verifier: string;
+  note?: string | null;
+  plan?: StructurePlanItem[];
+  plan_hash: string;
+  hash: string;
+  summary: string;
+  error?: string;
+}
+
+export interface ValidateCloseApplyPayload {
+  task_ids: string[];
+  note?: string;
+  expect_plan_hash?: string;
+  expect_task_hashes?: Record<string, string>;
+}
+
+export interface ValidateCloseApplyResponse {
+  ok: boolean;
+  applied: boolean;
+  count: number;
+  task_ids: string[];
+  verifier: string;
+  note?: string | null;
+  results: any[];
+  index_in_sync?: boolean;
+  error?: string;
 }
 
 /**

@@ -15,10 +15,12 @@ import {
   EyeOff,
   Pause,
   Play,
+  CheckCheck,
 } from 'lucide-react';
 import { TaskItem, TaskListResponse, TaskState, SharedFilterState, WorkspaceProjectInfo } from '../types';
 import { TaskDetailModal } from './TaskDetailModal';
 import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
+import { ValidateCloseDialog } from './ValidateCloseDialog';
 import { TimelineView } from './TimelineView';
 import { TaskTreeView } from './TaskTreeView';
 import { KindBadge, KIND_CONFIGS } from './KindBadge';
@@ -137,6 +139,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   const [syncConfirmData, setSyncConfirmData] = useState<(ConfirmDialogPreviewData & { title: string }) | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [sharedFilters, setSharedFilters] = useState<SharedFilterState>(getStoredSharedFilters);
+  const [validateCloseTargets, setValidateCloseTargets] = useState<TaskItem[] | null>(null);
 
   const tasks = data?.all_tasks || data?.emergent_tasks || [];
 
@@ -382,6 +385,26 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
   const droppedCards = filteredTasks.filter((t) => t.state === 'dropped');
   const closedCardsCount = doneCards.length + droppedCards.length;
 
+  const isLeafValidateCloseable = (t: TaskItem) =>
+    (t.state === 'delivered' || t.state === 'verified') &&
+    !t.is_container &&
+    t.node_type !== 'container' &&
+    t.node_type !== 'initiative' &&
+    t.is_leaf !== false &&
+    !t.id.startsWith('INIT-');
+
+  const actionableDeliveredCards = deliveredCards.filter(isLeafValidateCloseable);
+  const actionableVerifiedCards = verifiedCards.filter(isLeafValidateCloseable);
+  const actionableSplitCards = [...actionableDeliveredCards, ...actionableVerifiedCards];
+
+  const handleOpenValidateClose = (e: React.MouseEvent, list: TaskItem[]) => {
+    e.stopPropagation();
+    const targets = list.filter(isLeafValidateCloseable);
+    if (targets.length > 0) {
+      setValidateCloseTargets(targets);
+    }
+  };
+
   type KanbanColumnDef =
     | {
         id: string;
@@ -528,6 +551,31 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
             <KindBadge kind={effectiveKind} size={11} showLabel={true} />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', overflow: 'hidden' }}>
+            {isLeafValidateCloseable(t) && !isSubWorkspaceReadOnly && (
+              <button
+                type="button"
+                onClick={(e) => handleOpenValidateClose(e, [t])}
+                title="Validate & close task (mark done with verifier owner)"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '0.15rem 0.35rem',
+                  borderRadius: '0.2rem',
+                  border: '1px solid #10b981',
+                  backgroundColor: '#064e3b',
+                  color: '#a7f3d0',
+                  cursor: 'pointer',
+                  fontSize: '0.62rem',
+                  fontWeight: 600,
+                  gap: '0.2rem',
+                  flexShrink: 0,
+                }}
+              >
+                <CheckCheck size={10} />
+                <span>Validate &amp; close</span>
+              </button>
+            )}
             {!isClosedState(t.state) && t.state !== 'verified' && !isSubWorkspaceReadOnly && (
               <button
                 type="button"
@@ -1332,6 +1380,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                       alignItems: 'center',
                       backgroundColor: '#0f172a',
                       minWidth: 0,
+                      gap: '0.4rem',
                     }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minWidth: 0 }}>
                         <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: col.color, flexShrink: 0 }} />
@@ -1339,9 +1388,35 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                           {col.title}
                         </span>
                       </div>
-                      <span style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600, flexShrink: 0, marginLeft: '0.25rem' }}>
-                        {totalSplitCount}
-                      </span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}>
+                        {actionableSplitCards.length > 0 && !isSubWorkspaceReadOnly && (
+                          <button
+                            type="button"
+                            onClick={(e) => handleOpenValidateClose(e, actionableSplitCards)}
+                            title={`Validate & close ${actionableSplitCards.length} task(s)`}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.25rem',
+                              padding: '0.18rem 0.45rem',
+                              borderRadius: '0.25rem',
+                              border: '1px solid #10b981',
+                              backgroundColor: '#064e3b',
+                              color: '#a7f3d0',
+                              fontSize: '0.68rem',
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            <CheckCheck size={11} />
+                            <span>Validate &amp; close</span>
+                          </button>
+                        )}
+                        <span style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600 }}>
+                          {totalSplitCount}
+                        </span>
+                      </div>
                     </div>
 
                     {/* Split cards list */}
@@ -1349,15 +1424,46 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                       {/* Delivered sub-section */}
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
                         <div style={{
-                          fontSize: '0.72rem',
-                          fontWeight: 600,
-                          color: '#94a3b8',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: '0.35rem',
                           padding: '0.1rem 0.2rem',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
                         }}>
-                          Delivered — needs verification ({deliveredCards.length})
+                          <div style={{
+                            fontSize: '0.72rem',
+                            fontWeight: 600,
+                            color: '#94a3b8',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}>
+                            Delivered — needs verification ({deliveredCards.length})
+                          </div>
+                          {actionableDeliveredCards.length > 0 && !isSubWorkspaceReadOnly && (
+                            <button
+                              type="button"
+                              onClick={(e) => handleOpenValidateClose(e, actionableDeliveredCards)}
+                              title={`Validate & close ${actionableDeliveredCards.length} delivered task(s)`}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.2rem',
+                                padding: '0.12rem 0.4rem',
+                                borderRadius: '0.2rem',
+                                border: '1px solid #10b981',
+                                backgroundColor: '#064e3b',
+                                color: '#a7f3d0',
+                                fontSize: '0.65rem',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                                flexShrink: 0,
+                              }}
+                            >
+                              <CheckCheck size={10} />
+                              <span>Validate &amp; close</span>
+                            </button>
+                          )}
                         </div>
                         {deliveredCards.length > 0 ? (
                           renderCardListWithGrouping(deliveredCards, renderKanbanCard)
@@ -1374,15 +1480,46 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
                       {/* Verified sub-section */}
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
                         <div style={{
-                          fontSize: '0.72rem',
-                          fontWeight: 600,
-                          color: '#94a3b8',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: '0.35rem',
                           padding: '0.1rem 0.2rem',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
                         }}>
-                          Verified — ready to close ({verifiedCards.length})
+                          <div style={{
+                            fontSize: '0.72rem',
+                            fontWeight: 600,
+                            color: '#94a3b8',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}>
+                            Verified — ready to close ({verifiedCards.length})
+                          </div>
+                          {actionableVerifiedCards.length > 0 && !isSubWorkspaceReadOnly && (
+                            <button
+                              type="button"
+                              onClick={(e) => handleOpenValidateClose(e, actionableVerifiedCards)}
+                              title={`Validate & close ${actionableVerifiedCards.length} verified task(s)`}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.2rem',
+                                padding: '0.12rem 0.4rem',
+                                borderRadius: '0.2rem',
+                                border: '1px solid #10b981',
+                                backgroundColor: '#064e3b',
+                                color: '#a7f3d0',
+                                fontSize: '0.65rem',
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                                flexShrink: 0,
+                              }}
+                            >
+                              <CheckCheck size={10} />
+                              <span>Validate &amp; close</span>
+                            </button>
+                          )}
                         </div>
                         {verifiedCards.length > 0 ? (
                           renderCardListWithGrouping(verifiedCards, renderKanbanCard)
@@ -1502,6 +1639,22 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
           onApply={handleApplySync}
           onCancel={() => setSyncConfirmData(null)}
           onRefetchPreview={handleRefetchSyncPreview}
+        />
+      )}
+
+      {/* Validate & Close Confirmation Dialog */}
+      {validateCloseTargets && validateCloseTargets.length > 0 && (
+        <ValidateCloseDialog
+          isOpen={true}
+          tasks={validateCloseTargets}
+          project={validateCloseTargets[0]?.project || effectiveProject}
+          onClose={() => setValidateCloseTargets(null)}
+          onSuccess={(inSync) => {
+            if (inSync === false) {
+              setIndexOutOfSync(true);
+            }
+            onRefresh();
+          }}
         />
       )}
     </div>
