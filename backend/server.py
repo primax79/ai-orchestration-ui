@@ -2270,6 +2270,325 @@ async def api_transition_task(request: Request) -> JSONResponse:
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
+def _extract_validate_close_task_ids(body: dict[str, Any]) -> list[str]:
+    raw = body.get("task_ids")
+    if raw is None:
+        raw = body.get("tasks")
+    if raw is None and body.get("task_id"):
+        raw = [body.get("task_id")]
+    if raw is None and body.get("id"):
+        raw = [body.get("id")]
+    ids = _extract_dep_ids(raw)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for tid in ids:
+        if tid not in seen:
+            seen.add(tid)
+            ordered.append(tid)
+    return ordered
+
+
+def _compute_validate_close_plan_hash(items: list[dict[str, Any]]) -> str:
+    canonical = [
+        {
+            "id": it["id"],
+            "state": it["state"],
+            "task_hash": it.get("task_hash") or "",
+        }
+        for it in items
+    ]
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _inspect_validate_close_tasks(
+    tasks_dir: pathlib.Path,
+    task_ids: list[str],
+    note: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    if not task_ids:
+        return 400, {"ok": False, "error": "task_ids is required and must be non-empty"}
+
+    for tid in task_ids:
+        if not TASK_MUTATION_ID_RE.match(tid):
+            return 400, {"ok": False, "error": f"Invalid task id {tid!r}"}
+
+    list_code, list_data = await run_ai_orch(["tasks", "list", "--tasks-dir", str(tasks_dir), "--json"])
+    if list_code != 0 or not isinstance(list_data, dict):
+        return (504 if list_code == 504 else 500), (
+            list_data if isinstance(list_data, dict) else {"ok": False, "error": str(list_data)}
+        )
+
+    tree_map: dict[str, Any] = list_data.get("tree") or {}
+    all_tasks_list: list[dict[str, Any]] = list_data.get("all_tasks") or list_data.get("emergent_tasks") or []
+    tasks_by_id: dict[str, dict[str, Any]] = {
+        str(t.get("id")): t for t in all_tasks_list if isinstance(t, dict) and t.get("id")
+    }
+
+    items: list[dict[str, Any]] = []
+    plan: list[dict[str, Any]] = []
+
+    for tid in task_ids:
+        node = tree_map.get(tid) or tasks_by_id.get(tid)
+        if not node:
+            return 404, {"ok": False, "task_id": tid, "error": f"Task {tid!r} not found"}
+
+        if node.get("is_container") or node.get("is_leaf") is False:
+            return 400, {
+                "ok": False,
+                "task_id": tid,
+                "error": f"Task {tid!r} is a container with derived state; validate and close its leaf tasks instead.",
+            }
+
+        raw_state = str(node.get("state") or "").strip()
+        canon_state = str(node.get("canonical_state") or canonicalize_task_state(raw_state)).strip().lower()
+        if canon_state not in ("delivered", "verified"):
+            return 400, {
+                "ok": False,
+                "task_id": tid,
+                "state": raw_state,
+                "error": f"Task {tid!r} is in state {raw_state!r}; only 'delivered' or 'verified' tasks can be validated and closed.",
+            }
+
+        cmd = [
+            "tasks", "transition", tid, "done",
+            "--verifier", "owner",
+            "--dry-run",
+            "--tasks-dir", str(tasks_dir),
+            "--json",
+        ]
+        if note:
+            cmd.extend(["--reason", note])
+
+        dry_code, dry_data = await run_ai_orch(cmd)
+        if dry_code != 0 or not isinstance(dry_data, dict) or not dry_data.get("ok"):
+            err_msg = dry_data.get("error") if isinstance(dry_data, dict) else str(dry_data)
+            return map_cli_status(dry_code, dry_data), {
+                "ok": False,
+                "task_id": tid,
+                "error": err_msg or f"Dry-run transition failed for {tid}",
+            }
+
+        task_hash = str(
+            node.get("task_hash")
+            or node.get("bundle_sha256")
+            or node.get("task_bundle_sha256")
+            or dry_data.get("task_hash")
+            or dry_data.get("bundle_sha256")
+            or ""
+        )
+        title = str(node.get("title") or tid)
+        short_title = str(node.get("short_title") or node.get("short") or title)
+        verify_by = (
+            node.get("verify_by")
+            or node.get("verify-by")
+            or (tasks_by_id.get(tid) or {}).get("verify_by")
+            or (tasks_by_id.get(tid) or {}).get("verify-by")
+            or None
+        )
+        if isinstance(verify_by, str):
+            verify_by = verify_by.strip()
+            if not verify_by or verify_by == "-":
+                verify_by = None
+
+        path_steps = dry_data.get("path") or (
+            ["delivered", "verified", "done"] if canon_state == "delivered" else ["verified", "done"]
+        )
+        rel_path = str(dry_data.get("rel_path") or node.get("rel_path") or tid)
+        path_str = " -> ".join(str(s) for s in path_steps)
+
+        items.append({
+            "id": tid,
+            "task_id": tid,
+            "title": title,
+            "short_title": short_title,
+            "state": canon_state,
+            "raw_state": raw_state,
+            "new_state": dry_data.get("new_state", "done"),
+            "verify_by": verify_by,
+            "verifier": "owner",
+            "path": path_steps,
+            "rel_path": rel_path,
+            "task_hash": task_hash,
+        })
+        plan.append({
+            "action": "modify",
+            "task_id": tid,
+            "path": rel_path,
+            "reason": f"{tid} ({short_title}): {path_str} (verifier: owner)" + (f" — {note}" if note else ""),
+            "current_state": canon_state,
+            "state": f"{canon_state} -> done",
+            "before_sha256": task_hash,
+        })
+
+    plan_hash = _compute_validate_close_plan_hash(items)
+    summary = (
+        f"Validate and close {len(items)} task(s) as `owner`: "
+        + ", ".join(f"`{it['id']}` ({it['short_title']})" for it in items)
+    )
+    return 200, {
+        "ok": True,
+        "dry_run": True,
+        "tasks": items,
+        "task_ids": [it["id"] for it in items],
+        "count": len(items),
+        "verifier": "owner",
+        "note": note,
+        "plan": plan,
+        "plan_hash": plan_hash,
+        "hash": plan_hash,
+        "summary": summary,
+    }
+
+
+async def api_preview_validate_close(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if body.get("project") and not request.query_params.get("project"):
+        request.state.project = state.resolve_project(str(body["project"]))
+
+    task_ids = _extract_validate_close_task_ids(body)
+    note_raw = body.get("note") if body.get("note") is not None else body.get("reason")
+    note = str(note_raw).strip() if note_raw is not None and str(note_raw).strip() else None
+
+    tasks_dir = state.tasks_dir(request)
+    status_code, payload = await _inspect_validate_close_tasks(tasks_dir, task_ids, note=note)
+    return JSONResponse(payload, status_code=status_code)
+
+
+async def api_apply_validate_close(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if body.get("project") and not request.query_params.get("project"):
+        request.state.project = state.resolve_project(str(body["project"]))
+
+    task_ids = _extract_validate_close_task_ids(body)
+    note_raw = body.get("note") if body.get("note") is not None else body.get("reason")
+    note = str(note_raw).strip() if note_raw is not None and str(note_raw).strip() else None
+
+    expect_plan_hash = (
+        body.get("expect_plan_hash")
+        or body.get("expect_hash")
+        or body.get("plan_hash")
+        or body.get("hash")
+        or request.query_params.get("expect_plan_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-plan-hash")
+    )
+    expect_task_hashes = body.get("expect_task_hashes") or body.get("task_hashes")
+
+    tasks_dir = state.tasks_dir(request)
+    status_code, preview_payload = await _inspect_validate_close_tasks(tasks_dir, task_ids, note=note)
+    if status_code != 200:
+        if status_code == 400 and expect_plan_hash and "only 'delivered' or 'verified'" in str(preview_payload.get("error", "")):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": f"stale-plan: {preview_payload.get('error')}",
+                    "details": preview_payload,
+                },
+                status_code=409,
+            )
+        return JSONResponse(preview_payload, status_code=status_code)
+
+    current_plan_hash = preview_payload["plan_hash"]
+    items: list[dict[str, Any]] = preview_payload["tasks"]
+
+    if expect_plan_hash:
+        if str(expect_plan_hash).strip().lower() != current_plan_hash.lower():
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "stale-plan: task states or hashes changed since preview",
+                    "expected": str(expect_plan_hash).strip(),
+                    "actual": current_plan_hash,
+                    "tasks": items,
+                    "plan_hash": current_plan_hash,
+                    "hash": current_plan_hash,
+                },
+                status_code=409,
+            )
+
+    if isinstance(expect_task_hashes, dict):
+        for it in items:
+            tid = it["id"]
+            exp_h = expect_task_hashes.get(tid)
+            if exp_h and str(exp_h).strip().lower() != str(it.get("task_hash") or "").lower():
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "task_id": tid,
+                        "error": "stale-task: task hash changed since preview",
+                        "expected": str(exp_h).strip(),
+                        "actual": it.get("task_hash"),
+                    },
+                    status_code=409,
+                )
+
+    results: list[dict[str, Any]] = []
+    for it in items:
+        tid = it["id"]
+        cmd = [
+            "tasks", "transition", tid, "done",
+            "--verifier", "owner",
+            "--tasks-dir", str(tasks_dir),
+            "--json",
+        ]
+        if note:
+            cmd.extend(["--reason", note])
+        if it.get("task_hash"):
+            cmd.extend(["--expect-task-hash", str(it["task_hash"])])
+
+        code, data = await run_ai_orch(cmd)
+        if code != 0 or (isinstance(data, dict) and data.get("ok") is False):
+            err_status = map_cli_status(code, data)
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "task_id": tid,
+                    "error": data.get("error") if isinstance(data, dict) else str(data),
+                    "completed": results,
+                    "details": data,
+                },
+                status_code=err_status,
+            )
+        res_item = data if isinstance(data, dict) else {"ok": True, "task_id": tid, "new_state": "done"}
+        results.append(res_item)
+        await state.broadcast({
+            "type": "task_transitioned",
+            "task_id": tid,
+            "new_state": res_item.get("new_state", "done"),
+        })
+
+    check_code, check_data = await run_ai_orch(
+        ["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--check", "--json"]
+    )
+    in_sync = check_data.get("in_sync", False) if isinstance(check_data, dict) else False
+
+    await state.broadcast({"type": "changed", "areas": ["tasks"]})
+    await state.broadcast({"type": "tasks_changed"})
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "applied": True,
+            "count": len(results),
+            "task_ids": [it["id"] for it in items],
+            "verifier": "owner",
+            "note": note,
+            "results": results,
+            "index_in_sync": in_sync,
+        },
+        status_code=200,
+    )
+
+
 async def api_preview_sync_index(request: Request) -> JSONResponse:
     tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["tasks", "sync-index", "--tasks-dir", str(tasks_dir), "--check", "--json"])
@@ -5686,6 +6005,9 @@ routes = [
     Route("/api/tasks/{id}/reopen", api_reopen, methods=["POST"]),
     Route("/api/tasks/reopen/preview", api_preview_reopen, methods=["POST"]),
     Route("/api/tasks/reopen", api_reopen, methods=["POST"]),
+    Route("/api/tasks/validate-close/preview", api_preview_validate_close, methods=["POST"]),
+    Route("/api/tasks/validate-close/apply", api_apply_validate_close, methods=["POST"]),
+    Route("/api/tasks/validate-close", api_apply_validate_close, methods=["POST"]),
     Route("/api/tasks/transition", api_transition_task, methods=["POST"]),
     Route("/api/tasks/sync-index/preview", api_preview_sync_index, methods=["GET"]),
     Route("/api/tasks/sync-index", api_sync_index, methods=["POST"]),

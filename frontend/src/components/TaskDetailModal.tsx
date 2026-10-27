@@ -35,6 +35,7 @@ import { KindBadge } from './KindBadge';
 import { LabelList } from './LabelChip';
 import { LabelEditorModal } from './LabelEditorModal';
 import { PromoteDialog } from './PromoteDialog';
+import { ValidateCloseDialog } from './ValidateCloseDialog';
 import {
   ProjectChip,
   ConditionalBadge,
@@ -146,6 +147,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
 
   const [showLabelEditor, setShowLabelEditor] = useState(false);
   const [showPromoteDialog, setShowPromoteDialog] = useState(false);
+  const [showValidateCloseDialog, setShowValidateCloseDialog] = useState(false);
 
   // Sync currentTask when incoming prop changes
   useEffect(() => {
@@ -2338,6 +2340,26 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                         gap: '0.3rem',
                         padding: '0.4rem 0.8rem',
                         borderRadius: '0.375rem',
+                        border: '1px solid #10b981',
+                        backgroundColor: 'transparent',
+                        color: '#34d399',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {loading ? <Loader2 size={15} className="spin" /> : <CheckCircle size={15} />}
+                      <span>Approve (Verified)</span>
+                    </button>
+
+                    <button
+                      onClick={() => setShowValidateCloseDialog(true)}
+                      disabled={loading}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.3rem',
+                        padding: '0.4rem 0.8rem',
+                        borderRadius: '0.375rem',
                         border: 'none',
                         backgroundColor: '#10b981',
                         color: '#fff',
@@ -2346,14 +2368,14 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                       }}
                     >
                       {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
-                      <span>Approve (Verified)</span>
+                      <span>Validate &amp; close</span>
                     </button>
                   </>
                 )}
 
                 {currentTask.state === 'verified' && (
                   <button
-                    onClick={() => handleTransition('done', undefined, 'Completed and integrated')}
+                    onClick={() => setShowValidateCloseDialog(true)}
                     disabled={loading}
                     style={{
                       display: 'flex',
@@ -2369,7 +2391,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                     }}
                   >
                     {loading ? <Loader2 size={15} className="spin" /> : <CheckCheck size={15} />}
-                    <span>Close Task (Done)</span>
+                    <span>Validate &amp; close</span>
                   </button>
                 )}
               </>
@@ -2612,6 +2634,25 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
           onClose={() => setShowPromoteDialog(false)}
           onSuccess={() => {
             setShowPromoteDialog(false);
+            onActionComplete();
+            onClose();
+          }}
+        />
+      )}
+
+      {/* Validate & Close Dialog */}
+      {showValidateCloseDialog && (
+        <ValidateCloseDialog
+          isOpen={true}
+          tasks={[currentTask]}
+          project={taskProject}
+          onClose={() => setShowValidateCloseDialog(false)}
+          onSuccess={(inSync) => {
+            if (inSync === false) {
+              setIndexOutOfSync(true);
+              onIndexOutOfSync?.();
+            }
+            setShowValidateCloseDialog(false);
             onActionComplete();
             onClose();
           }}

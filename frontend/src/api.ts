@@ -54,6 +54,10 @@ import {
   NotificationsResponse,
   SetShortTitlePayload,
   SetShortTitleResponse,
+  ValidateClosePreviewPayload,
+  ValidateClosePreviewResponse,
+  ValidateCloseApplyPayload,
+  ValidateCloseApplyResponse,
 } from './types';
 
 export interface ProjectScopeOpts {
@@ -423,6 +427,34 @@ export const api = {
         reason,
         expect_task_hash: expectTaskHash,
       }),
+    }, proj);
+  },
+
+  async previewValidateClose(
+    payload: ValidateClosePreviewPayload,
+    opts?: string | ProjectScopeOpts | null
+  ): Promise<ValidateClosePreviewResponse> {
+    const proj = resolveExplicitProject(opts);
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<ValidateClosePreviewResponse>('previewValidateClose', payload, proj);
+    }
+    return apiFetch<ValidateClosePreviewResponse>('/api/tasks/validate-close/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }, proj);
+  },
+
+  async applyValidateClose(
+    payload: ValidateCloseApplyPayload,
+    opts?: string | ProjectScopeOpts | null
+  ): Promise<ValidateCloseApplyResponse> {
+    const proj = resolveExplicitProject(opts);
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<ValidateCloseApplyResponse>('applyValidateClose', payload, proj);
+    }
+    return apiFetch<ValidateCloseApplyResponse>('/api/tasks/validate-close/apply', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }, proj);
   },
 

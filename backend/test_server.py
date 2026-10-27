@@ -4120,5 +4120,158 @@ sys.exit(2)
         state.workspace = old_ws
 
 
+def test_validate_close_preview_and_apply(monkeypatch, tmp_path):
+    fake_config = tmp_path / "config"
+    fake_config.mkdir()
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(fake_config))
+
+    token = get_or_create_token()
+    headers = {"X-AI-Orch-Token": token}
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    tasks_dir = ws / "tasks"
+    tasks_dir.mkdir()
+    (tasks_dir / "00-INDEX.md").write_text("# Tasks Index\n", encoding="utf-8")
+
+    bin_path = os.environ.get("AI_ORCH_BIN", "/Users/Alfredo/works/ai-coding-tools/ai-orchestration/bin/ai-orch")
+
+    # Create 3 tasks: T001 (delivered), T002 (verified), T003 (open)
+    for title in ("First task", "Second task", "Third task"):
+        r = subprocess.run(
+            [
+                bin_path, "tasks", "new",
+                "--title", title,
+                "--goal", f"Goal for {title}",
+                "--priority-reason", "Test fixture",
+                "--step", "Implement feature",
+                "--verification", "Run tests",
+                "--category", "ui",
+                "--priority", "P2",
+                "--tasks-dir", str(tasks_dir),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(r.stdout).get("ok") is True
+
+    subprocess.run([bin_path, "tasks", "transition", "T001", "in progress", "--tasks-dir", str(tasks_dir), "--json"], check=True, capture_output=True)
+    subprocess.run([bin_path, "tasks", "transition", "T001", "delivered", "--verify-by", "owner", "--tasks-dir", str(tasks_dir), "--json"], check=True, capture_output=True)
+
+    subprocess.run([bin_path, "tasks", "transition", "T002", "in progress", "--tasks-dir", str(tasks_dir), "--json"], check=True, capture_output=True)
+    subprocess.run([bin_path, "tasks", "transition", "T002", "delivered", "--tasks-dir", str(tasks_dir), "--json"], check=True, capture_output=True)
+    subprocess.run([bin_path, "tasks", "transition", "T002", "verified", "--verifier", "owner", "--tasks-dir", str(tasks_dir), "--json"], check=True, capture_output=True)
+
+    old_ws = state.workspace
+    state.workspace = ws
+    try:
+        # 1. Unauthenticated requests rejected
+        assert client.post("/api/tasks/validate-close/preview", json={"task_ids": ["T001"]}).status_code == 401
+        assert client.post("/api/tasks/validate-close/apply", json={"task_ids": ["T001"]}).status_code == 401
+
+        # 2. Empty or invalid task_ids rejected with 400
+        assert client.post("/api/tasks/validate-close/preview", headers=headers, json={"task_ids": []}).status_code == 400
+        assert client.post("/api/tasks/validate-close/preview", headers=headers, json={"task_ids": ["BAD!!"]}).status_code == 400
+
+        # 3. Non-existent task rejected with 404
+        assert client.post("/api/tasks/validate-close/preview", headers=headers, json={"task_ids": ["T999"]}).status_code == 404
+
+        # 4. Task not in delivered/verified rejected with 400
+        res_open = client.post("/api/tasks/validate-close/preview", headers=headers, json={"task_ids": ["T001", "T003"]})
+        assert res_open.status_code == 400
+        assert "T003" in res_open.json().get("error", "")
+
+        # 5. Preview for T001 (delivered) and T002 (verified) succeeds without writing
+        res_prev = client.post(
+            "/api/tasks/validate-close/preview",
+            headers=headers,
+            json={"task_ids": ["T001", "T002"], "note": "Validated by owner in UI"},
+        )
+        assert res_prev.status_code == 200
+        prev_data = res_prev.json()
+        assert prev_data.get("ok") is True
+        assert prev_data.get("dry_run") is True
+        assert prev_data.get("count") == 2
+        assert prev_data.get("verifier") == "owner"
+        assert prev_data.get("note") == "Validated by owner in UI"
+        plan_hash = prev_data.get("plan_hash")
+        assert plan_hash
+        tasks_preview = prev_data.get("tasks", [])
+        assert len(tasks_preview) == 2
+        assert tasks_preview[0]["id"] == "T001"
+        assert tasks_preview[0]["state"] == "delivered"
+        assert tasks_preview[0]["verify_by"] == "owner"
+        assert tasks_preview[0]["path"] == ["delivered", "verified", "done"]
+        assert tasks_preview[1]["id"] == "T002"
+        assert tasks_preview[1]["state"] == "verified"
+        assert tasks_preview[1]["path"] == ["verified", "done"]
+
+        # Verify preview did not mutate task states on disk
+        show_t1_before = json.loads(
+            subprocess.run([bin_path, "tasks", "show", "T001", "--tasks-dir", str(tasks_dir), "--json"], capture_output=True, text=True, check=True).stdout
+        )
+        assert show_t1_before["task"]["canonical_state"] == "delivered"
+
+        # 6. Apply with mismatched expect_plan_hash -> 409
+        res_stale = client.post(
+            "/api/tasks/validate-close/apply",
+            headers=headers,
+            json={"task_ids": ["T001", "T002"], "note": "Validated by owner in UI", "expect_plan_hash": "deadbeef" * 8},
+        )
+        assert res_stale.status_code == 409
+        assert "stale-plan" in res_stale.json().get("error", "")
+
+        # 7. Apply with matching expect_plan_hash -> 200, transitions both to done with verifier owner and note
+        with client.websocket_connect(f"/ws?token={token}") as sock:
+            init_msg = sock.receive_json()
+            assert init_msg.get("type") == "connected"
+
+            res_apply = client.post(
+                "/api/tasks/validate-close/apply",
+                headers=headers,
+                json={"task_ids": ["T001", "T002"], "note": "Validated by owner in UI", "expect_plan_hash": plan_hash},
+            )
+            assert res_apply.status_code == 200
+            apply_data = res_apply.json()
+            assert apply_data.get("ok") is True
+            assert apply_data.get("applied") is True
+            assert apply_data.get("count") == 2
+            assert apply_data.get("verifier") == "owner"
+            assert apply_data.get("task_ids") == ["T001", "T002"]
+
+            # WebSocket events broadcast
+            ws_events = [sock.receive_json() for _ in range(4)]
+            event_types = [e.get("type") for e in ws_events]
+            assert "task_transitioned" in event_types
+            assert "changed" in event_types
+            assert "tasks_changed" in event_types
+
+        # Verify on disk that both T001 and T002 are now in done with verifier=owner and Log entry
+        for tid in ("T001", "T002"):
+            show_after = json.loads(
+                subprocess.run([bin_path, "tasks", "show", tid, "--tasks-dir", str(tasks_dir), "--json"], capture_output=True, text=True, check=True).stdout
+            )["task"]
+            assert show_after["state"] == "done"
+            assert show_after["canonical_state"] == "done"
+            assert show_after["in_done"] is True
+            file_text = pathlib.Path(show_after["file_path"]).read_text(encoding="utf-8")
+            assert "- state: done" in file_text
+            assert "- verifier: owner" in file_text
+            assert "Validated by owner in UI" in file_text
+
+        # 8. Re-applying on already closed tasks with old expect_plan_hash -> 409
+        res_reapply = client.post(
+            "/api/tasks/validate-close/apply",
+            headers=headers,
+            json={"task_ids": ["T001"], "expect_plan_hash": plan_hash},
+        )
+        assert res_reapply.status_code == 409
+    finally:
+        state.workspace = old_ws
+
+
+
 
 
