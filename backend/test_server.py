@@ -30,6 +30,22 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_test_environment(monkeypatch, tmp_path):
+    cfg_dir = tmp_path / "_isolated_config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    ws_dir = tmp_path / "_isolated_workspace"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(cfg_dir))
+    monkeypatch.delenv("AI_ORCHESTRATION_CONFIG", raising=False)
+    old_ws = state.workspace
+    state.workspace = ws_dir
+    try:
+        yield
+    finally:
+        state.workspace = old_ws
+
+
 client = TestClient(app)
 
 
@@ -814,8 +830,8 @@ def _create_sample_task(workspace: pathlib.Path, task_id: str = "T001", state_st
         "- decider: -\n"
         "- plan-hash: -\n\n"
         "## Goal\nSample goal\n\n"
-        "## Steps\n1. Step 1\n\n"
-        "## Verification\nSample verification\n"
+        "## Steps\n- [ ] Implement concrete sample feature\n\n"
+        "## Verification\n- [ ] Run pytest and verify exit code 0\n"
     )
     task_file.write_text(task_content, encoding="utf-8")
     return task_file
@@ -1302,8 +1318,8 @@ def _setup_runs_workspace(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatc
         "- decider: -\n"
         "- plan-hash: -\n\n"
         "## Goal\nSample goal\n\n"
-        "## Steps\n1. Step 1\n\n"
-        "## Verification\nSample verification\n",
+        "## Steps\n- [ ] Implement concrete sample feature\n\n"
+        "## Verification\n- [ ] Run pytest and verify exit code 0\n",
         encoding="utf-8",
     )
     subprocess.run(["git", "add", "."], cwd=str(ws), check=True)

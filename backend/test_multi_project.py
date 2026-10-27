@@ -46,6 +46,14 @@ except ImportError:
     from projects import ProjectResolver, UnknownProjectError, ProjectRequiredError, OutsideWorkspaceError
 
 
+@pytest.fixture(autouse=True)
+def _isolated_config(monkeypatch, tmp_path):
+    cfg_dir = tmp_path / "_isolated_config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("AI_ORCH_CONFIG_DIR", str(cfg_dir))
+    monkeypatch.delenv("AI_ORCHESTRATION_CONFIG", raising=False)
+
+
 @pytest.fixture
 def auth_headers():
     token = get_or_create_token()

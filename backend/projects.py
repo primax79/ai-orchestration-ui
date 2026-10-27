@@ -14,6 +14,7 @@ import pathlib
 import re
 import sqlite3
 import subprocess
+import sys
 from typing import Any, Callable
 
 logger = logging.getLogger("orchestration_projects")
@@ -712,44 +713,39 @@ class ProjectResolver:
         # Fallback to CLI if SQLite check didn't match
         if self.ai_orch_bin and self.ai_orch_bin.is_file():
             try:
-                cmd = [str(self.ai_orch_bin), "projects", "list", str(ws_path), "--json"]
+                cmd = [sys.executable, str(self.ai_orch_bin), "workspace", "show", str(ws_path), "--json"]
                 if self.config_dir:
                     cmd.extend(["--config-dir", str(self.config_dir)])
                 proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
                 if proc.returncode == 0:
                     data = json.loads(proc.stdout)
-                    if data.get("ok"):
-                        items = data.get("items", [])
+                    ws_info = data.get("workspace") if isinstance(data.get("workspace"), dict) else None
+                    cpath = pathlib.Path(ws_info["canonical_path"]).resolve() if ws_info and ws_info.get("canonical_path") else None
+                    if data.get("ok") and ws_info and cpath == ws_path.resolve():
                         projects = []
                         sub_workspaces = []
                         has_workspace_slug = False
-                        for item in items:
-                            kind = item.get("kind", "project")
-                            slug = item.get("slug")
-                            rel_p = item.get("path") or "."
+                        for pr in ws_info.get("projects", []):
+                            slug = pr.get("slug")
+                            rel_p = pr.get("rel_path") or pr.get("path") or "."
                             rel_posix = str(rel_p).replace("\\", "/")
                             name_p = "_workspace" if slug == "_workspace" else pathlib.PurePosixPath(rel_posix).name
                             if not disc_filter.allows_project(rel_posix, name_p, slug):
                                 continue
-                            p_root = (ws_path / rel_p).resolve()
-                            if kind == "sub_workspace":
-                                sub_workspaces.append({
-                                    "uuid": item.get("uuid"),
-                                    "slug": slug,
-                                    "path": rel_p,
-                                    "kind": "sub_workspace",
-                                })
+                            if slug == "_workspace":
+                                has_workspace_slug = True
+                                kind = "_workspace"
                             else:
-                                if slug == "_workspace":
-                                    has_workspace_slug = True
-                                projects.append(ProjectInfo(
-                                    id=slug,
-                                    path=rel_p,
-                                    kind=kind,
-                                    root=p_root,
-                                    tasks_dir=p_root / "tasks",
-                                    uuid=item.get("uuid"),
-                                ))
+                                kind = "project"
+                            p_root = (ws_path / rel_p).resolve()
+                            projects.append(ProjectInfo(
+                                id=slug,
+                                path=rel_p,
+                                kind=kind,
+                                root=p_root,
+                                tasks_dir=p_root / "tasks",
+                                uuid=pr.get("uuid"),
+                            ))
 
                         if (
                             not has_workspace_slug
@@ -763,9 +759,30 @@ class ProjectResolver:
                                 root=ws_path,
                                 tasks_dir=ws_path / "tasks",
                             ))
+
+                        for sw in ws_info.get("sub_workspaces", []):
+                            sw_cpath = pathlib.Path(sw.get("canonical_path") or "").resolve()
+                            if ws_path in sw_cpath.parents:
+                                rel_ow = sw_cpath.relative_to(ws_path).as_posix()
+                                if not disc_filter.allows_project(rel_ow, sw_cpath.name, sw.get("slug", "")):
+                                    continue
+                                sub_workspaces.append({
+                                    "uuid": sw.get("uuid"),
+                                    "slug": sw.get("slug"),
+                                    "path": str(sw_cpath.relative_to(ws_path)),
+                                    "kind": "sub_workspace",
+                                })
+                                projects.append(ProjectInfo(
+                                    id=sw["slug"],
+                                    path=str(sw_cpath.relative_to(ws_path)),
+                                    kind="sub_workspace",
+                                    root=sw_cpath,
+                                    tasks_dir=sw_cpath / "tasks",
+                                    uuid=sw.get("uuid"),
+                                ))
                         return "registered", projects, sub_workspaces
             except Exception as e:
-                logger.debug("CLI projects list failed: %s", e)
+                logger.debug("CLI workspace show failed: %s", e)
 
         return None
 
