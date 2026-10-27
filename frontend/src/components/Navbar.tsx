@@ -363,7 +363,10 @@ export const Navbar: React.FC<NavbarProps> = ({
                 const open = (counts.open || 0) + (counts.todo || 0) + (counts.bounced || 0);
                 const progress = (counts['in progress'] || 0) + (counts.in_progress || 0) + (counts.delivered || 0) + (counts.verified || 0);
                 const nonClosed = waiting + open + progress;
-                return { waiting, open, progress, nonClosed };
+                const closed = (counts.done || 0) + (counts['done with a caveat'] || 0) + (counts.dropped || 0);
+                // Every task, closed included: a project with only closed tasks is not empty (owner 2026-10-27).
+                const total = Object.values(counts).reduce<number>((a, v) => a + (typeof v === 'number' ? v : 0), 0);
+                return { waiting, open, progress, nonClosed, closed, total };
               };
               const totals = workspace.projects.reduce(
                 (acc, p) => {
@@ -389,7 +392,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               const isProjectEmpty = (p: (typeof workspace.projects)[number]) => {
                 if (p.kind === '_workspace') return false;
                 const pc = getProjActiveCounts(p.counts);
-                return pc.nonClosed === 0;
+                return pc.total === 0;
               };
               const emptyProjectsCount = sortedProjects.filter((p) => isProjectEmpty(p)).length;
               const nonEmptyProjects = sortedProjects.filter(
@@ -447,7 +450,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                       const subTag = p.kind === 'sub_workspace' ? ' [sub_workspace]' : '';
                       return (
                         <option key={p.id} value={p.id}>
-                          {p.id}{subTag} — {pc.nonClosed} (waiting: {pc.waiting}, open: {pc.open}, progress: {pc.progress})
+                          {p.id}{subTag} — {pc.nonClosed} (waiting: {pc.waiting}, open: {pc.open}, progress: {pc.progress}{pc.closed ? `, closed: ${pc.closed}` : ''})
                         </option>
                       );
                     })}

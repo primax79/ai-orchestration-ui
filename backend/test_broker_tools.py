@@ -115,14 +115,14 @@ Initial core setup goal description.
 
     # Register workspace
     p_prev = subprocess.run(
-        [str(bin_path), "workspace", "register", str(ws_dir), "--id", "test-ws", "--title", "Test Workspace", "--config-dir", str(cfg_dir), "--json"],
+        [sys.executable, str(bin_path), "workspace", "register", str(ws_dir), "--id", "test-ws", "--title", "Test Workspace", "--config-dir", str(cfg_dir), "--json"],
         capture_output=True,
         text=True,
         check=True,
     )
     plan_hash = json.loads(p_prev.stdout)["plan_hash"]
     subprocess.run(
-        [str(bin_path), "workspace", "register", str(ws_dir), "--id", "test-ws", "--title", "Test Workspace", "--apply", "--expect-hash", plan_hash, "--config-dir", str(cfg_dir), "--json"],
+        [sys.executable, str(bin_path), "workspace", "register", str(ws_dir), "--id", "test-ws", "--title", "Test Workspace", "--apply", "--expect-hash", plan_hash, "--config-dir", str(cfg_dir), "--json"],
         capture_output=True,
         text=True,
         check=True,
@@ -130,14 +130,14 @@ Initial core setup goal description.
 
     # Discover projects
     p_disc = subprocess.run(
-        [str(bin_path), "projects", "discover", "test-ws", "--config-dir", str(cfg_dir), "--json"],
+        [sys.executable, str(bin_path), "projects", "discover", "test-ws", "--config-dir", str(cfg_dir), "--json"],
         capture_output=True,
         text=True,
         check=True,
     )
     disc_hash = json.loads(p_disc.stdout)["plan_hash"]
     subprocess.run(
-        [str(bin_path), "projects", "discover", "test-ws", "--apply", "--expect-hash", disc_hash, "--config-dir", str(cfg_dir), "--json"],
+        [sys.executable, str(bin_path), "projects", "discover", "test-ws", "--apply", "--expect-hash", disc_hash, "--config-dir", str(cfg_dir), "--json"],
         capture_output=True,
         text=True,
         check=True,
@@ -1276,14 +1276,14 @@ Workspace coordination goal.
 
     # Re-run projects discover so pkg-b is registered in config
     p_disc = subprocess.run(
-        [str(bin_path), "projects", "discover", "test-ws", "--config-dir", str(cfg_dir), "--json"],
+        [sys.executable, str(bin_path), "projects", "discover", "test-ws", "--config-dir", str(cfg_dir), "--json"],
         capture_output=True,
         text=True,
         check=True,
     )
     disc_hash = json.loads(p_disc.stdout)["plan_hash"]
     subprocess.run(
-        [str(bin_path), "projects", "discover", "test-ws", "--apply", "--expect-hash", disc_hash, "--config-dir", str(cfg_dir), "--json"],
+        [sys.executable, str(bin_path), "projects", "discover", "test-ws", "--apply", "--expect-hash", disc_hash, "--config-dir", str(cfg_dir), "--json"],
         capture_output=True,
         text=True,
         check=True,
