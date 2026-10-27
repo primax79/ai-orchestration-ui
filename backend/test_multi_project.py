@@ -829,7 +829,9 @@ def test_common_view_carries_conditional_tasks(auth_headers):
             assert t1["conditional"] is True
             assert t1["conditions"][0]["id"] == "Q001"
             assert t1["conditions"][0]["decider"] == "owner"
-            assert t1["conditions"][0]["age_days"] == 9
+            # Expected age computed at assert time: the run may cross midnight after `asked` was written.
+            import datetime as _dt
+            assert t1["conditions"][0]["age_days"] == (_dt.date.today() - _dt.date.fromisoformat(asked)).days
             other = next(t for t in items if t["qualified_id"] == "proj-a/01.1")
             assert "conditional" not in other
 
