@@ -858,6 +858,10 @@ export interface UseCaseItem {
   verification_type: UseCaseVerificationType;
   last_tested?: string | null;
   last_verdict?: UseCaseVerdict | null;
+  approved_by?: string | null;
+  approved?: string | null;
+  approved_date?: string | null;
+  'approved-by'?: string | null;
   description?: string;
   preconditions?: string;
   scenario?: string;
@@ -873,6 +877,88 @@ export interface TaskUseCasesPayload {
   use_cases: string[];
   action: 'link' | 'unlink';
   expect_plan_hash?: string;
+}
+
+export interface UseCaseApprovalPayload {
+  action: 'approve' | 'deprecate' | 'propose';
+  ids?: string[];
+  stage?: string;
+  approval?: string;
+  all?: boolean;
+  reason?: string;
+  expect_plan_hash?: string;
+}
+
+export interface UseCaseApprovalChangeItem {
+  id: string;
+  use_case_id?: string;
+  title?: string;
+  path?: string;
+  old_approval?: string;
+  new_approval?: string;
+  from?: string;
+  to?: string;
+  stage?: string;
+  changed?: boolean;
+  approved_by?: string | null;
+  approved?: string | null;
+  summary?: string;
+}
+
+export interface UseCaseApprovalResponse {
+  ok: boolean;
+  applied?: boolean;
+  dry_run?: boolean;
+  changed?: boolean;
+  action?: 'approve' | 'deprecate' | 'propose';
+  target_approval?: string;
+  by?: string;
+  reason?: string | null;
+  approved_date?: string | null;
+  use_cases?: UseCaseApprovalChangeItem[];
+  use_case_changes?: UseCaseApprovalChangeItem[];
+  unchanged?: UseCaseApprovalChangeItem[];
+  matched_count?: number;
+  changed_count?: number;
+  plan?: Array<{
+    action: string;
+    before_hash?: string;
+    path: string;
+    summary?: string;
+  }>;
+  plan_hash?: string;
+  diff?: string;
+  error?: string;
+}
+
+export function buildApprovalSummary(res: UseCaseApprovalResponse): string {
+  const target = res.target_approval || res.action || 'updated';
+  const changedList = res.use_cases || res.use_case_changes || [];
+  const actuallyChanged = changedList.filter((u) => u.changed !== false);
+  const unchanged = changedList.filter((u) => u.changed === false);
+
+  let md = `Changing approval to **${target}** for **${changedList.length}** use case(s):\n\n`;
+  if (actuallyChanged.length > 0) {
+    md += `### Changes (${actuallyChanged.length})\n\n`;
+    for (const uc of actuallyChanged) {
+      const from = uc.from || uc.old_approval || 'unknown';
+      const to = uc.to || uc.new_approval || target;
+      const stageStr = uc.stage ? ` (stage: *${uc.stage}*)` : '';
+      md += `- **${uc.id}**${uc.title ? ` (${uc.title})` : ''}: \`${from}\` → \`${to}\`${stageStr}\n`;
+    }
+    md += '\n';
+  } else {
+    md += `*No changes required (already ${target}).*\n\n`;
+  }
+
+  if (unchanged.length > 0 && actuallyChanged.length > 0) {
+    md += `### Unchanged (${unchanged.length})\n\n`;
+    for (const uc of unchanged) {
+      md += `- **${uc.id}**${uc.title ? ` (${uc.title})` : ''}: already \`${uc.old_approval || target}\`\n`;
+    }
+  }
+
+  return md;
 }
 
 export interface UseCaseQueueItem {

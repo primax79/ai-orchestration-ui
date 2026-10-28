@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { X, Play, Loader2, CheckCircle2, AlertTriangle, RefreshCw } from 'lucide-react';
+import { X, Play, Loader2, CheckCircle2, AlertTriangle, RefreshCw, RotateCcw } from 'lucide-react';
 import {
   UseCaseItem,
+  UseCaseApprovalResponse,
+  buildApprovalSummary,
   TaskItem,
   shortTitle,
   getUseCaseStage,
@@ -9,7 +11,7 @@ import {
   getUseCaseApprovalStyle,
 } from '../types';
 import { api, useProject } from '../api';
-import { ConfirmDialog } from './ConfirmDialog';
+import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 
 interface UseCaseDetailModalProps {
   useCase: UseCaseItem;
@@ -50,6 +52,12 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
     progress?: string;
   } | null>(null);
   const [showForceConfirm, setShowForceConfirm] = useState(false);
+  const [approving, setApproving] = useState(false);
+  const [approvalConfirmData, setApprovalConfirmData] = useState<{
+    action: 'approve' | 'deprecate' | 'propose';
+    title: string;
+    preview: UseCaseApprovalResponse;
+  } | null>(null);
 
   const reloadDetail = useCallback(async () => {
     try {
@@ -97,6 +105,58 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
     } finally {
       setValidating(false);
     }
+  };
+
+  const handleTriggerApproval = async (action: 'approve' | 'deprecate' | 'propose') => {
+    setApproving(true);
+    try {
+      const res = await api.previewUseCaseApproval({ action, ids: [currentUc.id] }, targetProject);
+      const actionLabels = {
+        approve: 'Approve',
+        deprecate: 'Deprecate',
+        propose: 'Move Back to Proposed for',
+      };
+      setApprovalConfirmData({
+        action,
+        title: `${actionLabels[action]} Use Case ${currentUc.id}`,
+        preview: res,
+      });
+    } catch (e: any) {
+      alert(`Approval preview error: ${e?.message || e}`);
+    } finally {
+      setApproving(false);
+    }
+  };
+
+  const handleApplyApproval = async (planHash?: string) => {
+    if (!approvalConfirmData) return;
+    const { action } = approvalConfirmData;
+    await api.applyUseCaseApproval(
+      {
+        action,
+        ids: [currentUc.id],
+        expect_plan_hash: planHash,
+      },
+      targetProject
+    );
+    setApprovalConfirmData(null);
+    await reloadDetail();
+    onRefresh();
+  };
+
+  const handleRefetchApprovalPreview = async (): Promise<ConfirmDialogPreviewData> => {
+    if (!approvalConfirmData) return {};
+    const res = await api.previewUseCaseApproval(
+      { action: approvalConfirmData.action, ids: [currentUc.id] },
+      targetProject
+    );
+    setApprovalConfirmData((prev) => (prev ? { ...prev, preview: res } : null));
+    return {
+      summary: buildApprovalSummary(res),
+      plan: res.plan,
+      diff: res.diff,
+      hash: res.plan_hash,
+    };
   };
 
   const stage = getUseCaseStage(currentUc);
@@ -212,6 +272,12 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
                   approved
                 </span>
               )}
+              {(currentUc.approved_by || (currentUc as any)['approved-by']) && (
+                <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>
+                  by <strong>{currentUc.approved_by || (currentUc as any)['approved-by']}</strong>
+                  {(currentUc.approved || currentUc.approved_date) ? ` on ${currentUc.approved || currentUc.approved_date}` : ''}
+                </span>
+              )}
               {isRevalidationPending && (
                 <span style={{
                   display: 'inline-flex',
@@ -261,6 +327,18 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
             <div>
               <div style={{ color: '#64748b', fontSize: '0.72rem', textTransform: 'uppercase', fontWeight: 600 }}>Approval</div>
               <div style={{ fontWeight: 600, color: approvalStyle.color }}>{approval}</div>
+            </div>
+            <div>
+              <div style={{ color: '#64748b', fontSize: '0.72rem', textTransform: 'uppercase', fontWeight: 600 }}>Approved By</div>
+              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>
+                {currentUc.approved_by || (currentUc as any)['approved-by'] || '—'}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: '#64748b', fontSize: '0.72rem', textTransform: 'uppercase', fontWeight: 600 }}>Approved Date</div>
+              <div style={{ fontWeight: 500, color: '#f1f5f9' }}>
+                {currentUc.approved || currentUc.approved_date || '—'}
+              </div>
             </div>
             <div>
               <div style={{ color: '#64748b', fontSize: '0.72rem', textTransform: 'uppercase', fontWeight: 600 }}>Priority</div>
@@ -561,7 +639,82 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
             {currentUc.rel_path}
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            {/* Approval state transition buttons */}
+            <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center', marginRight: '0.5rem' }}>
+              <button
+                type="button"
+                onClick={() => handleTriggerApproval('approve')}
+                disabled={approving || approval === 'approved'}
+                title={approval === 'approved' ? 'Already approved' : 'Approve this use case'}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.45rem 0.75rem',
+                  borderRadius: '0.375rem',
+                  border: approval === 'approved' ? '1px solid #065f46' : '1px solid #059669',
+                  backgroundColor: approval === 'approved' ? 'rgba(6, 78, 59, 0.4)' : '#065f46',
+                  color: approval === 'approved' ? '#6ee7b7' : '#fff',
+                  fontSize: '0.82rem',
+                  fontWeight: 600,
+                  cursor: (approving || approval === 'approved') ? 'not-allowed' : 'pointer',
+                  opacity: (approving || approval === 'approved') ? 0.6 : 1,
+                }}
+              >
+                <CheckCircle2 size={14} />
+                <span>Approve</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleTriggerApproval('deprecate')}
+                disabled={approving || approval === 'deprecated'}
+                title={approval === 'deprecated' ? 'Already deprecated' : 'Deprecate this use case'}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.45rem 0.75rem',
+                  borderRadius: '0.375rem',
+                  border: approval === 'deprecated' ? '1px solid #7f1d1d' : '1px solid #dc2626',
+                  backgroundColor: approval === 'deprecated' ? 'rgba(127, 29, 29, 0.4)' : '#7f1d1d',
+                  color: approval === 'deprecated' ? '#fca5a5' : '#fff',
+                  fontSize: '0.82rem',
+                  fontWeight: 600,
+                  cursor: (approving || approval === 'deprecated') ? 'not-allowed' : 'pointer',
+                  opacity: (approving || approval === 'deprecated') ? 0.6 : 1,
+                }}
+              >
+                <AlertTriangle size={14} />
+                <span>Deprecate</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleTriggerApproval('propose')}
+                disabled={approving || approval === 'proposed'}
+                title={approval === 'proposed' ? 'Already proposed' : 'Move back to proposed'}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.45rem 0.75rem',
+                  borderRadius: '0.375rem',
+                  border: '1px solid #475569',
+                  backgroundColor: '#334155',
+                  color: '#cbd5e1',
+                  fontSize: '0.82rem',
+                  fontWeight: 600,
+                  cursor: (approving || approval === 'proposed') ? 'not-allowed' : 'pointer',
+                  opacity: (approving || approval === 'proposed') ? 0.6 : 1,
+                }}
+              >
+                <RotateCcw size={14} />
+                <span>Back to proposed</span>
+              </button>
+            </div>
+
             {notReadyConflict && (
               <button
                 type="button"
@@ -622,6 +775,29 @@ export const UseCaseDetailModal: React.FC<UseCaseDetailModalProps> = ({
             await handleValidate(true);
           }}
           onCancel={() => setShowForceConfirm(false)}
+        />
+      )}
+
+      {/* Confirmation dialog for Approval change preview */}
+      {approvalConfirmData && (
+        <ConfirmDialog
+          isOpen={true}
+          title={approvalConfirmData.title}
+          summary={buildApprovalSummary(approvalConfirmData.preview)}
+          plan={approvalConfirmData.preview.plan}
+          diff={approvalConfirmData.preview.diff}
+          hash={approvalConfirmData.preview.plan_hash}
+          applyButtonText={
+            approvalConfirmData.action === 'approve'
+              ? 'Approve'
+              : approvalConfirmData.action === 'deprecate'
+              ? 'Deprecate'
+              : 'Back to proposed'
+          }
+          danger={approvalConfirmData.action === 'deprecate'}
+          onApply={handleApplyApproval}
+          onCancel={() => setApprovalConfirmData(null)}
+          onRefetchPreview={handleRefetchApprovalPreview}
         />
       )}
     </div>
