@@ -426,7 +426,7 @@ _READ_ONLY_PREFIXES = {
     ("tasks", "list"), ("tasks", "validate"), ("tasks", "graph"), ("questions", "list"), ("questions", "show"),
     ("inbox", "list"), ("inbox", "show"), ("config", "show"), ("env", "status"),
     ("run", "list"), ("run", "show"), ("run", "logs"), ("run", "options"),
-    ("use-cases", "list"), ("use-cases", "show"),
+    ("use-cases", "list"), ("use-cases", "show"), ("use-cases", "queue"),
     ("events", "tail"), ("events", "stats"),
     ("sessions", "list"), ("sessions", "show"), ("sessions", "role"),
     ("triggers", "list"), ("triggers", "status"), ("triggers", "history"),
@@ -562,6 +562,8 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
             "stale-note",
             "plan-hash-mismatch",
             "task-hash-mismatch",
+            "use_case_failing",
+            "not_ready",
         ) or reason in (
             "stale-task",
             "stale-task-hash",
@@ -576,6 +578,8 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
             "target-head-drift",
             "same-task-active",
             "active-chain-run",
+            "use_case_failing",
+            "not_ready",
         ):
             return 409
         if data.get("error") in (
@@ -614,6 +618,10 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "already has an active run" in err_str
         or "active-chain-run" in err_str
         or "references the same worktree" in err_str
+        or "use_case_failing" in err_str
+        or "use case(s) failing" in err_str
+        or "not_ready" in err_str
+        or "not ready" in err_str
     ):
         return 409
 
@@ -1789,6 +1797,91 @@ async def api_set_short(request: Request) -> JSONResponse:
     return await _handle_set_short(request, is_preview=False)
 
 
+async def _handle_task_use_cases(request: Request, is_preview: bool = False) -> JSONResponse:
+    task_id = request.path_params.get("id") or request.path_params.get("task_id", "")
+    if not TASK_MUTATION_ID_RE.match(task_id):
+        return JSONResponse({"error": f"Invalid task id {task_id!r}"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if body.get("dry_run") or body.get("preview") or request.query_params.get("dry_run"):
+        is_preview = True
+
+    action = body.get("action", "link")
+    if action not in ("link", "unlink"):
+        return JSONResponse({"error": "action must be 'link' or 'unlink'"}, status_code=400)
+
+    raw_ucs = body.get("use_cases")
+    if raw_ucs is None and body.get("use_case"):
+        raw_ucs = body.get("use_case")
+
+    if isinstance(raw_ucs, list):
+        uc_list = [str(u).strip() for u in raw_ucs if str(u).strip()]
+    elif isinstance(raw_ucs, str):
+        uc_list = [u.strip() for u in raw_ucs.split(",") if u.strip()]
+    else:
+        uc_list = []
+
+    if not uc_list:
+        return JSONResponse({"error": "use_cases is required"}, status_code=400)
+
+    expect_plan_hash = (
+        body.get("expect_plan_hash")
+        or body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or body.get("plan_hash")
+        or request.query_params.get("expect_plan_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-plan-hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required"}, status_code=400)
+
+    subcmd = "link" if action == "link" else "unlink"
+    tasks_dir = state.tasks_dir(request)
+    cmd = ["tasks", subcmd, task_id, *uc_list, "--tasks-dir", str(tasks_dir), "--json"]
+    if is_preview:
+        cmd.append("--preview")
+    else:
+        cmd.append("--apply")
+        cmd.extend(["--expect-plan-hash", str(expect_plan_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({
+                "type": "use_cases_changed",
+                "action": action,
+                "task_id": task_id,
+                "use_cases": uc_list,
+            })
+            await state.broadcast({
+                "type": "tasks_updated",
+                "task_id": task_id,
+            })
+            await state.broadcast({
+                "type": "changed",
+                "areas": ["tasks"],
+            })
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_task_use_cases(request: Request) -> JSONResponse:
+    return await _handle_task_use_cases(request, is_preview=True)
+
+
+async def api_apply_task_use_cases(request: Request) -> JSONResponse:
+    return await _handle_task_use_cases(request, is_preview=False)
+
+
 async def api_list_labels(request: Request) -> JSONResponse:
     tasks_dir = state.tasks_dir(request)
     if not tasks_dir.is_dir():
@@ -2254,6 +2347,8 @@ async def api_transition_task(request: Request) -> JSONResponse:
         cmd.extend(["--expect-task-hash", str(body["expect_task_hash"])])
     if body.get("force_unblock"):
         cmd.append("--force-unblock")
+    if body.get("owner_approved"):
+        cmd.append("--owner-approved")
 
     code, data = await run_ai_orch(cmd)
     if code == 0:
@@ -2267,6 +2362,13 @@ async def api_transition_task(request: Request) -> JSONResponse:
 
         await state.broadcast({"type": "task_transitioned", "task_id": task_id, "new_state": new_state})
         return JSONResponse(data if isinstance(data, dict) else {"ok": True, "index_in_sync": in_sync}, status_code=200)
+
+    if isinstance(data, dict) and (
+        data.get("reason") == "use_case_failing"
+        or "use_case_failing" in str(data.get("error", "")).lower()
+        or data.get("use_case_ids") is not None
+    ):
+        return JSONResponse(data, status_code=409)
 
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -4822,14 +4924,36 @@ async def api_inbox_to_task(request: Request) -> JSONResponse:
 async def api_list_use_cases(request: Request) -> JSONResponse:
     tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["use-cases", "list", "--tasks-dir", str(tasks_dir), "--json"])
-    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 500)
+    if code != 0 or not isinstance(data, dict):
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    for uc in data.get("use_cases", []):
+        if isinstance(uc, dict):
+            if "status" not in uc or uc["status"] is None:
+                uc["status"] = uc.get("stage")
+    return JSONResponse(data, status_code=200)
+
+
+async def api_get_use_cases_queue(request: Request) -> JSONResponse:
+    tasks_dir = state.tasks_dir(request)
+    code, data = await run_ai_orch(["use-cases", "queue", "--tasks-dir", str(tasks_dir), "--json"])
+    if code != 0 or not isinstance(data, dict):
+        status_code = map_cli_status(code, data)
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+    return JSONResponse(data, status_code=200)
 
 
 async def api_get_use_case(request: Request) -> JSONResponse:
-    uc_id = request.path_params["uc_id"]
+    uc_id = request.path_params.get("id") or request.path_params.get("uc_id", "")
     tasks_dir = state.tasks_dir(request)
     code, data = await run_ai_orch(["use-cases", "show", uc_id, "--tasks-dir", str(tasks_dir), "--json"])
-    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200 if code == 0 else 404)
+    if code != 0 or not isinstance(data, dict):
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=404)
+    uc = data.get("use_case")
+    if isinstance(uc, dict):
+        if "status" not in uc or uc["status"] is None:
+            uc["status"] = uc.get("stage")
+    return JSONResponse(data, status_code=200)
 
 
 async def api_create_use_case(request: Request) -> JSONResponse:
@@ -4843,7 +4967,7 @@ async def api_create_use_case(request: Request) -> JSONResponse:
     ]
     if str(body.get("id") or "").strip():
         cmd.extend(["--id", str(body["id"]).strip()])  # empty: the engine assigns the next UC###
-    for opt_field in ("actor", "status", "priority", "verification_type", "verification_command", "description", "preconditions", "scenario"):
+    for opt_field in ("actor", "status", "approval", "priority", "verification_type", "verification_command", "description", "preconditions", "scenario"):
         if body.get(opt_field):
             cmd.extend([f"--{opt_field.replace('_', '-')}", str(body[opt_field])])
     if body.get("linked_tasks"):
@@ -4858,7 +4982,7 @@ async def api_create_use_case(request: Request) -> JSONResponse:
 
 
 async def api_validate_use_case(request: Request) -> JSONResponse:
-    uc_id = request.path_params["uc_id"]
+    uc_id = request.path_params.get("id") or request.path_params.get("uc_id", "")
     tasks_dir = state.tasks_dir(request)
     body = {}
     try:
@@ -4869,9 +4993,25 @@ async def api_validate_use_case(request: Request) -> JSONResponse:
     actor = str(body.get("actor", "automated-probe"))
 
     cmd = ["use-cases", "validate", uc_id, "--timeout", timeout, "--actor", actor, "--tasks-dir", str(tasks_dir), "--json"]
+    if body.get("force"):
+        cmd.append("--force")
+
     code, data = await run_ai_orch(cmd)
-    await state.broadcast({"type": "use_cases_changed", "action": "validated", "id": uc_id})
-    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200)
+
+    reason = str(data.get("reason", "")) if isinstance(data, dict) else ""
+    err_str = f"{data.get('error', '')} {data.get('message', '')} {reason}".lower() if isinstance(data, dict) else str(data).lower()
+    if code == 2 or reason == "not_ready" or "not ready" in err_str:
+        return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=409)
+
+    if code == 0 or (isinstance(data, dict) and data.get("ok") and "verdict" in data):
+        await state.broadcast({"type": "use_cases_changed", "action": "validated", "id": uc_id})
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    if isinstance(data, dict) and ("not found" in err_str or "not-found" in err_str):
+        return JSONResponse(data, status_code=404)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 async def api_run_campaign(request: Request) -> JSONResponse:
@@ -4884,9 +5024,16 @@ async def api_run_campaign(request: Request) -> JSONResponse:
     cmd = ["use-cases", "campaign", "--tasks-dir", str(tasks_dir), "--json"]
     if body.get("filter_actor"):
         cmd.extend(["--filter-actor", str(body["filter_actor"])])
+    if body.get("timeout"):
+        cmd.extend(["--timeout", str(body["timeout"])])
+    if body.get("actor"):
+        cmd.extend(["--actor", str(body["actor"])])
     code, data = await run_ai_orch(cmd)
-    await state.broadcast({"type": "use_cases_changed", "action": "campaign_completed"})
-    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=200)
+    if isinstance(data, dict) and data.get("ok"):
+        await state.broadcast({"type": "use_cases_changed", "action": "campaign_completed"})
+        return JSONResponse(data, status_code=200)
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -6018,6 +6165,9 @@ routes = [
     Route("/api/tasks/validate-close/preview", api_preview_validate_close, methods=["POST"]),
     Route("/api/tasks/validate-close/apply", api_apply_validate_close, methods=["POST"]),
     Route("/api/tasks/validate-close", api_apply_validate_close, methods=["POST"]),
+    Route("/api/tasks/{id}/use-cases/preview", api_preview_task_use_cases, methods=["POST"]),
+    Route("/api/tasks/{id}/use-cases/apply", api_apply_task_use_cases, methods=["POST"]),
+    Route("/api/tasks/{id}/use-cases", api_apply_task_use_cases, methods=["POST"]),
     Route("/api/tasks/transition", api_transition_task, methods=["POST"]),
     Route("/api/tasks/sync-index/preview", api_preview_sync_index, methods=["GET"]),
     Route("/api/tasks/sync-index", api_sync_index, methods=["POST"]),
@@ -6083,8 +6233,11 @@ routes = [
     Route("/api/inbox/{id}/to-microtask", api_inbox_to_microtask, methods=["POST"]),
     Route("/api/use-cases", api_list_use_cases, methods=["GET"]),
     Route("/api/use-cases", api_create_use_case, methods=["POST"]),
-    Route("/api/use-cases/campaign", api_run_campaign, methods=["POST"]),
+    Route("/api/use-cases/queue", api_get_use_cases_queue, methods=["GET"]),
+    Route("/api/use-cases/campaign", api_run_campaign, methods=["GET", "POST"]),
+    Route("/api/use-cases/{id}", api_get_use_case, methods=["GET"]),
     Route("/api/use-cases/{uc_id}", api_get_use_case, methods=["GET"]),
+    Route("/api/use-cases/{id}/validate", api_validate_use_case, methods=["POST"]),
     Route("/api/use-cases/{uc_id}/validate", api_validate_use_case, methods=["POST"]),
     Route("/api/events", api_list_events, methods=["GET"]),
     Route("/api/events/stats", api_get_events_stats, methods=["GET"]),

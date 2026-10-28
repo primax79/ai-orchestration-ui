@@ -58,6 +58,8 @@ import {
   ValidateClosePreviewResponse,
   ValidateCloseApplyPayload,
   ValidateCloseApplyResponse,
+  TaskUseCasesPayload,
+  UseCaseQueueResponse,
 } from './types';
 
 export interface ProjectScopeOpts {
@@ -411,11 +413,19 @@ export const api = {
     verifier?: string,
     reason?: string,
     expectTaskHash?: string,
+    optsOrApproved?: boolean | string | ProjectScopeOpts | null,
     opts?: string | ProjectScopeOpts | null
   ): Promise<any> {
-    const proj = resolveExplicitProject(opts);
+    let ownerApproved: boolean | undefined = undefined;
+    let actualOpts = opts;
+    if (typeof optsOrApproved === 'boolean') {
+      ownerApproved = optsOrApproved;
+    } else if (optsOrApproved !== undefined && opts === undefined) {
+      actualOpts = optsOrApproved;
+    }
+    const proj = resolveExplicitProject(actualOpts);
     if (isVsCode && vscode) {
-      return sendVsCodeMessage('transitionTask', { taskId, newState, actor, verifier, reason, expectTaskHash }, proj);
+      return sendVsCodeMessage('transitionTask', { taskId, newState, actor, verifier, reason, expectTaskHash, ownerApproved }, proj);
     }
     return apiFetch('/api/tasks/transition', {
       method: 'POST',
@@ -426,6 +436,7 @@ export const api = {
         verifier,
         reason,
         expect_task_hash: expectTaskHash,
+        owner_approved: ownerApproved,
       }),
     }, proj);
   },
@@ -494,6 +505,36 @@ export const api = {
       return sendVsCodeMessage<SetShortTitleResponse>('setShortTitle', { taskId, ...payload }, proj);
     }
     return apiFetch<SetShortTitleResponse>(`/api/tasks/${encodeURIComponent(taskId)}/short`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }, proj);
+  },
+
+  async previewTaskUseCases(
+    taskId: string,
+    payload: TaskUseCasesPayload,
+    opts?: string | ProjectScopeOpts | null
+  ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('previewTaskUseCases', { taskId, ...payload }, proj);
+    }
+    return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/use-cases/preview`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }, proj);
+  },
+
+  async applyTaskUseCases(
+    taskId: string,
+    payload: TaskUseCasesPayload,
+    opts?: string | ProjectScopeOpts | null
+  ): Promise<any> {
+    const proj = resolveExplicitProject(opts);
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('applyTaskUseCases', { taskId, ...payload }, proj);
+    }
+    return apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/use-cases/apply`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }, proj);
@@ -1341,7 +1382,15 @@ export const api = {
     }, proj);
   },
 
-  async validateUseCase(id: string, options?: { timeout?: number; actor?: string }, opts?: string | ProjectScopeOpts | null): Promise<any> {
+  async getUseCaseQueue(opts?: string | ProjectScopeOpts | null): Promise<UseCaseQueueResponse> {
+    const proj = resolveExplicitProject(opts);
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage<UseCaseQueueResponse>('getUseCaseQueue', {}, proj);
+    }
+    return apiFetch<UseCaseQueueResponse>('/api/use-cases/queue', undefined, proj);
+  },
+
+  async validateUseCase(id: string, options?: { timeout?: number; actor?: string; force?: boolean }, opts?: string | ProjectScopeOpts | null): Promise<any> {
     const proj = resolveExplicitProject(opts);
     if (isVsCode && vscode) {
       return sendVsCodeMessage('validateUseCase', { id, ...options }, proj);
