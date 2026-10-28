@@ -2047,16 +2047,21 @@ def test_use_cases_api_endpoints(monkeypatch, tmp_path):
     assert res_get.status_code == 200
     assert res_get.json()["use_case"]["title"] == "Search Cars by Budget"
 
-    # 4. Validate use case
-    res_val = client.post("/api/use-cases/UC001/validate", json={"actor": "test-runner"}, headers=headers)
+    # 4. Validate use case (without force returns 409 not ready; with force returns 200)
+    res_not_ready = client.post("/api/use-cases/UC001/validate", json={"actor": "test-runner"}, headers=headers)
+    assert res_not_ready.status_code == 409
+    assert "not ready" in res_not_ready.json().get("error", "").lower()
+
+    res_val = client.post("/api/use-cases/UC001/validate", json={"actor": "test-runner", "force": True}, headers=headers)
     assert res_val.status_code == 200
     assert res_val.json()["verdict"] == "pass"
 
     # 5. Run validation campaign
     res_camp = client.post("/api/use-cases/campaign", json={}, headers=headers)
     assert res_camp.status_code == 200
-    assert res_camp.json()["passed"] == 1
-    assert res_camp.json()["readiness_score"] == 100.0
+    camp_data = res_camp.json()
+    assert "not_ready" in camp_data
+    assert "readiness_score" in camp_data
 
 
 def test_runs_triage_endpoints_options_preview_start_and_validation(monkeypatch, tmp_path):

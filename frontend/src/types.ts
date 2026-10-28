@@ -742,7 +742,18 @@ export interface InboxToTaskResponse {
 // Use Cases & Validation (Spec 15)
 // ---------------------------------------------------------------------------
 
-export type UseCaseStatus = 'draft' | 'active' | 'verified' | 'failing' | 'partial';
+export type UseCaseStatus = 'draft' | 'active' | 'verified' | 'failing' | 'partial' | string;
+export type UseCaseStage =
+  | 'draft'
+  | 'planned'
+  | 'in development'
+  | 'ready'
+  | 'verified'
+  | 'failing'
+  | 'partial'
+  | 'untested'
+  | 'ready (revalidation pending)';
+export type UseCaseApproval = 'proposed' | 'approved' | 'deprecated';
 export type UseCaseVerdict = 'pass' | 'fail' | 'partial' | 'untested';
 export type UseCaseVerificationType = 'automated-probe' | 'e2e' | 'code-audit' | 'api-probe';
 
@@ -753,8 +764,19 @@ export interface UseCaseItem {
   short_title_source?: 'field' | 'derived';
   actor: string;
   status: UseCaseStatus;
+  stage?: UseCaseStage;
+  approval?: UseCaseApproval;
+  revalidation?: string | null;
   priority: Priority;
   linked_tasks: string[];
+  linked_tasks_details?: Array<{
+    id: string;
+    title?: string;
+    short_title?: string;
+    state?: string;
+    canonical_state?: string;
+    dropped?: boolean;
+  }>;
   verification_type: UseCaseVerificationType;
   last_tested?: string | null;
   last_verdict?: UseCaseVerdict | null;
@@ -767,6 +789,42 @@ export interface UseCaseItem {
   file_path?: string;
   rel_path?: string;
   content?: string;
+}
+
+export interface TaskUseCasesPayload {
+  use_cases: string[];
+  action: 'link' | 'unlink';
+  expect_plan_hash?: string;
+}
+
+export interface UseCaseQueueItem {
+  id: string;
+  use_case_id?: string;
+  title: string;
+  short_title?: string;
+  actor?: string;
+  approval?: UseCaseApproval;
+  stage?: UseCaseStage;
+  status?: string;
+  priority?: Priority;
+  revalidation?: string;
+  last_verdict?: UseCaseVerdict | null;
+  last_tested?: string | null;
+  linked_tasks?: string[];
+  triggering_task?: string;
+  date?: string;
+  requested_at?: string;
+  transition?: string;
+  file_path?: string;
+  rel_path?: string;
+}
+
+export interface UseCaseQueueResponse {
+  ok: boolean;
+  count: number;
+  queue: UseCaseQueueItem[];
+  use_cases?: UseCaseQueueItem[];
+  items?: UseCaseQueueItem[];
 }
 
 export interface UseCaseListResponse {
