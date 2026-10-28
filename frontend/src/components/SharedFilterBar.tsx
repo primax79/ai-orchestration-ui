@@ -7,14 +7,18 @@ import {
   ChevronDown,
   RotateCcw,
   FolderGit2,
+  Target,
 } from 'lucide-react';
-import { TaskKind, TaskState, SharedFilterState, LabelsResponse, LabelCountItem, WorkspaceProjectInfo } from '../types';
+import { TaskKind, TaskState, SharedFilterState, LabelsResponse, LabelCountItem, WorkspaceProjectInfo, UseCaseItem } from '../types';
 import { KindBadge, KIND_CONFIGS } from './KindBadge';
 import { LabelChip } from './LabelChip';
 import { ProjectChip } from './ProjectBadges';
-import { microtaskAndLabelsApi, useProjectContext } from '../api';
+import { api, microtaskAndLabelsApi, useProjectContext } from '../api';
 
 const SHARED_FILTERS_KEY = 'ai-orch:shared-filters';
+
+// Module-level cache of loaded use cases so matchTaskFilters can resolve linked_tasks even when task.use_cases is absent
+let cachedUseCases: UseCaseItem[] = [];
 
 export const DEFAULT_SHARED_FILTERS: SharedFilterState = {
   search: '',
@@ -25,6 +29,7 @@ export const DEFAULT_SHARED_FILTERS: SharedFilterState = {
   groupByLabel: false,
   projects: [],
   groupByProject: false,
+  useCase: 'all',
 };
 
 export const getStoredSharedFilters = (): SharedFilterState => {
@@ -42,6 +47,7 @@ export const getStoredSharedFilters = (): SharedFilterState => {
           groupByLabel: Boolean(parsed.groupByLabel),
           projects: Array.isArray(parsed.projects) ? parsed.projects : [],
           groupByProject: Boolean(parsed.groupByProject),
+          useCase: typeof parsed.useCase === 'string' && parsed.useCase ? parsed.useCase : 'all',
         };
       }
     }
@@ -83,6 +89,7 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
   const [showStateDropdown, setShowStateDropdown] = useState(false);
   const [showProjectDropdown, setShowProjectDropdown] = useState(false);
   const [fetchedLabels, setFetchedLabels] = useState<string[]>([]);
+  const [fetchedUseCases, setFetchedUseCases] = useState<UseCaseItem[]>([]);
 
   const projsToQuery = availableProjects.length > 0 ? availableProjects : ctxProjects;
   const projectIdsKey = projsToQuery.map((p) => p.id).join(',');
@@ -107,6 +114,29 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
           setFetchedLabels(Array.from(set).sort());
         })
         .catch(() => {});
+      Promise.all(
+        projsToQuery.map((p) =>
+          api.getUseCases('all', p.id).catch(() => ({ ok: false, use_cases: [] as UseCaseItem[] }))
+        )
+      )
+        .then((results) => {
+          if (!isMounted) return;
+          const allUcs: UseCaseItem[] = [];
+          const seen = new Set<string>();
+          results.forEach((res: any) => {
+            if (res && Array.isArray(res.use_cases)) {
+              res.use_cases.forEach((u: UseCaseItem) => {
+                if (!seen.has(u.id)) {
+                  seen.add(u.id);
+                  allUcs.push(u);
+                }
+              });
+            }
+          });
+          cachedUseCases = allUcs;
+          setFetchedUseCases(allUcs);
+        })
+        .catch(() => {});
       return () => {
         isMounted = false;
       };
@@ -123,6 +153,15 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
       .then((res: LabelsResponse) => {
         if (isMounted && res && Array.isArray(res.labels)) {
           setFetchedLabels(res.labels.map((l: LabelCountItem) => l.label));
+        }
+      })
+      .catch(() => {});
+    api
+      .getUseCases('all', targetProj)
+      .then((res: any) => {
+        if (isMounted && res && Array.isArray(res.use_cases)) {
+          cachedUseCases = res.use_cases;
+          setFetchedUseCases(res.use_cases);
         }
       })
       .catch(() => {});
@@ -147,10 +186,12 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
       states: [],
       priority: 'all',
       projects: [],
+      useCase: 'all',
     });
   };
 
   const selectedProjects = filters.projects || [];
+  const selectedUseCase = filters.useCase && filters.useCase !== 'all' ? filters.useCase : '';
 
   const hasActiveFilters = Boolean(
     filters.search ||
@@ -158,6 +199,7 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
     filters.labels.length > 0 ||
     filters.states.length > 0 ||
     (filters.priority && filters.priority !== 'all') ||
+    selectedUseCase ||
     (showProjectControls && selectedProjects.length > 0)
   );
 
@@ -415,6 +457,51 @@ export const SharedFilterBar: React.FC<SharedFilterBarProps> = ({
             </button>
           )}
 
+          {/* Use Case Select Dropdown (Task 17.10) */}
+          {fetchedUseCases.length > 0 && (
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                padding: '0.15rem 0.45rem',
+                borderRadius: '0.375rem',
+                border: `1px solid ${selectedUseCase ? '#818cf8' : '#334155'}`,
+                backgroundColor: selectedUseCase ? 'rgba(129, 140, 248, 0.15)' : '#0f172a',
+              }}
+              title="Filter tasks by Use Case"
+            >
+              <Target size={13} color={selectedUseCase ? '#818cf8' : '#94a3b8'} />
+              <select
+                aria-label="Filter by Use Case"
+                value={selectedUseCase || 'all'}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  updateFilters({ useCase: val === 'all' ? 'all' : val });
+                }}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  outline: 'none',
+                  color: selectedUseCase ? '#c7d2fe' : '#cbd5e1',
+                  fontSize: '0.75rem',
+                  fontWeight: 500,
+                  cursor: 'pointer',
+                  maxWidth: '200px',
+                }}
+              >
+                <option value="all" style={{ backgroundColor: '#0f172a', color: '#cbd5e1' }}>
+                  Use Case: All
+                </option>
+                {fetchedUseCases.map((uc) => (
+                  <option key={uc.id} value={uc.id} style={{ backgroundColor: '#0f172a', color: '#f8fafc' }}>
+                    {uc.id} — {uc.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
           {/* Labels Dropdown Trigger */}
           <div style={{ position: 'relative' }}>
             <button
@@ -665,17 +752,47 @@ export function matchTaskFilters(
     short_title?: string;
     kind?: string;
     labels?: string[];
+    use_cases?: string[];
+    fields?: Record<string, any>;
     state?: string;
     priority?: string;
     category?: string;
     group?: string;
     executor?: string;
   },
-  filters: SharedFilterState
+  filters: SharedFilterState,
+  useCasesList?: UseCaseItem[]
 ): boolean {
   // Project filter
   if (filters.projects && filters.projects.length > 0 && task.project) {
     if (!filters.projects.includes(task.project)) {
+      return false;
+    }
+  }
+
+  // Use case filter (Task 17.10)
+  if (filters.useCase && filters.useCase !== 'all') {
+    const targetUc = filters.useCase.toUpperCase();
+    const taskUcs = new Set<string>();
+    if (Array.isArray(task.use_cases)) {
+      task.use_cases.forEach((u) => taskUcs.add(String(u).toUpperCase()));
+    }
+    const fieldVal = task.fields?.use_cases?.value;
+    if (Array.isArray(fieldVal)) {
+      fieldVal.forEach((u: any) => taskUcs.add(String(u).toUpperCase()));
+    } else if (typeof fieldVal === 'string' && fieldVal && fieldVal !== '-') {
+      fieldVal.split(',').forEach((s) => {
+        if (s.trim()) taskUcs.add(s.trim().toUpperCase());
+      });
+    }
+    const listToCheck = useCasesList && useCasesList.length > 0 ? useCasesList : cachedUseCases;
+    if (listToCheck && listToCheck.length > 0) {
+      const ucObj = listToCheck.find((u) => u.id.toUpperCase() === targetUc);
+      if (ucObj && Array.isArray(ucObj.linked_tasks) && ucObj.linked_tasks.includes(task.id)) {
+        taskUcs.add(targetUc);
+      }
+    }
+    if (!taskUcs.has(targetUc)) {
       return false;
     }
   }

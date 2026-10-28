@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { CheckCheck, X, Loader2, AlertCircle, AlertTriangle } from 'lucide-react';
 import { api, useProject } from '../api';
 import { TaskItem, ValidateCloseTaskItem, shortTitle } from '../types';
+import { ConfirmDialog } from './ConfirmDialog';
 
 export interface ValidateCloseDialogProps {
   isOpen: boolean;
@@ -29,25 +30,72 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
   const [planHash, setPlanHash] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [staleWarning, setStaleWarning] = useState<string | null>(null);
+  const [failingGuard, setFailingGuard] = useState<{
+    message: string;
+    useCases: string[];
+    taskId?: string;
+  } | null>(null);
+  const [showOwnerApproveConfirm, setShowOwnerApproveConfirm] = useState(false);
 
   const taskIds = tasks.map((t) => t.id);
 
-  const fetchPreview = useCallback(async () => {
+  const isUseCaseFailingError = (err: any): { isFailing: boolean; useCases: string[]; message: string; taskId?: string } => {
+    const data = err?.data || err?.details || {};
+    const msg = data?.error || data?.message || err?.message || String(err);
+    const reason = data?.reason || data?.details?.reason;
+    const ucIds: string[] =
+      data?.use_case_ids ||
+      data?.use_cases ||
+      data?.details?.use_case_ids ||
+      data?.details?.use_cases ||
+      [];
+    const parsedFromMsg = Array.from(String(msg).matchAll(/\bUC\d{3,}\b/g)).map((m) => m[0]);
+    const finalUcIds = Array.from(new Set([...(Array.isArray(ucIds) ? ucIds : []), ...parsedFromMsg]));
+    if (
+      reason === 'use_case_failing' ||
+      String(msg).toLowerCase().includes('use_case_failing') ||
+      String(msg).toLowerCase().includes('use case(s) failing') ||
+      ucIds.length > 0
+    ) {
+      return {
+        isFailing: true,
+        useCases: finalUcIds,
+        message: msg,
+        taskId: data?.task_id,
+      };
+    }
+    return { isFailing: false, useCases: [], message: msg };
+  };
+
+  const fetchPreview = useCallback(async (ownerApproved = false) => {
     if (!isOpen || taskIds.length === 0) return;
     setLoadingPreview(true);
     setError(null);
+    if (!ownerApproved) {
+      setFailingGuard(null);
+    }
     try {
       const res = await api.previewValidateClose(
         {
           task_ids: taskIds,
           note: note.trim() || undefined,
+          owner_approved: ownerApproved || undefined,
         },
         targetProject
       );
       setPreviewTasks(res.tasks || []);
       setPlanHash(res.plan_hash || res.hash || '');
     } catch (err: any) {
-      setError(err?.message || String(err));
+      const guard = isUseCaseFailingError(err);
+      if (guard.isFailing) {
+        setFailingGuard({
+          message: guard.message,
+          useCases: guard.useCases,
+          taskId: guard.taskId,
+        });
+      } else {
+        setError(err?.message || String(err));
+      }
     } finally {
       setLoadingPreview(false);
     }
@@ -58,6 +106,8 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
       setNote('');
       setError(null);
       setStaleWarning(null);
+      setFailingGuard(null);
+      setShowOwnerApproveConfirm(false);
       setPreviewTasks(
         tasks.map((t) => ({
           id: t.id,
@@ -70,20 +120,41 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
         }))
       );
       setPlanHash('');
-      fetchPreview();
+      fetchPreview(false);
     }
   }, [isOpen, tasks.map((t) => t.id).join(',')]);
 
   if (!isOpen) return null;
 
-  const handleConfirm = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (taskIds.length === 0 || applying || loadingPreview) return;
-
+  const executeApply = async (ownerApproved = false) => {
+    if (taskIds.length === 0 || applying) return;
     setApplying(true);
     setError(null);
     setStaleWarning(null);
     try {
+      if (ownerApproved) {
+        let lastInSync: boolean | undefined = undefined;
+        for (const tid of taskIds) {
+          const res = await api.transitionTask(
+            tid,
+            'done',
+            'operator',
+            'owner',
+            note.trim() || undefined,
+            undefined,
+            true,
+            targetProject
+          );
+          if (res && res.index_in_sync !== undefined) {
+            lastInSync = res.index_in_sync;
+          }
+        }
+        setShowOwnerApproveConfirm(false);
+        onSuccess(lastInSync);
+        onClose();
+        return;
+      }
+
       const res = await api.applyValidateClose(
         {
           task_ids: taskIds,
@@ -92,9 +163,19 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
         },
         targetProject
       );
+      setShowOwnerApproveConfirm(false);
       onSuccess(res.index_in_sync);
       onClose();
     } catch (err: any) {
+      const guard = isUseCaseFailingError(err);
+      if (guard.isFailing) {
+        setFailingGuard({
+          message: guard.message,
+          useCases: guard.useCases,
+          taskId: guard.taskId,
+        });
+        return;
+      }
       const status = err?.status;
       const msg = err?.message || String(err);
       const isStale =
@@ -104,13 +185,19 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
         msg.toLowerCase().includes('hash mismatch');
       if (isStale) {
         setStaleWarning('Task states or hashes changed since preview — refreshed preview below. Please review and confirm again.');
-        await fetchPreview();
+        await fetchPreview(ownerApproved);
       } else {
         setError(msg);
       }
     } finally {
       setApplying(false);
     }
+  };
+
+  const handleConfirm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (taskIds.length === 0 || applying || loadingPreview) return;
+    await executeApply(false);
   };
 
   const displayList: ValidateCloseTaskItem[] =
@@ -231,6 +318,74 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
               >
                 <AlertTriangle size={16} color="#f59e0b" style={{ flexShrink: 0 }} />
                 <span>{staleWarning}</span>
+              </div>
+            )}
+
+            {/* Closing Guard (409 use_case_failing) */}
+            {failingGuard && (
+              <div
+                style={{
+                  padding: '0.85rem 1rem',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#451a1a',
+                  border: '1px solid #ef4444',
+                  color: '#fca5a5',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.6rem',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                  <AlertCircle size={17} color="#ef4444" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: '0.85rem', color: '#fecaca', marginBottom: '0.2rem' }}>
+                      Closing Guard: Linked Use Case(s) Failing
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: '#fca5a5', lineHeight: 1.4 }}>
+                      {failingGuard.message}
+                    </div>
+                    {failingGuard.useCases.length > 0 && (
+                      <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', marginTop: '0.45rem' }}>
+                        {failingGuard.useCases.map((ucId) => (
+                          <span
+                            key={ucId}
+                            style={{
+                              fontSize: '0.72rem',
+                              fontWeight: 700,
+                              fontFamily: 'monospace',
+                              padding: '0.12rem 0.45rem',
+                              borderRadius: '0.25rem',
+                              backgroundColor: '#7f1d1d',
+                              color: '#fecaca',
+                              border: '1px solid #ef4444',
+                            }}
+                          >
+                            {ucId} (failing)
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowOwnerApproveConfirm(true)}
+                    disabled={applying}
+                    style={{
+                      padding: '0.4rem 0.85rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #f59e0b',
+                      backgroundColor: '#d97706',
+                      color: '#fff',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      cursor: applying ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    Close anyway (owner approved)
+                  </button>
+                </div>
               </div>
             )}
 
@@ -434,7 +589,7 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={applying || loadingPreview || displayList.length === 0 || Boolean(error)}
+                disabled={applying || loadingPreview || displayList.length === 0 || Boolean(error) || Boolean(failingGuard)}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -443,12 +598,17 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
                   borderRadius: '0.375rem',
                   border: 'none',
                   backgroundColor:
-                    applying || loadingPreview || displayList.length === 0 || Boolean(error) ? '#334155' : '#10b981',
-                  color: applying || loadingPreview || displayList.length === 0 || Boolean(error) ? '#64748b' : '#fff',
+                    applying || loadingPreview || displayList.length === 0 || Boolean(error) || Boolean(failingGuard)
+                      ? '#334155'
+                      : '#10b981',
+                  color:
+                    applying || loadingPreview || displayList.length === 0 || Boolean(error) || Boolean(failingGuard)
+                      ? '#64748b'
+                      : '#fff',
                   fontSize: '0.82rem',
                   fontWeight: 600,
                   cursor:
-                    applying || loadingPreview || displayList.length === 0 || Boolean(error)
+                    applying || loadingPreview || displayList.length === 0 || Boolean(error) || Boolean(failingGuard)
                       ? 'not-allowed'
                       : 'pointer',
                 }}
@@ -460,6 +620,24 @@ export const ValidateCloseDialog: React.FC<ValidateCloseDialogProps> = ({
           </div>
         </form>
       </div>
+
+      {/* Confirmation dialog for Close anyway (owner approved) */}
+      {showOwnerApproveConfirm && failingGuard && (
+        <ConfirmDialog
+          isOpen={true}
+          title="Close anyway (owner approved)?"
+          summary={`The closing guard blocked this transition because linked approved use case(s) are failing${
+            failingGuard.useCases.length > 0 ? ` (**${failingGuard.useCases.join(', ')}**)` : ''
+          }:\n\n> ${failingGuard.message}\n\nConfirming will resend the transition with \`owner_approved: true\`.`}
+          warnings={['Overriding the closing guard closes the task while linked use cases remain in a failing state.']}
+          applyButtonText="Close anyway (owner approved)"
+          danger={true}
+          onApply={async () => {
+            await executeApply(true);
+          }}
+          onCancel={() => setShowOwnerApproveConfirm(false)}
+        />
+      )}
     </div>
   );
 

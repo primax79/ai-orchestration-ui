@@ -186,15 +186,19 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
   // Filtered visible nodes
   const visibleNodes = useMemo(() => {
     if (!graph?.nodes) return [];
+    const taskLookup = new Map<string, TaskItem>();
+    tasks.forEach((t) => taskLookup.set(t.id, t));
     return graph.nodes.filter((node) => {
       const isClosed = node.state === 'done' || node.state === 'done with a caveat' || node.state === 'dropped';
       if (!showDone && isClosed) return false;
       if (groupFilter !== 'all' && node.group !== groupFilter) return false;
       if (filterChainOnly && selectedTaskId && !selectedChainIds.has(node.id)) return false;
-      if (!matchTaskFilters(node, sharedFilters)) return false;
+      const fullTask = taskLookup.get(node.id);
+      const mergedNode = fullTask ? { ...node, use_cases: node.use_cases || fullTask.use_cases, fields: fullTask.fields } : node;
+      if (!matchTaskFilters(mergedNode, sharedFilters)) return false;
       return true;
     });
-  }, [graph?.nodes, showDone, groupFilter, filterChainOnly, selectedTaskId, selectedChainIds, sharedFilters]);
+  }, [graph?.nodes, tasks, showDone, groupFilter, filterChainOnly, selectedTaskId, selectedChainIds, sharedFilters]);
 
   // Determine columns
   const columnsData = useMemo(() => {

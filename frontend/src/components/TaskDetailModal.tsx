@@ -18,8 +18,23 @@ import {
   Send,
   Paperclip,
   Edit2,
+  Target,
+  Link2,
 } from 'lucide-react';
-import { TaskItem, QuestionItem, AskQuestionPayload, RunRecord, TreeNode, StructurePlanItem, TaskState, shortTitle } from '../types';
+import {
+  TaskItem,
+  QuestionItem,
+  AskQuestionPayload,
+  RunRecord,
+  TreeNode,
+  StructurePlanItem,
+  TaskState,
+  UseCaseItem,
+  shortTitle,
+  getUseCaseStage,
+  getUseCaseStageStyle,
+  getUseCaseApprovalStyle,
+} from '../types';
 import { api, taskStructureApi, useProject } from '../api';
 import { SafeMarkdown } from './SafeMarkdown';
 import { RunDialog } from './RunDialog';
@@ -148,6 +163,34 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
   const [showLabelEditor, setShowLabelEditor] = useState(false);
   const [showPromoteDialog, setShowPromoteDialog] = useState(false);
   const [showValidateCloseDialog, setShowValidateCloseDialog] = useState(false);
+
+  // Use Cases state (Task 17.10)
+  const [allUseCases, setAllUseCases] = useState<UseCaseItem[]>([]);
+  const [showUseCasePicker, setShowUseCasePicker] = useState(false);
+  const [selectedUseCaseToLink, setSelectedUseCaseToLink] = useState<string>('');
+  const [useCaseActionLoading, setUseCaseActionLoading] = useState(false);
+  const [useCaseActionError, setUseCaseActionError] = useState<string | null>(null);
+  const [useCaseConfirmData, setUseCaseConfirmData] = useState<{
+    isOpen: boolean;
+    title: string;
+    summary?: string;
+    plan?: any[];
+    diff?: string;
+    warnings?: string[];
+    planHash?: string;
+    action: 'link' | 'unlink';
+    useCases: string[];
+  } | null>(null);
+
+  // Closing guard state (409 use_case_failing)
+  const [closingGuardConflict, setClosingGuardConflict] = useState<{
+    newState: string;
+    verifier?: string;
+    reason?: string;
+    useCases: string[];
+    message: string;
+  } | null>(null);
+  const [showClosingGuardConfirm, setShowClosingGuardConfirm] = useState(false);
 
   // Sync currentTask when incoming prop changes
   useEffect(() => {
@@ -549,11 +592,21 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     }
   }, [task.id, taskProject]);
 
+  const loadUseCases = useCallback(async () => {
+    try {
+      const res = await api.getUseCases('all', taskProject);
+      setAllUseCases(res?.use_cases || []);
+    } catch {
+      // non-blocking
+    }
+  }, [taskProject]);
+
   useEffect(() => {
     reloadTaskDetailAndState();
     loadTaskRuns();
     loadQuestions();
-  }, [task.id, taskProject, reloadTaskDetailAndState, loadTaskRuns]);
+    loadUseCases();
+  }, [task.id, taskProject, reloadTaskDetailAndState, loadTaskRuns, loadUseCases]);
 
   // WebSocket listener debounced 300ms on changed runs or tasks
   useEffect(() => {
@@ -566,6 +619,8 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
 
       const isTaskRunEvent =
         msg.type === 'tasks_changed' ||
+        msg.type === 'tasks_updated' ||
+        msg.type === 'use_cases_changed' ||
         msg.type === 'task_transitioned' ||
         msg.type === 'task_delivered' ||
         msg.type === 'run_cancelled' ||
@@ -576,6 +631,7 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
         timer = setTimeout(() => {
           reloadTaskDetailAndState();
           loadTaskRuns();
+          loadUseCases();
           setRunsRefreshTrigger((k) => k + 1);
         }, 300);
       }
@@ -701,22 +757,158 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
     }
   };
 
-  const handleTransition = async (newState: string, verifier?: string, reason?: string) => {
+  // Linked use cases for current task
+  const linkedUseCaseIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (Array.isArray(currentTask.use_cases)) {
+      currentTask.use_cases.forEach((id) => ids.add(id));
+    }
+    const fieldVal = currentTask.fields?.use_cases?.value;
+    if (Array.isArray(fieldVal)) {
+      fieldVal.forEach((id: string) => ids.add(id));
+    } else if (typeof fieldVal === 'string' && fieldVal && fieldVal !== '-') {
+      fieldVal.split(',').forEach((s) => {
+        if (s.trim()) ids.add(s.trim());
+      });
+    }
+    for (const uc of allUseCases) {
+      if (Array.isArray(uc.linked_tasks) && uc.linked_tasks.includes(currentTask.id)) {
+        ids.add(uc.id);
+      }
+    }
+    return Array.from(ids);
+  }, [currentTask.id, currentTask.use_cases, currentTask.fields, allUseCases]);
+
+  const unlinkedUseCases = useMemo(() => {
+    const linkedSet = new Set(linkedUseCaseIds);
+    return allUseCases.filter((uc) => !linkedSet.has(uc.id));
+  }, [allUseCases, linkedUseCaseIds]);
+
+  const handlePreviewUseCaseLinkAction = async (action: 'link' | 'unlink', ucIds: string[]) => {
+    if (!ucIds || ucIds.length === 0) return;
+    setUseCaseActionLoading(true);
+    setUseCaseActionError(null);
+    try {
+      const res = await api.previewTaskUseCases(
+        currentTask.id,
+        { use_cases: ucIds, action },
+        taskProject
+      );
+      if (!res || res.ok === false) {
+        throw new Error(res?.error || `Failed to preview ${action}`);
+      }
+      setUseCaseConfirmData({
+        isOpen: true,
+        title: `${action === 'link' ? 'Link' : 'Unlink'} Use Case${ucIds.length > 1 ? 's' : ''} (${ucIds.join(', ')}) ${action === 'link' ? 'to' : 'from'} ${currentTask.id}`,
+        summary: `${action === 'link' ? 'Link' : 'Unlink'} use case(s) **${ucIds.join(', ')}** ${action === 'link' ? 'to' : 'from'} task **${currentTask.id}** (${currentTask.title}).`,
+        plan: res.plan,
+        diff: res.diff,
+        warnings: res.warnings,
+        planHash: res.plan_hash || res.hash,
+        action,
+        useCases: ucIds,
+      });
+      if (action === 'link') {
+        setShowUseCasePicker(false);
+        setSelectedUseCaseToLink('');
+      }
+    } catch (err: any) {
+      setUseCaseActionError(err?.message || String(err));
+    } finally {
+      setUseCaseActionLoading(false);
+    }
+  };
+
+  const handleApplyUseCaseLinkAction = async (planHash?: string) => {
+    if (!useCaseConfirmData) return;
+    const hash = planHash || useCaseConfirmData.planHash || '';
+    const { action, useCases } = useCaseConfirmData;
+    const res = await api.applyTaskUseCases(
+      currentTask.id,
+      { use_cases: useCases, action, expect_plan_hash: hash },
+      taskProject
+    );
+    if (!res || res.ok === false) {
+      throw new Error(res?.error || `Failed to apply ${action}`);
+    }
+    setUseCaseConfirmData(null);
+    await Promise.all([reloadTaskDetailAndState(), loadUseCases()]);
+    onActionComplete();
+  };
+
+  const handleRefetchUseCasePreview = async () => {
+    if (!useCaseConfirmData) return {};
+    const { action, useCases } = useCaseConfirmData;
+    const res = await api.previewTaskUseCases(
+      currentTask.id,
+      { use_cases: useCases, action },
+      taskProject
+    );
+    return {
+      plan: res.plan,
+      diff: res.diff,
+      warnings: res.warnings,
+      hash: res.plan_hash || res.hash,
+    };
+  };
+
+  const handleTransition = async (
+    newState: string,
+    verifier?: string,
+    reason?: string,
+    ownerApproved = false
+  ) => {
     setLoading(true);
     setTransitionError(null);
+    if (!ownerApproved) {
+      setClosingGuardConflict(null);
+    }
     try {
-      const res = await api.transitionTask(task.id, newState, 'operator', verifier, reason, undefined, taskProject);
+      const res = await api.transitionTask(
+        task.id,
+        newState,
+        'operator',
+        verifier,
+        reason,
+        undefined,
+        ownerApproved ? true : undefined,
+        taskProject
+      );
       if (res && res.index_in_sync === false) {
         setIndexOutOfSync(true);
         onIndexOutOfSync?.();
       }
+      setClosingGuardConflict(null);
+      setShowClosingGuardConfirm(false);
       await reloadTaskDetailAndState();
       await loadTaskRuns();
       setRunsRefreshTrigger((k) => k + 1);
       onActionComplete();
       onClose();
     } catch (e: any) {
-      setTransitionError(`Transition error: ${e.message}`);
+      const status = e?.status;
+      const errData = e?.data || {};
+      const msg = errData?.error || errData?.message || e?.message || String(e);
+      const isFailingGuard =
+        status === 409 &&
+        (errData?.reason === 'use_case_failing' ||
+          String(msg).toLowerCase().includes('use_case_failing') ||
+          String(msg).toLowerCase().includes('use case(s) failing') ||
+          Array.isArray(errData?.use_case_ids) ||
+          Array.isArray(errData?.use_cases));
+
+      if (isFailingGuard) {
+        const ucs = errData?.use_case_ids || errData?.use_cases || [];
+        setClosingGuardConflict({
+          newState,
+          verifier,
+          reason,
+          useCases: Array.isArray(ucs) ? ucs : [],
+          message: msg,
+        });
+      } else {
+        setTransitionError(`Transition error: ${msg}`);
+      }
     } finally {
       setLoading(false);
     }
@@ -1089,6 +1281,217 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
                 )}
               </div>
             </div>
+          </div>
+
+          {/* Use Cases Section (Task 17.10) */}
+          <div style={{
+            backgroundColor: '#0f172a',
+            border: '1px solid #334155',
+            borderRadius: '0.5rem',
+            padding: '0.85rem 1rem',
+            marginBottom: '1.25rem',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                <Target size={16} color="#818cf8" />
+                <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#818cf8', textTransform: 'uppercase' }}>
+                  Use Cases ({linkedUseCaseIds.length})
+                </span>
+              </div>
+
+              {!showUseCasePicker ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowUseCasePicker(true);
+                    setUseCaseActionError(null);
+                    if (unlinkedUseCases.length > 0 && !selectedUseCaseToLink) {
+                      setSelectedUseCaseToLink(unlinkedUseCases[0].id);
+                    }
+                  }}
+                  disabled={useCaseActionLoading}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.25rem',
+                    padding: '0.25rem 0.6rem',
+                    borderRadius: '0.3rem',
+                    border: '1px solid #4f46e5',
+                    backgroundColor: 'rgba(79, 70, 229, 0.15)',
+                    color: '#a5b4fc',
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                    cursor: useCaseActionLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  <Link2 size={12} />
+                  <span>Link use case</span>
+                </button>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+                  {unlinkedUseCases.length > 0 ? (
+                    <>
+                      <select
+                        value={selectedUseCaseToLink || unlinkedUseCases[0]?.id || ''}
+                        onChange={(e) => setSelectedUseCaseToLink(e.target.value)}
+                        style={{
+                          padding: '0.25rem 0.5rem',
+                          borderRadius: '0.25rem',
+                          border: '1px solid #475569',
+                          backgroundColor: '#1e293b',
+                          color: '#f8fafc',
+                          fontSize: '0.75rem',
+                        }}
+                      >
+                        {unlinkedUseCases.map((uc) => (
+                          <option key={uc.id} value={uc.id}>
+                            {uc.id} — {uc.title} ({getUseCaseStage(uc)})
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={useCaseActionLoading}
+                        onClick={() => {
+                          const targetUc = selectedUseCaseToLink || unlinkedUseCases[0]?.id;
+                          if (targetUc) {
+                            handlePreviewUseCaseLinkAction('link', [targetUc]);
+                          }
+                        }}
+                        style={{
+                          padding: '0.25rem 0.6rem',
+                          borderRadius: '0.25rem',
+                          border: 'none',
+                          backgroundColor: '#4f46e5',
+                          color: '#fff',
+                          fontSize: '0.75rem',
+                          fontWeight: 600,
+                          cursor: useCaseActionLoading ? 'not-allowed' : 'pointer',
+                        }}
+                      >
+                        {useCaseActionLoading ? 'Previewing…' : 'Preview & Link'}
+                      </button>
+                    </>
+                  ) : (
+                    <span style={{ fontSize: '0.75rem', color: '#94a3b8', fontStyle: 'italic' }}>
+                      No unlinked use cases available
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowUseCasePicker(false)}
+                    style={{
+                      padding: '0.25rem 0.5rem',
+                      borderRadius: '0.25rem',
+                      border: '1px solid #475569',
+                      backgroundColor: 'transparent',
+                      color: '#94a3b8',
+                      fontSize: '0.75rem',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {useCaseActionError && (
+              <div style={{
+                padding: '0.45rem 0.65rem',
+                borderRadius: '0.3rem',
+                backgroundColor: '#451a1a',
+                border: '1px solid #ef4444',
+                color: '#fca5a5',
+                fontSize: '0.75rem',
+                marginBottom: '0.5rem',
+              }}>
+                {useCaseActionError}
+              </div>
+            )}
+
+            {linkedUseCaseIds.length > 0 ? (
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                {linkedUseCaseIds.map((ucId) => {
+                  const ucObj = allUseCases.find((u) => u.id === ucId);
+                  const st = ucObj ? getUseCaseStage(ucObj) : 'draft';
+                  const stStyle = getUseCaseStageStyle(st);
+                  const app = ucObj?.approval || 'approved';
+                  const appStyle = getUseCaseApprovalStyle(app);
+                  return (
+                    <div
+                      key={ucId}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '0.4rem',
+                        padding: '0.3rem 0.55rem',
+                        borderRadius: '0.375rem',
+                        backgroundColor: '#1e293b',
+                        border: '1px solid #334155',
+                        fontSize: '0.78rem',
+                      }}
+                    >
+                      <span style={{ fontFamily: 'monospace', fontWeight: 700, color: '#818cf8' }}>
+                        {ucId}
+                      </span>
+                      {ucObj?.title && (
+                        <span style={{ color: '#e2e8f0', fontWeight: 500 }}>
+                          {ucObj.title}
+                        </span>
+                      )}
+                      <span style={{
+                        fontSize: '0.68rem',
+                        fontWeight: 700,
+                        padding: '0.08rem 0.4rem',
+                        borderRadius: '1rem',
+                        backgroundColor: stStyle.bg,
+                        color: stStyle.color,
+                        border: `1px solid ${stStyle.border}`,
+                      }}>
+                        {stStyle.label}
+                      </span>
+                      {ucObj && app !== 'approved' && (
+                        <span style={{
+                          fontSize: '0.65rem',
+                          fontWeight: 700,
+                          padding: '0.05rem 0.35rem',
+                          borderRadius: '0.2rem',
+                          backgroundColor: appStyle.bg,
+                          color: appStyle.color,
+                          border: `1px solid ${appStyle.border}`,
+                          textTransform: 'uppercase',
+                        }}>
+                          {appStyle.label}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        disabled={useCaseActionLoading}
+                        onClick={() => handlePreviewUseCaseLinkAction('unlink', [ucId])}
+                        title={`Unlink ${ucId} from ${currentTask.id}`}
+                        style={{
+                          background: 'none',
+                          border: '1px solid #475569',
+                          borderRadius: '0.2rem',
+                          color: '#94a3b8',
+                          fontSize: '0.68rem',
+                          padding: '0.05rem 0.35rem',
+                          cursor: useCaseActionLoading ? 'not-allowed' : 'pointer',
+                          marginLeft: '0.15rem',
+                        }}
+                      >
+                        Unlink
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div style={{ fontSize: '0.78rem', color: '#64748b', fontStyle: 'italic' }}>
+                No use cases linked to this task.
+              </div>
+            )}
           </div>
 
           {(currentTask.coordinates?.length || (currentTask as any).coordinates_refs?.length) ? (
@@ -1997,6 +2400,76 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             onOpenRunDialog={() => setShowRunDialog(true)}
           />
 
+          {/* Closing Guard Banner (409 use_case_failing) */}
+          {closingGuardConflict && (
+            <div style={{
+              marginTop: '1rem',
+              padding: '0.9rem 1rem',
+              borderRadius: '0.5rem',
+              backgroundColor: '#451a1a',
+              border: '1px solid #ef4444',
+              color: '#fca5a5',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.6rem',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                <AlertCircle size={17} color="#ef4444" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 700, fontSize: '0.85rem', color: '#fecaca', marginBottom: '0.2rem' }}>
+                    Closing Guard: Linked Use Case(s) Failing
+                  </div>
+                  <div style={{ fontSize: '0.8rem', color: '#fca5a5', lineHeight: 1.4 }}>
+                    {closingGuardConflict.message}
+                  </div>
+                  {closingGuardConflict.useCases.length > 0 && (
+                    <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', marginTop: '0.45rem' }}>
+                      {closingGuardConflict.useCases.map((ucId) => {
+                        const ucObj = allUseCases.find((u) => u.id === ucId);
+                        return (
+                          <span
+                            key={ucId}
+                            style={{
+                              fontSize: '0.72rem',
+                              fontWeight: 700,
+                              fontFamily: 'monospace',
+                              padding: '0.12rem 0.45rem',
+                              borderRadius: '0.25rem',
+                              backgroundColor: '#7f1d1d',
+                              color: '#fecaca',
+                              border: '1px solid #ef4444',
+                            }}
+                          >
+                            {ucId}{ucObj?.title ? ` — ${ucObj.title}` : ''} (failing)
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  onClick={() => setShowClosingGuardConfirm(true)}
+                  disabled={loading}
+                  style={{
+                    padding: '0.4rem 0.85rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #f59e0b',
+                    backgroundColor: '#d97706',
+                    color: '#fff',
+                    fontSize: '0.8rem',
+                    fontWeight: 600,
+                    cursor: loading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  Close anyway (owner approved)
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Inline Transition Error */}
           {transitionError && (
             <div style={{
@@ -2656,6 +3129,48 @@ export const TaskDetailModal: React.FC<TaskDetailModalProps> = ({
             onActionComplete();
             onClose();
           }}
+        />
+      )}
+
+      {/* Use Case Link / Unlink Preview -> Confirm -> Apply Dialog */}
+      {useCaseConfirmData && (
+        <ConfirmDialog
+          isOpen={useCaseConfirmData.isOpen}
+          title={useCaseConfirmData.title}
+          summary={useCaseConfirmData.summary}
+          plan={useCaseConfirmData.plan}
+          diff={useCaseConfirmData.diff}
+          warnings={useCaseConfirmData.warnings}
+          hash={useCaseConfirmData.planHash}
+          danger={useCaseConfirmData.action === 'unlink'}
+          applyButtonText={useCaseConfirmData.action === 'link' ? 'Confirm & Link' : 'Confirm & Unlink'}
+          cancelButtonText="Cancel"
+          onApply={handleApplyUseCaseLinkAction}
+          onCancel={() => setUseCaseConfirmData(null)}
+          onRefetchPreview={handleRefetchUseCasePreview}
+        />
+      )}
+
+      {/* Closing Guard Override Confirmation Dialog */}
+      {showClosingGuardConfirm && closingGuardConflict && (
+        <ConfirmDialog
+          isOpen={true}
+          title="Close anyway (owner approved)?"
+          summary={`Transitioning **${currentTask.id}** to \`${closingGuardConflict.newState}\` was blocked because linked approved use case(s) are failing${
+            closingGuardConflict.useCases.length > 0 ? ` (**${closingGuardConflict.useCases.join(', ')}**)` : ''
+          }:\n\n> ${closingGuardConflict.message}\n\nConfirming will resend the transition with \`owner_approved: true\`.`}
+          warnings={['Overriding the closing guard transitions the task while linked use cases remain in a failing state.']}
+          applyButtonText="Close anyway (owner approved)"
+          danger={true}
+          onApply={async () => {
+            await handleTransition(
+              closingGuardConflict.newState,
+              closingGuardConflict.verifier,
+              closingGuardConflict.reason,
+              true
+            );
+          }}
+          onCancel={() => setShowClosingGuardConfirm(false)}
         />
       )}
     </div>
