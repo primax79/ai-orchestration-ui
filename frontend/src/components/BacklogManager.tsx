@@ -295,6 +295,9 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
     if (isCommonView) {
       return showAllCommonQueue ? allQueueCandidates : compactCommonQueueTasks;
     }
+    if (sharedFilters.useCase && sharedFilters.useCase !== 'all') {
+      return allQueueCandidates;
+    }
     const nextUpCandidates = baseTasks.filter((t) => {
       if (t.kind !== 'emergent' && t.category !== 'micro') return false;
       if (/^\d+\.\d+/.test(t.id)) return false;
@@ -302,7 +305,7 @@ export const BacklogManager: React.FC<BacklogManagerProps> = ({
       return true;
     });
     return nextUpCandidates.sort(sortTasksByPriorityAndId).slice(0, 5);
-  }, [isCommonView, showAllCommonQueue, allQueueCandidates, compactCommonQueueTasks, baseTasks]);
+  }, [isCommonView, showAllCommonQueue, allQueueCandidates, compactCommonQueueTasks, baseTasks, sharedFilters.useCase]);
 
   const handleOpenSyncPreview = async () => {
     setSyncingIndex(true);

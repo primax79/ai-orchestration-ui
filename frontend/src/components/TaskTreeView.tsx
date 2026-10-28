@@ -220,6 +220,7 @@ export const TaskTreeView: React.FC<TaskTreeViewProps> = ({
         placement_warning: t.placement_warning,
         placement_warnings: t.placement_warnings,
         warnings: t.warnings,
+        use_cases: t.use_cases,
       };
     }
     return map;

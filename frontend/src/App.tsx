@@ -498,7 +498,13 @@ export const App: React.FC = () => {
           if (Array.isArray(msg.areas)) {
             triggerDebouncedReload(msg.areas);
           }
-        } else if (msg.type === 'task_transitioned' || msg.type === 'index_synced' || msg.type === 'tasks_changed') {
+        } else if (
+          msg.type === 'task_transitioned' ||
+          msg.type === 'index_synced' ||
+          msg.type === 'tasks_changed' ||
+          msg.type === 'tasks_updated' ||
+          msg.type === 'use_cases_changed'
+        ) {
           triggerDebouncedReload(['tasks']);
         } else if (
           msg.type === 'question_asked' ||
@@ -694,7 +700,29 @@ export const App: React.FC = () => {
 
           {activeTab === 'use-cases' && (
             <div>
-              <UseCasesManager onRefresh={loadTasks} />
+              <UseCasesManager
+                onRefresh={loadTasks}
+                tasks={tasksData?.all_tasks || tasksData?.emergent_tasks || []}
+                onSelectTask={(taskId) => {
+                  const all = tasksData?.all_tasks || tasksData?.emergent_tasks || [];
+                  const found = all.find((t) => t.id === taskId);
+                  if (found) {
+                    setModalTaskAndRun({ task: found });
+                  } else {
+                    setModalTaskAndRun({
+                      task: {
+                        id: taskId,
+                        title: `Task ${taskId}`,
+                        kind: taskId.startsWith('T') ? 'emergent' : 'initiative_task',
+                        category: 'general',
+                        priority: 'P2',
+                        state: 'open',
+                        executor: 'self',
+                      },
+                    });
+                  }
+                }}
+              />
             </div>
           )}
 

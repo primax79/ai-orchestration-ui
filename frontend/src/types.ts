@@ -119,6 +119,7 @@ export interface TaskItem {
   placement_warning?: string;
   placement_warnings?: string[];
   warnings?: string[];
+  use_cases?: string[];
 }
 
 export interface InitiativeItem {
@@ -757,6 +758,83 @@ export type UseCaseApproval = 'proposed' | 'approved' | 'deprecated';
 export type UseCaseVerdict = 'pass' | 'fail' | 'partial' | 'untested';
 export type UseCaseVerificationType = 'automated-probe' | 'e2e' | 'code-audit' | 'api-probe';
 
+export const ALL_USE_CASE_STAGES: UseCaseStage[] = [
+  'draft',
+  'planned',
+  'in development',
+  'ready',
+  'ready (revalidation pending)',
+  'verified',
+  'failing',
+  'partial',
+  'untested',
+];
+
+export const USE_CASE_STAGE_STYLES: Record<
+  string,
+  { bg: string; color: string; border: string; label: string }
+> = {
+  draft: { bg: '#1e293b', color: '#94a3b8', border: '#475569', label: 'draft' },
+  planned: { bg: '#1e3a8a', color: '#93c5fd', border: '#3b82f6', label: 'planned' },
+  'in development': { bg: '#312e81', color: '#c7d2fe', border: '#6366f1', label: 'in development' },
+  ready: { bg: '#0c4a6e', color: '#7dd3fc', border: '#0ea5e9', label: 'ready' },
+  'ready (revalidation pending)': {
+    bg: '#451a03',
+    color: '#fde68a',
+    border: '#d97706',
+    label: 'ready (revalidation pending)',
+  },
+  verified: { bg: '#064e3b', color: '#34d399', border: '#10b981', label: 'verified' },
+  failing: { bg: '#451a1a', color: '#fca5a5', border: '#ef4444', label: 'failing' },
+  partial: { bg: '#431407', color: '#fdba74', border: '#f97316', label: 'partial' },
+  untested: { bg: '#3b0764', color: '#d8b4fe', border: '#a855f7', label: 'untested' },
+};
+
+export const USE_CASE_APPROVAL_STYLES: Record<
+  string,
+  { bg: string; color: string; border: string; label: string }
+> = {
+  proposed: { bg: '#3b2505', color: '#fbbf24', border: '#f59e0b', label: 'proposed' },
+  approved: { bg: '#064e3b', color: '#34d399', border: '#10b981', label: 'approved' },
+  deprecated: { bg: '#27272a', color: '#a1a1aa', border: '#52525b', label: 'deprecated' },
+};
+
+export function getUseCaseStage(uc: { stage?: string | null; status?: string | null; revalidation?: string | null }): UseCaseStage {
+  const raw = (uc.stage || uc.status || 'draft').toLowerCase().trim();
+  if (raw === 'ready' && uc.revalidation === 'pending') {
+    return 'ready (revalidation pending)';
+  }
+  if (ALL_USE_CASE_STAGES.includes(raw as UseCaseStage)) {
+    return raw as UseCaseStage;
+  }
+  if (raw === 'active') return 'ready';
+  return (raw as UseCaseStage) || 'draft';
+}
+
+export function getUseCaseStageStyle(stage?: string | null) {
+  const key = (stage || 'draft').toLowerCase().trim();
+  return (
+    USE_CASE_STAGE_STYLES[key] || {
+      bg: '#1e293b',
+      color: '#cbd5e1',
+      border: '#334155',
+      label: stage || 'draft',
+    }
+  );
+}
+
+export function getUseCaseApprovalStyle(approval?: string | null) {
+  const key = (approval || 'proposed').toLowerCase().trim();
+  return (
+    USE_CASE_APPROVAL_STYLES[key] || {
+      bg: '#334155',
+      color: '#cbd5e1',
+      border: '#475569',
+      label: approval || 'proposed',
+    }
+  );
+}
+
 export interface UseCaseItem {
   id: string;
   title: string;
@@ -834,13 +912,31 @@ export interface UseCaseListResponse {
   use_cases: UseCaseItem[];
 }
 
+export interface ValidationCampaignNotReadyItem {
+  id: string;
+  title?: string;
+  actor?: string;
+  stage?: UseCaseStage | string;
+  approval?: UseCaseApproval | string;
+  tasks_done?: number;
+  tasks_total?: number;
+  progress?: string;
+}
+
 export interface ValidationCampaignResult {
   ok: boolean;
   timestamp: string;
   readiness_score: number;
+  readiness_score_in_scope?: number;
   total: number;
+  evaluated?: number;
+  in_scope?: number;
+  out_of_scope?: number;
   passed: number;
   failed: number;
+  untested?: number | any[];
+  not_ready_count?: number;
+  not_ready?: ValidationCampaignNotReadyItem[] | number;
   regressions_count: number;
   regressions: any[];
   report_file: string;
@@ -879,6 +975,7 @@ export interface TaskGraphNode {
   conditional?: boolean;
   conditions?: TaskConditionItem[];
   coordinates?: TaskCoordinateItem[];
+  use_cases?: string[];
 }
 
 export interface TaskGraphEdge {
@@ -1077,6 +1174,7 @@ export interface TreeNode {
   placement_warning?: string;
   placement_warnings?: string[];
   warnings?: string[];
+  use_cases?: string[];
 }
 
 export interface StructurePlanItem {
@@ -1232,6 +1330,7 @@ export interface SharedFilterState {
   groupByLabel?: boolean;
   projects?: string[];
   groupByProject?: boolean;
+  useCase?: string | 'all';
 }
 
 export interface InboxToMicrotaskPayload {
@@ -1666,6 +1765,7 @@ export interface ValidateCloseTaskItem {
 export interface ValidateClosePreviewPayload {
   task_ids: string[];
   note?: string;
+  owner_approved?: boolean;
 }
 
 export interface ValidateClosePreviewResponse {
@@ -1688,6 +1788,7 @@ export interface ValidateCloseApplyPayload {
   note?: string;
   expect_plan_hash?: string;
   expect_task_hashes?: Record<string, string>;
+  owner_approved?: boolean;
 }
 
 export interface ValidateCloseApplyResponse {
