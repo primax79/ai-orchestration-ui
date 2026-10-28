@@ -4787,6 +4787,14 @@ async def api_inbox_to_task(request: Request) -> JSONResponse:
         cmd.extend(["--depends-on", str(body["depends_on"])])
     if body.get("decider"):
         cmd.extend(["--decider", str(body["decider"])])
+    # 17.4: optional kind and use-case links, passed through only when given.
+    if body.get("kind"):
+        cmd.extend(["--kind", str(body["kind"])])
+    use_cases = body.get("use_cases")
+    if isinstance(use_cases, list):
+        use_cases = ",".join(str(u).strip() for u in use_cases if str(u).strip())
+    if use_cases:
+        cmd.extend(["--use-case", str(use_cases)])
 
     code, data = await run_ai_orch(cmd)
     if code == 0:
