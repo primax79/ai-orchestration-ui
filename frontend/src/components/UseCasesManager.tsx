@@ -1,9 +1,12 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Target, Play, Plus, Loader2, RefreshCw, Clock } from 'lucide-react';
+import { Target, Play, Plus, Loader2, RefreshCw, Clock, CheckCircle2, AlertTriangle, RotateCcw, MoreVertical } from 'lucide-react';
 import {
   UseCaseItem,
   UseCaseQueueItem,
   UseCaseQueueResponse,
+  UseCaseApprovalPayload,
+  UseCaseApprovalResponse,
+  buildApprovalSummary,
   ValidationCampaignResult,
   ValidationCampaignNotReadyItem,
   TaskItem,
@@ -13,7 +16,7 @@ import {
   getUseCaseApprovalStyle,
 } from '../types';
 import { UseCaseDetailModal } from './UseCaseDetailModal';
-import { ConfirmDialog } from './ConfirmDialog';
+import { ConfirmDialog, ConfirmDialogPreviewData } from './ConfirmDialog';
 import { api, useProject } from '../api';
 
 interface UseCasesManagerProps {
@@ -39,6 +42,23 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({
   const [approvalFilter, setApprovalFilter] = useState<string>('all');
   const [activeView, setActiveView] = useState<'all' | 'queue'>('all');
   const [showCreateModal, setShowCreateModal] = useState(false);
+
+  // Selection and approval state
+  const [selectedUcIds, setSelectedUcIds] = useState<Set<string>>(new Set());
+  const [openMenuUcId, setOpenMenuUcId] = useState<string | null>(null);
+  const [approvalLoading, setApprovalLoading] = useState(false);
+  const [approvalConfirmData, setApprovalConfirmData] = useState<{
+    payload: UseCaseApprovalPayload;
+    title: string;
+    preview: UseCaseApprovalResponse;
+  } | null>(null);
+
+  // Close card menu on outside click
+  useEffect(() => {
+    const handleWindowClick = () => setOpenMenuUcId(null);
+    window.addEventListener('click', handleWindowClick);
+    return () => window.removeEventListener('click', handleWindowClick);
+  }, []);
 
   // 409 Not Ready confirmation state for card/queue quick-validate
   const [quickForceConfirm, setQuickForceConfirm] = useState<{
@@ -174,6 +194,50 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({
     } finally {
       setCreating(false);
     }
+  };
+
+  const handleTriggerApproval = async (payload: UseCaseApprovalPayload, title: string) => {
+    setApprovalLoading(true);
+    try {
+      const res = await api.previewUseCaseApproval(payload, targetProject);
+      setApprovalConfirmData({
+        payload,
+        title,
+        preview: res,
+      });
+    } catch (e: any) {
+      alert(`Approval preview failed: ${e?.message || e}`);
+    } finally {
+      setApprovalLoading(false);
+    }
+  };
+
+  const handleApplyApproval = async (planHash?: string) => {
+    if (!approvalConfirmData) return;
+    const { payload } = approvalConfirmData;
+    await api.applyUseCaseApproval(
+      {
+        ...payload,
+        expect_plan_hash: planHash,
+      },
+      targetProject
+    );
+    setApprovalConfirmData(null);
+    setSelectedUcIds(new Set());
+    await loadUseCasesAndQueue();
+    onRefresh();
+  };
+
+  const handleRefetchApprovalPreview = async (): Promise<ConfirmDialogPreviewData> => {
+    if (!approvalConfirmData) return {};
+    const res = await api.previewUseCaseApproval(approvalConfirmData.payload, targetProject);
+    setApprovalConfirmData((prev) => (prev ? { ...prev, preview: res } : null));
+    return {
+      summary: buildApprovalSummary(res),
+      plan: res.plan,
+      diff: res.diff,
+      hash: res.plan_hash,
+    };
   };
 
   // Counts per stage across all use cases
@@ -828,6 +892,137 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({
             </div>
           </div>
 
+          {/* Selection & Approval Bulk Actions Bar */}
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: '1rem',
+            padding: '0.6rem 0.9rem',
+            backgroundColor: '#1e293b',
+            borderRadius: '0.375rem',
+            border: '1px solid #334155',
+            flexWrap: 'wrap',
+            gap: '0.75rem',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', fontSize: '0.82rem', color: '#cbd5e1', userSelect: 'none' }}>
+                <input
+                  type="checkbox"
+                  checked={filteredUseCases.length > 0 && filteredUseCases.every((u) => selectedUcIds.has(u.id))}
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      setSelectedUcIds((prev) => {
+                        const next = new Set(prev);
+                        filteredUseCases.forEach((u) => next.add(u.id));
+                        return next;
+                      });
+                    } else {
+                      setSelectedUcIds((prev) => {
+                        const next = new Set(prev);
+                        filteredUseCases.forEach((u) => next.delete(u.id));
+                        return next;
+                      });
+                    }
+                  }}
+                  style={{ cursor: 'pointer', width: '15px', height: '15px', accentColor: '#4f46e5' }}
+                />
+                <span>Select all shown ({filteredUseCases.length})</span>
+              </label>
+
+              {selectedUcIds.size > 0 && (
+                <span style={{ fontSize: '0.8rem', color: '#818cf8', fontWeight: 600 }}>
+                  {selectedUcIds.size} selected
+                </span>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              {selectedUcIds.size > 0 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleTriggerApproval(
+                        { action: 'approve', ids: Array.from(selectedUcIds) },
+                        `Approve Selected Use Cases (${selectedUcIds.size})`
+                      );
+                    }}
+                    disabled={approvalLoading}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      padding: '0.35rem 0.75rem',
+                      borderRadius: '0.25rem',
+                      border: '1px solid #059669',
+                      backgroundColor: '#065f46',
+                      color: '#fff',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      cursor: approvalLoading ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    <CheckCircle2 size={14} />
+                    <span>Approve selected ({selectedUcIds.size})</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setSelectedUcIds(new Set())}
+                    style={{
+                      padding: '0.35rem 0.65rem',
+                      borderRadius: '0.25rem',
+                      border: '1px solid #475569',
+                      backgroundColor: 'transparent',
+                      color: '#94a3b8',
+                      fontSize: '0.8rem',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    Clear selection
+                  </button>
+                </>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  const payload: UseCaseApprovalPayload = {
+                    action: 'approve',
+                    stage: stageFilter !== 'all' ? stageFilter : undefined,
+                    approval: approvalFilter !== 'all' ? approvalFilter : undefined,
+                    all: stageFilter === 'all' && approvalFilter === 'all' ? true : undefined,
+                  };
+                  const filterLabel = [
+                    stageFilter !== 'all' ? `stage: ${stageFilter}` : null,
+                    approvalFilter !== 'all' ? `approval: ${approvalFilter}` : null,
+                  ].filter(Boolean).join(', ');
+                  const title = filterLabel ? `Approve All Shown Use Cases (${filterLabel})` : 'Approve All Use Cases';
+                  handleTriggerApproval(payload, title);
+                }}
+                disabled={approvalLoading || filteredUseCases.length === 0}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.35rem',
+                  padding: '0.35rem 0.75rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #4f46e5',
+                  backgroundColor: '#4338ca',
+                  color: '#fff',
+                  fontSize: '0.8rem',
+                  fontWeight: 600,
+                  cursor: (approvalLoading || filteredUseCases.length === 0) ? 'not-allowed' : 'pointer',
+                  opacity: filteredUseCases.length === 0 ? 0.6 : 1,
+                }}
+              >
+                <CheckCircle2 size={14} />
+                <span>Approve all shown ({filteredUseCases.length})</span>
+              </button>
+            </div>
+          </div>
+
           {/* Use Cases Grid */}
           {loading ? (
             <div style={{ padding: '3rem', textAlign: 'center', color: '#94a3b8' }}>Loading use cases...</div>
@@ -874,6 +1069,22 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({
                     <div>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.45rem', flexWrap: 'wrap', gap: '0.35rem' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+                          <input
+                            type="checkbox"
+                            checked={selectedUcIds.has(uc.id)}
+                            onChange={(e) => {
+                              e.stopPropagation();
+                              setSelectedUcIds((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(uc.id)) next.delete(uc.id);
+                                else next.add(uc.id);
+                                return next;
+                              });
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                            style={{ cursor: 'pointer', width: '15px', height: '15px', accentColor: '#4f46e5', marginRight: '0.1rem' }}
+                            title={`Select ${uc.id}`}
+                          />
                           <span style={{ fontSize: '0.75rem', fontWeight: 700, padding: '0.1rem 0.35rem', borderRadius: '0.2rem', backgroundColor: '#4f46e5', color: '#fff' }}>
                             {uc.id}
                           </span>
@@ -905,7 +1116,147 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({
                             </span>
                           )}
                         </div>
-                        <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Actor: <strong>{uc.actor}</strong></span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Actor: <strong>{uc.actor}</strong></span>
+                          {/* Card Action Menu */}
+                          <div style={{ position: 'relative' }} onClick={(e) => e.stopPropagation()}>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setOpenMenuUcId(openMenuUcId === uc.id ? null : uc.id);
+                              }}
+                              title="Use case actions"
+                              style={{
+                                background: 'none',
+                                border: 'none',
+                                color: '#94a3b8',
+                                cursor: 'pointer',
+                                padding: '0.15rem',
+                                borderRadius: '0.25rem',
+                                display: 'flex',
+                                alignItems: 'center',
+                              }}
+                              onMouseEnter={(e) => (e.currentTarget.style.color = '#fff')}
+                              onMouseLeave={(e) => (e.currentTarget.style.color = '#94a3b8')}
+                            >
+                              <MoreVertical size={16} />
+                            </button>
+                            {openMenuUcId === uc.id && (
+                              <div
+                                style={{
+                                  position: 'absolute',
+                                  right: 0,
+                                  top: '100%',
+                                  marginTop: '0.25rem',
+                                  backgroundColor: '#0f172a',
+                                  border: '1px solid #334155',
+                                  borderRadius: '0.375rem',
+                                  boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.5)',
+                                  zIndex: 30,
+                                  minWidth: '160px',
+                                  overflow: 'hidden',
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  disabled={approval === 'approved'}
+                                  onClick={() => {
+                                    setOpenMenuUcId(null);
+                                    handleTriggerApproval({ action: 'approve', ids: [uc.id] }, `Approve Use Case ${uc.id}`);
+                                  }}
+                                  style={{
+                                    width: '100%',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    padding: '0.5rem 0.75rem',
+                                    border: 'none',
+                                    backgroundColor: 'transparent',
+                                    color: approval === 'approved' ? '#64748b' : '#34d399',
+                                    fontSize: '0.8rem',
+                                    fontWeight: 500,
+                                    textAlign: 'left',
+                                    cursor: approval === 'approved' ? 'default' : 'pointer',
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    if (approval !== 'approved') e.currentTarget.style.backgroundColor = '#1e293b';
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.currentTarget.style.backgroundColor = 'transparent';
+                                  }}
+                                >
+                                  <CheckCircle2 size={13} />
+                                  <span>Approve</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  disabled={approval === 'deprecated'}
+                                  onClick={() => {
+                                    setOpenMenuUcId(null);
+                                    handleTriggerApproval({ action: 'deprecate', ids: [uc.id] }, `Deprecate Use Case ${uc.id}`);
+                                  }}
+                                  style={{
+                                    width: '100%',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    padding: '0.5rem 0.75rem',
+                                    border: 'none',
+                                    backgroundColor: 'transparent',
+                                    color: approval === 'deprecated' ? '#64748b' : '#f87171',
+                                    fontSize: '0.8rem',
+                                    fontWeight: 500,
+                                    textAlign: 'left',
+                                    cursor: approval === 'deprecated' ? 'default' : 'pointer',
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    if (approval !== 'deprecated') e.currentTarget.style.backgroundColor = '#1e293b';
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.currentTarget.style.backgroundColor = 'transparent';
+                                  }}
+                                >
+                                  <AlertTriangle size={13} />
+                                  <span>Deprecate</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  disabled={approval === 'proposed'}
+                                  onClick={() => {
+                                    setOpenMenuUcId(null);
+                                    handleTriggerApproval({ action: 'propose', ids: [uc.id] }, `Move Use Case ${uc.id} Back to Proposed`);
+                                  }}
+                                  style={{
+                                    width: '100%',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '0.5rem',
+                                    padding: '0.5rem 0.75rem',
+                                    border: 'none',
+                                    backgroundColor: 'transparent',
+                                    color: approval === 'proposed' ? '#64748b' : '#cbd5e1',
+                                    fontSize: '0.8rem',
+                                    fontWeight: 500,
+                                    textAlign: 'left',
+                                    cursor: approval === 'proposed' ? 'default' : 'pointer',
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    if (approval !== 'proposed') e.currentTarget.style.backgroundColor = '#1e293b';
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.currentTarget.style.backgroundColor = 'transparent';
+                                  }}
+                                >
+                                  <RotateCcw size={13} />
+                                  <span>Back to proposed</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
                       </div>
 
                       <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#f8fafc', lineHeight: 1.3, marginBottom: '0.35rem' }}>
@@ -1035,6 +1386,29 @@ export const UseCasesManager: React.FC<UseCasesManagerProps> = ({
             await handleQuickValidate(null, quickForceConfirm.ucId, quickForceConfirm.title, true);
           }}
           onCancel={() => setQuickForceConfirm(null)}
+        />
+      )}
+
+      {/* Approval Confirmation Dialog */}
+      {approvalConfirmData && (
+        <ConfirmDialog
+          isOpen={true}
+          title={approvalConfirmData.title}
+          summary={buildApprovalSummary(approvalConfirmData.preview)}
+          plan={approvalConfirmData.preview.plan}
+          diff={approvalConfirmData.preview.diff}
+          hash={approvalConfirmData.preview.plan_hash}
+          applyButtonText={
+            approvalConfirmData.payload.action === 'approve'
+              ? 'Approve'
+              : approvalConfirmData.payload.action === 'deprecate'
+              ? 'Deprecate'
+              : 'Back to proposed'
+          }
+          danger={approvalConfirmData.payload.action === 'deprecate'}
+          onApply={handleApplyApproval}
+          onCancel={() => setApprovalConfirmData(null)}
+          onRefetchPreview={handleRefetchApprovalPreview}
         />
       )}
 

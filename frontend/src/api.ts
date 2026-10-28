@@ -60,6 +60,8 @@ import {
   ValidateCloseApplyResponse,
   TaskUseCasesPayload,
   UseCaseQueueResponse,
+  UseCaseApprovalPayload,
+  UseCaseApprovalResponse,
 } from './types';
 
 export interface ProjectScopeOpts {
@@ -1409,6 +1411,34 @@ export const api = {
     return apiFetch('/api/use-cases/campaign', {
       method: 'POST',
       body: JSON.stringify(options || {}),
+    }, proj);
+  },
+
+  async previewUseCaseApproval(
+    payload: UseCaseApprovalPayload,
+    opts?: string | ProjectScopeOpts | null
+  ): Promise<UseCaseApprovalResponse> {
+    const proj = resolveExplicitProject(opts);
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('previewUseCaseApproval', payload, proj);
+    }
+    return apiFetch<UseCaseApprovalResponse>('/api/use-cases/approval/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }, proj);
+  },
+
+  async applyUseCaseApproval(
+    payload: UseCaseApprovalPayload,
+    opts?: string | ProjectScopeOpts | null
+  ): Promise<UseCaseApprovalResponse> {
+    const proj = resolveExplicitProject(opts);
+    if (isVsCode && vscode) {
+      return sendVsCodeMessage('applyUseCaseApproval', payload, proj);
+    }
+    return apiFetch<UseCaseApprovalResponse>('/api/use-cases/approval/apply', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }, proj);
   },
 

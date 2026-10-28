@@ -661,6 +661,10 @@ def map_cli_status(code: int, data: Any, default_error_status: int = 500) -> int
         or "plan-task-attachments-unsupported" in err_str
         or "attachment-limit-reached" in err_str
         or "derived state" in err_str
+        or "without selection" in err_str
+        or "refusing to approve" in err_str
+        or "refusing to deprecate" in err_str
+        or "refusing to propose" in err_str
     ):
         return 400
 
@@ -4923,7 +4927,17 @@ async def api_inbox_to_task(request: Request) -> JSONResponse:
 
 async def api_list_use_cases(request: Request) -> JSONResponse:
     tasks_dir = state.tasks_dir(request)
-    code, data = await run_ai_orch(["use-cases", "list", "--tasks-dir", str(tasks_dir), "--json"])
+    cmd = ["use-cases", "list", "--tasks-dir", str(tasks_dir), "--json"]
+    status = request.query_params.get("status")
+    stage = request.query_params.get("stage")
+    approval = request.query_params.get("approval")
+    if status and status.lower() != "all":
+        cmd.extend(["--status", status])
+    if stage and stage.lower() != "all":
+        cmd.extend(["--stage", stage])
+    if approval and approval.lower() != "all":
+        cmd.extend(["--approval", approval])
+    code, data = await run_ai_orch(cmd)
     if code != 0 or not isinstance(data, dict):
         status_code = map_cli_status(code, data)
         return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
@@ -5034,6 +5048,104 @@ async def api_run_campaign(request: Request) -> JSONResponse:
         return JSONResponse(data, status_code=200)
     status_code = map_cli_status(code, data)
     return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def _handle_use_case_approval(request: Request, is_preview: bool = False) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if body.get("dry_run") or body.get("preview") or request.query_params.get("dry_run"):
+        is_preview = True
+
+    action = str(body.get("action") or "").strip().lower()
+    if action not in ("approve", "deprecate", "propose"):
+        return JSONResponse({"error": "action must be 'approve', 'deprecate', or 'propose'"}, status_code=400)
+
+    raw_ids = body.get("ids")
+    if raw_ids is None and body.get("id"):
+        raw_ids = [body.get("id")]
+    uc_ids: list[str] = []
+    if isinstance(raw_ids, list):
+        uc_ids = [str(i).strip() for i in raw_ids if str(i).strip()]
+    elif isinstance(raw_ids, str):
+        uc_ids = [i.strip() for i in raw_ids.split(",") if i.strip()]
+
+    stage = body.get("stage")
+    if stage is not None:
+        stage = str(stage).strip()
+        if not stage or stage.lower() == "all":
+            stage = None
+
+    approval = body.get("approval")
+    if approval is not None:
+        approval = str(approval).strip()
+        if not approval or approval.lower() == "all":
+            approval = None
+
+    all_flag = bool(body.get("all"))
+    reason = body.get("reason")
+    if reason is not None:
+        reason = str(reason).strip()
+        if not reason:
+            reason = None
+
+    expect_plan_hash = (
+        body.get("expect_plan_hash")
+        or body.get("expect_task_hash")
+        or body.get("expect_hash")
+        or body.get("plan_hash")
+        or request.query_params.get("expect_plan_hash")
+        or request.query_params.get("expect_task_hash")
+        or request.query_params.get("expect_hash")
+        or request.headers.get("x-expect-plan-hash")
+        or request.headers.get("x-expect-task-hash")
+    )
+    if not is_preview and not expect_plan_hash:
+        return JSONResponse({"error": "expect_plan_hash is required on apply"}, status_code=400)
+
+    tasks_dir = state.tasks_dir(request)
+    cmd = ["use-cases", action]
+    if uc_ids:
+        cmd.extend(uc_ids)
+    if stage:
+        cmd.extend(["--stage", stage])
+    if approval:
+        cmd.extend(["--approval", approval])
+    if all_flag:
+        cmd.append("--all")
+    if reason:
+        cmd.extend(["--reason", reason])
+    # by is set by the backend to owner (the UI acts for the owner)
+    cmd.extend(["--by", "owner"])
+    cmd.extend(["--tasks-dir", str(tasks_dir), "--json"])
+
+    if is_preview:
+        cmd.append("--preview")
+    else:
+        cmd.append("--apply")
+        cmd.extend(["--expect-plan-hash", str(expect_plan_hash)])
+
+    code, data = await run_ai_orch(cmd)
+    if code == 0:
+        if not is_preview:
+            await state.broadcast({
+                "type": "use_cases_changed",
+                "action": action,
+            })
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=200)
+
+    status_code = map_cli_status(code, data)
+    return JSONResponse(data if isinstance(data, dict) else {"error": data}, status_code=status_code)
+
+
+async def api_preview_use_case_approval(request: Request) -> JSONResponse:
+    return await _handle_use_case_approval(request, is_preview=True)
+
+
+async def api_apply_use_case_approval(request: Request) -> JSONResponse:
+    return await _handle_use_case_approval(request, is_preview=False)
 
 
 # ---------------------------------------------------------------------------
@@ -6235,6 +6347,8 @@ routes = [
     Route("/api/use-cases", api_create_use_case, methods=["POST"]),
     Route("/api/use-cases/queue", api_get_use_cases_queue, methods=["GET"]),
     Route("/api/use-cases/campaign", api_run_campaign, methods=["GET", "POST"]),
+    Route("/api/use-cases/approval/preview", api_preview_use_case_approval, methods=["POST"]),
+    Route("/api/use-cases/approval/apply", api_apply_use_case_approval, methods=["POST"]),
     Route("/api/use-cases/{id}", api_get_use_case, methods=["GET"]),
     Route("/api/use-cases/{uc_id}", api_get_use_case, methods=["GET"]),
     Route("/api/use-cases/{id}/validate", api_validate_use_case, methods=["POST"]),
